@@ -124,6 +124,26 @@ fatal: unable to fork
 | `GITHUB_PROBE_BYTES` | `131072` | 测速时每通道拉多少字节 |
 | `GITHUB_PROBE_TIMEOUT` | `6` | 测速时单通道超时（秒） |
 
+### 冷 DNS：比带宽更常见的延迟来源
+
+同一个 2.2 MiB 资产连测四次：**15098 / 2187 / 2324 / 11143 ms**，stderr 全是
+`curl: (28) Resolving timed out after 5000 milliseconds`。
+
+`release-assets.githubusercontent.com` 冷解析实测要 **11119 ms**，之后 0–1 ms（走 OS 缓存）；
+而 curl 的 `--connect-timeout` 把 DNS 也算在内，5 秒一到就报错重试 —— 慢的不是带宽，是解析。
+
+脚本因此在 `fetch_one` 的 `rest` 通道里先调 `dns_warm()`（`tools/github.sh` 第 113 行起）：
+用 node 的 `dns.lookup`（走 getaddrinfo，结果留在 OS 缓存）预热 `api.github.com` 与
+`release-assets.githubusercontent.com`。**不钉 IP**：DNS 变了能跟得上，只重付一次预热成本。
+
+### 下载失败要能看出来
+
+镜像和 relay 对不存在的资产会回 **HTTP 200 + 正文 `Not Found`**（9 字节）。
+早期版本只看 curl 退出码，于是 404 也 `exit=0` 并写出一个 9 字节的假文件。
+现在 `fetch_one` 校验 `%{http_code}` 必须是 `2xx`，并对小于 4 KiB 的产物再查一遍
+`<!DOCTYPE html` / `Not Found` / `Bad Gateway` / `404:` 等错误页特征。
+实测：不存在的资产现在是 **exit=2**，日志写 `[fail] 下载失败（候选表里的通道全试过…）`。
+
 ### 相关文档
 
 - `docs/network-baseline.md` —— 上下行实测、通道可达性、选路判据（>50 MB 不走 git push）
