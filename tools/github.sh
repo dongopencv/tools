@@ -271,7 +271,9 @@ verify_out() {
   done
   [[ -s "$out" ]] || die "下载产物为空" 3
   head -c 200 "$out" | grep -qi '<!DOCTYPE html' && { rm -f "$out"; die "产物是 HTML 错误页，不是目标文件" 3; }
-  local actual; actual=$(sha256sum "$out" 2>/dev/null | awk '{print $1}')
+  # 用 stdin 形式算哈希：Windows 路径含反斜杠时，sha256sum 会把文件名转义并在行首加一个
+  # 反斜杠（GNU coreutils 对含 \ 或换行的文件名如此），直接 awk '{print $1}' 会拿到 "\\abc…"。
+  local actual; actual=$(sha256sum < "$out" 2>/dev/null | awk '{print $1}')
   if [[ -n "$sha" ]]; then
     if [[ "${actual,,}" == "${sha,,}" ]]; then ok "SHA256 校验通过"
     else die "SHA256 不匹配（期望 ${sha,,} / 实际 $actual）" 3; fi

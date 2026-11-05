@@ -62,15 +62,49 @@ if ($policy -eq "Restricted") {
     }
 }
 
+# ── GitHub 网关 ───────────────────────────────────────────────────────────
+# 本机 github.com:443 被墙，裸 Invoke-WebRequest / 裸 git clone 走 HTTPS 必然超时。
+# 所有 GitHub 访问收敛到 tools/github.sh（镜像选路 + SHA256 + 断点续传）。
+# 脚本被 `irm <url> | iex` 单独执行时没有脚本目录，会退回直连并给出提示。
+$script:GitHubGateway = $null
+foreach ($cand in @(
+    $(if ($PSScriptRoot) { Join-Path $PSScriptRoot "toolsgithub.sh" }),
+    (Join-Path $HOME "projPC1	oolsgithub.sh"),
+    "D:projPC1	oolsgithub.sh"
+)) {
+    if ($cand -and (Test-Path $cand)) { $script:GitHubGateway = (Resolve-Path $cand).Path; break }
+}
+
+function Invoke-GitHubGateway {
+    param([string[]]$GatewayArgs)
+    if (-not $script:GitHubGateway) { return $false }
+    $bashCmd = Get-Command bash -ErrorAction SilentlyContinue
+    if (-not $bashCmd) { return $false }
+    & $bashCmd.Source $script:GitHubGateway @GatewayArgs
+    return ($LASTEXITCODE -eq 0)
+}
+
 function Invoke-UvFromGitHub {
     $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64" } else { "x86_64" }
     $url  = "https://github.com/astral-sh/uv/releases/latest/download/uv-$arch-pc-windows-msvc.zip"
     $dest = Join-Path $env:LOCALAPPDATA "uv"
     $zip  = Join-Path $env:TEMP "uv-gh-$([System.IO.Path]::GetRandomFileName()).zip"
 
-    Write-Info "Downloading uv ($arch) from GitHub Releases..."
     $ProgressPreference = 'SilentlyContinue'
-    Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+    $fetched = $false
+    if ($script:GitHubGateway) {
+        Write-Info "Downloading uv ($arch) via GitHub gateway..."
+        $fetched = Invoke-GitHubGateway @("download", $url, "-o", $zip)
+        if (-not $fetched) { Write-Warn "Gateway download failed; retrying direct..." }
+    }
+    if (-not $fetched) {
+        if (-not $script:GitHubGateway) {
+            Write-Warn "GitHub gateway not found (tools/github.sh) - downloading directly."
+            Write-Warn "On this machine github.com:443 is blocked; put the workspace repo in place or set it up first."
+        }
+        Write-Info "Downloading uv ($arch) from GitHub Releases (direct)..."
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+    }
 
     if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
     Expand-Archive -Force -Path $zip -DestinationPath $dest
@@ -216,7 +250,15 @@ if ($FromSource) {
         }
         $cloneDir = Join-Path $env:TEMP "octop-install-$(Get-Random)"
         try {
-            git clone --depth 1 $OctopRepo $cloneDir
+            # HTTPS clone of github.com is blocked here; go through the gateway (SSH first).
+            $slug = if ($OctopRepo -match 'github\.com[:/](?<o>[^/]+)/(?<r>[^/]+?)(?:\.git)?/?$') { "$($Matches.o)/$($Matches.r)" } else { $null }
+            $cloned = $false
+            if ($slug) { $cloned = Invoke-GitHubGateway @("clone", $slug, $cloneDir) }
+            if (-not $cloned) {
+                if ($slug) { Write-Warn "Gateway clone failed; retrying direct git clone..." }
+                git clone --depth 1 $OctopRepo $cloneDir
+                if ($LASTEXITCODE -ne 0) { throw "git clone failed for $OctopRepo" }
+            }
             Prepare-Console $cloneDir
             uv pip install "${cloneDir}${ExtrasSuffix}" --python $VenvPython
         } finally {
