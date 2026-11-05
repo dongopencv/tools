@@ -23,8 +23,8 @@ bash tools/github.sh <子命令> [参数…]
 | `status` | 全通道体检：gh / 传输器 / token / 中转站 / 可达性 / SSH / git 传输 | `bash tools/github.sh status` |
 | `api` | 调 GitHub API（自动在 gh → curl → node 之间选路） | `bash tools/github.sh api repos/owner/repo --jq .full_name` |
 | `release` | 列出 release 的 tag / 资产 | `bash tools/github.sh release owner/repo v1.2.3` |
-| `asset` | 下载 release 资产（镜像选路 + SHA256 校验） | `bash tools/github.sh asset owner/repo v1.2.3 file.zip -s <sha256>` |
-| `download` | 下载任意 URL（aria2 多连接→curl 续传） | `bash tools/github.sh download <url> -o out.bin -s <sha256>` |
+| `asset` | 下载 release 资产（**先走 release-assets**，镜像兜底，SHA256 校验） | `bash tools/github.sh asset owner/repo v1.2.3 file.zip -s <sha256>` |
+| `download` | 下载任意 URL（顺序试通道，大文件才上 aria2） | `bash tools/github.sh download <url> -o out.bin -s <sha256>` |
 | `raw` | 取文件正文（走 API contents，raw 域不稳时的兜底） | `bash tools/github.sh raw owner/repo master README.md` |
 | `clone` | 克隆仓库（SSH 优先，回退镜像） | `bash tools/github.sh clone owner/repo` |
 | `push` | 推送（只走 SSH） | `bash tools/github.sh push owner/repo HEAD` |
@@ -46,6 +46,31 @@ bash tools/github.sh <子命令> [参数…]
 3. **`node` 的 `fetch`** —— 永远兜底，本机实测稳定可用。
 
 `status` 会分别报告「传输器」和「token 认证」两节，就是为了不把传输器故障误读成凭据故障。
+
+### 下载选路（2026-11-06 重做）
+
+老版本是「先逐通道探测再挑最快」，实测这个策略本身比下载还贵：
+
+- 探测比的是 `%{size_download}`，而每个通道都被 `-r 0-1023` 卡在 1024 字节 → 永远只有候选表第一个赢，等于从未测速。
+- 镜像对 Range 的处理不一致：有的老实回 `206`，有的直接回 `200` 并开始推整个文件 → 探测只能靠 `--max-time` 硬砍，四个候选一轮 **60+ 秒**，而真正下载只要 0.8–1.6 秒。
+
+现在改成**按候选表顺序直接下，失败或大小不符就换下一条**，选路成本 ≈ 一次真实传输：
+
+1. `asset` 先走 `api.github.com/…/releases/assets/<id>`（302 到 `release-assets.githubusercontent.com`，预签名、直连可达，**全场最快**：同一 324 MB 资产 5.09 MiB/s，而 ghfast 3.39、gh-proxy 1.32）。
+2. 失败才回落到 `download` 的候选表：relay(8899) → gh-proxy → ghfast → ghproxy.net → 直连。
+3. 每换一条通道都先删半截文件：不同通道未必都支持续传，`-C -` 接手别处残片会算出坏哈希。
+4. aria2 只在文件 ≥ 8 MiB 时启用（实测 2.18 MiB 时它与 curl 打平，更小的文件反而慢 6–12 倍）。
+
+实测（同一 2.18 MiB 资产）：改造前 `download` **52.2 s**，改造后 **8.2 s**；`asset` 三轮 3.0 / 3.8 / 12.8 s（第三轮是当时链路自己慢）。
+
+想回到「先测速再选」的旧行为：`GITHUB_PROBE=1 bash tools/github.sh download <url>`。
+
+### 凭据只发给 GitHub 自己的域名
+
+镜像是第三方（`gh-proxy.com` / `ghfast.top` / `ghproxy.net`），把 PAT 塞进它们的请求头等于把
+repo / workflow / delete_repo 权限交给别人。实测镜像对公开内容**根本不需要** `Authorization`
+（无 token 照样 200 / 206）。所以 `raw` 与 `clone` 的镜像分支都不带凭据，只有
+`api.github.com` / `release-assets` / 直连 / relay 才带。
 
 ### 通道探测要说人话
 
@@ -92,6 +117,10 @@ fatal: unable to fork
 | `GITHUB_RELAY` | `http://127.0.0.1:8899` | 本地中转站 |
 | `GITHUB_RELAY_SERVER` | `/c/Users/Admin/dsh-mirror-proxy/server.mjs` | 中转站服务文件 |
 | `ARIA2C` | `aria2c` | aria2 可执行文件 |
+| `GITHUB_ARIA2_MIN` | `8388608` | 文件小于这个字节数就不用 aria2（小文件多连接是负优化） |
+| `GITHUB_PROBE` | `0` | 设 `1` 回到「先逐通道测速再选」的旧策略 |
+| `GITHUB_PROBE_BYTES` | `131072` | 测速时每通道拉多少字节 |
+| `GITHUB_PROBE_TIMEOUT` | `6` | 测速时单通道超时（秒） |
 
 ### 相关文档
 

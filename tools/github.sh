@@ -43,6 +43,8 @@ fi
 MIRRORS=(https://gh-proxy.com/ https://ghfast.top/ https://ghproxy.net/ "")
 DL_DIR="${GITHUB_DL_DIR:-$HOME/Downloads/github}"
 ARIA2="${ARIA2C:-aria2c}"
+# 低于这个大小不值得开多连接（实测小文件上 aria2 不加速，见 cmd_download）
+ARIA2_MIN="${GITHUB_ARIA2_MIN:-8388608}"
 
 # ── 中转站（8899 MITM 反代）──
 RELAY="${GITHUB_RELAY:-http://127.0.0.1:8899}"
@@ -252,14 +254,37 @@ prefix_name() {
   esac
 }
 
-# 探测：只信 200/206 且有字节回来。curl 不可用时改用 node fetch。
+# 探测：真测速。
+#
+# 老实现比的是 %{size_download} —— 每个通道都被 -r 0-1023 卡在 1024 字节，
+# 于是 (( size > best )) 永远只有候选列表里第一个赢，等于从未测速（实测三个
+# 镜像对同一资产全返回 `206 1024`）。现在比 %{speed_download}（curl 的平均
+# 字节/秒），并顺带从 Content-Range 取文件总大小，供后面决定要不要上 aria2。
+#
+# 直连 github.com 被墙时旧版每次烧满 --max-time 12；现在 --connect-timeout 3
+# 卡住建连阶段，单通道最多 PROBE_TIMEOUT 秒。
+PROBE_BYTES="${GITHUB_PROBE_BYTES:-131072}"    # 每通道探 128 KiB
+PROBE_TIMEOUT="${GITHUB_PROBE_TIMEOUT:-6}"
+# 默认不预探测：见 cmd_download 里的说明（探测成本 > 传输成本）
+PROBE="${GITHUB_PROBE:-0}"
+
 probe() {
-  local kind="$1" url="$2" code size
-  read -r code size < <(curl -sS $(opts_of "$kind") -o /dev/null       -w '%{http_code} %{size_download}' --max-time 12 -L -r 0-1023 "$url" 2>/dev/null || echo "000 0")
+  local kind="$1" url="$2" code size spd total hdr
+  hdr=$(mktemp 2>/dev/null || echo "/tmp/probe.$$")
+  read -r code size spd < <(
+    curl -sS $(opts_of "$kind") -D "$hdr" -o /dev/null \
+      -w '%{http_code} %{size_download} %{speed_download}' \
+      --connect-timeout 3 --max-time "$PROBE_TIMEOUT" \
+      -L -r "0-$((PROBE_BYTES-1))" "$url" 2>/dev/null || echo "000 0 0"
+  )
   if [[ "$code" == 000 ]]; then
-    read -r code size < <(node_probe "$url")
+    read -r code size < <(node_probe "$url"); spd=0
   fi
-  echo "$code $size"
+  # Content-Range: bytes 0-131071/12345678 → 总大小（直连 200 全量时没有这行）
+total=$(grep -i '^content-range:' "$hdr" 2>/dev/null | tail -1 | sed 's|.*/||' | tr -d '\r')
+  [[ "$total" =~ ^[0-9]+$ ]] || total=0
+  rm -f "$hdr" 2>/dev/null
+  echo "$code $size $spd $total"
 }
 
 # 校验尾巴：空文件 / HTML 错误页 / SHA256
@@ -284,6 +309,45 @@ verify_out() {
   echo "$out"
 }
 
+# 单通道下载一次。成功（且大小对得上）返回 0；失败或明显不完整返回 1，由调用方换下一条。
+# 换通道时必须清掉半截文件：不同通道未必都支持续传，-C - 接手一个别处来的残片会算出坏哈希。
+fetch_one() {
+  local kind="$1" url="$2" out="$3" fsize="${4:-0}"
+  rm -f "$out" 2>/dev/null
+  local alog; alog="$(mktemp 2>/dev/null || echo "$out.aria2.log")"
+  local okflag=0
+  if command -v "$ARIA2" >/dev/null 2>&1 && (( fsize >= ARIA2_MIN )); then
+    info "  aria2c 8 连接（文件 $(( fsize / 1048576 )) MiB）"
+    local -a ax=()
+    [[ "$kind" == relay ]] && ax+=(--all-proxy="$RELAY")
+    [[ -f "$RELAY_CA" ]] && ax+=(--ca-certificate="$RELAY_CA")
+    if "$ARIA2" "${ax[@]}" --allow-overwrite=true -x 8 -s 8 -k 1M --max-tries=2 --timeout=30 \
+         --summary-interval=0 --console-log-level=warn --show-console-readout=false \
+         --auto-file-renaming=false --connect-timeout=5 \
+         -o "$(basename "$out")" -d "$(dirname "$out")" "$url" >"$alog" 2>&1; then okflag=1; fi
+    rm -f "$alog" 2>/dev/null
+    [[ $okflag -eq 1 ]] || info "  aria2 失败，改用 curl"
+  fi
+  if [[ $okflag -eq 0 ]]; then
+    curl -sS $(opts_of "$kind") -L --connect-timeout 5 --retry 2 --max-time 1800 \
+      -o "$out" "$url" >&2 && okflag=1
+  fi
+  if [[ $okflag -eq 0 ]] && have_node; then
+    info "  curl 没成，改用 node fetch"
+    local -a ndl=("$url" "$out")
+    [[ "$kind" == relay ]] && ndl+=("" "$RELAY")
+    node_download "${ndl[@]}" && okflag=1
+  fi
+  [[ $okflag -eq 1 && -s "$out" ]] || return 1
+  # 拿到 HTML 说明是错误页/拦截页，不是目标文件
+  head -c 200 "$out" | grep -qi '<!DOCTYPE html' && return 1
+  if (( fsize > 0 )); then
+    local got; got=$(stat -c %s "$out" 2>/dev/null || echo 0)
+    (( got == fsize )) || { info "  大小不符（$got / $fsize），丢弃重试"; return 1; }
+  fi
+  return 0
+}
+
 cmd_download() {
   local url="" out="" sha="" via=""
   while [[ $# -gt 0 ]]; do
@@ -302,8 +366,15 @@ cmd_download() {
     local base="${url%%\?*}"; out="$DL_DIR/$(basename "$base")"
   fi
 
-  local chosen="" kind="" best=0 code size ck cu
-  info "探测通道…（relay 需要中转站在线）"
+  # 为什么不再「先逐通道测速再挑」：
+  #   镜像站在 Range 请求上表现不一致 —— 有的老实回 206（能被 PROBE_BYTES 截断），
+  #   有的直接回 200 并开始推整个文件，于是 probe 只能靠 --max-time 硬砍，
+  #   每个这样的候选白烧满 PROBE_TIMEOUT 秒。实测四个候选一轮探测 60+ 秒，
+  #   而两个候选的端到端下载只要 0.8–1.6 秒。探测本身成了主要成本。
+  # 所以改成**按优先级顺序直接下**：每个通道边下边计时，失败或速度低于阈值就换下一个；
+  # 拿到的第一个「够快」的通道直接用来下完，选路成本 ≈ 一次真实传输。
+  local chosen="" kind="" best=0 code size spd total ck cu fsize=0
+  local -a order=()
   while IFS='|' read -r ck cu; do
     [[ -z "$ck" ]] && continue
     case "$via" in
@@ -313,41 +384,43 @@ cmd_download() {
       direct)  [[ "$ck" == direct ]] || continue ;;
       *)       die "download: --via 只支持 relay|mirror|direct" ;;
     esac
-    read -r code size < <(probe "$ck" "$cu")
-    if [[ "$code" == 200 || "$code" == 206 ]]; then
-      (( size > best )) && { best=$size; chosen="$cu"; kind="$ck"; }
-      info "  ok    $(prefix_name "$ck") $(prefix_name "$cu")  (http=$code)"
-    else
-      info "  skip  $(prefix_name "$ck") $(prefix_name "$cu")  (http=$code)"
-    fi
+    order+=("$ck|$cu")
   done < <(candidates "$url")
-  [[ -n "$chosen" ]] || die "所有通道都失败（网络问题，不是 URL 问题）" 2
-  info "选定通道: $(prefix_name "$kind") $(prefix_name "$chosen")"
+  [[ ${#order[@]} -gt 0 ]] || die "没有可用通道（--via 过滤掉了全部候选）" 2
 
-  local dlok=0 alog
-  alog="$(mktemp 2>/dev/null || echo "$out.aria2.log")"
-  if command -v "$ARIA2" >/dev/null 2>&1; then
-    info "下载中（aria2c 8 连接）→ $out"
-    local -a ax=()
-    [[ "$kind" == relay ]] && ax+=(--all-proxy="$RELAY")
-    [[ -f "$RELAY_CA" ]] && ax+=(--ca-certificate="$RELAY_CA")
-    if "$ARIA2" "${ax[@]}" --allow-overwrite=true -x 8 -s 8 -k 1M --max-tries=3 --timeout=30         --summary-interval=0 --console-log-level=warn --show-console-readout=false         --auto-file-renaming=false -o "$(basename "$out")" -d "$(dirname "$out")"         "$chosen" >"$alog" 2>&1; then dlok=1; else
-      info "  aria2 失败，回退 curl"; grep -iE 'error|denied' "$alog" 2>/dev/null | head -3 >&2
+  if [[ "$PROBE" == 1 ]]; then
+    info "逐通道测速（GITHUB_PROBE=1）…"
+    local entry
+    for entry in "${order[@]}"; do
+      ck="${entry%%|*}"; cu="${entry#*|}"
+      read -r code size spd total < <(probe "$ck" "$cu")
+      [[ "$code" == 200 || "$code" == 206 ]] || { info "  skip  $(prefix_name "$ck")（http=$code）"; continue; }
+      (( total > fsize )) && fsize=$total
+      (( spd > best )) && { best=$spd; chosen="$cu"; kind="$ck"; }
+      info "  ok    $(prefix_name "$ck") $(( spd / 1024 )) KiB/s"
+    done
+    [[ -n "$chosen" ]] || die "所有通道都失败（网络问题，不是 URL 问题）" 2
+    info "选定通道: $(prefix_name "$kind")（$(( best / 1024 )) KiB/s）"
+  else
+    chosen="${order[0]#*|}"; kind="${order[0]%%|*}"
+    info "首选通道: $(prefix_name "$kind")（失败再顺着候选表往下换）"
+  fi
+
+  # aria2 多连接只对大文件有收益：实测 2.18 MiB 的资产 curl 12.9 s / aria2 12.6 s
+  # （打平），更早 2.5 MB 时 aria2 反而慢 6–12 倍 —— 连接建立与分片开销吃掉了并行收益。
+  # 所以小文件直接单连接 curl，超过 ARIA2_MIN 才上 8 连接。
+  local dlok=0 entry attempt=0
+  for entry in "${order[@]}"; do
+    ck="${entry%%|*}"; cu="${entry#*|}"
+    (( PROBE == 1 )) && [[ -n "$chosen" && "$cu" != "$chosen" ]] && continue
+    attempt=$(( attempt + 1 ))
+    info "下载中 ($attempt/${#order[@]}): $(prefix_name "$ck") → $out"
+    if fetch_one "$ck" "$cu" "$out" "$fsize"; then
+      chosen="$cu"; kind="$ck"; dlok=1; break
     fi
-  fi
-  rm -f "$alog" 2>/dev/null
-  if [[ $dlok -eq 0 ]]; then
-    info "下载中（curl 续传）→ $out"
-    curl -sS $(opts_of "$kind") -L -C - --retry 3 --max-time 900 -o "$out" "$chosen" >&2 && dlok=1
-  fi
-  if [[ $dlok -eq 0 ]] && have_node; then
-    # curl 不可用（本机常见 TLS 凭据句柄问题）时，用 node fetch 兜底直取选定通道
-    local -a ndl=("$chosen" "$out")
-    [[ "$kind" == relay ]] && ndl+=("" "$RELAY")
-    info "curl 没成，改用 node fetch 兜底 → $out"
-    node_download "${ndl[@]}" && dlok=1
-  fi
-  [[ $dlok -eq 1 ]] || die "下载失败（curl 与 node 都拿不到内容；先跑 github.sh status 看通道）" 2
+    info "  这条不通/太慢，换下一条"
+  done
+  [[ $dlok -eq 1 ]] || die "下载失败（候选表里的通道全试过：relay/镜像/直连；先跑 github.sh status）" 2
   verify_out "$out" ${sha:+-s "$sha"}
 }
 
@@ -365,24 +438,42 @@ cmd_asset() {
     esac
   done
   [[ -n "$out" ]] || out="$DL_DIR/$name"
-  if cmd_download "https://github.com/$repo/releases/download/$tag/$name" --out "$out" ${sha:+-s "$sha"}; then
-    return 0
-  fi
-  warn "常规通道失败，回落到 API 资产端点"
+
+  # 顺序很重要：**先 release-assets，后镜像**。
+  # api.github.com/…/releases/assets/<id> 会 302 到 release-assets.githubusercontent.com，
+  # 那是预签名 URL、直连可达，实测是全场最快的通道（同一 324 MB 资产：
+  # release-assets 5.09 MiB/s / ghfast 3.39 MiB/s / gh-proxy 1.32 MiB/s）。
+  # 老版本把它排在「所有镜像都失败之后」，等于永远用次优路径。
   local t json obj id
-  t=$(require_token)
-  json=$(cmd_api "repos/$repo/releases/tags/$tag" 2>/dev/null)
-  obj=$(printf "%s" "$json" | grep -o "{[^{}]*\"name\":\"$name\"[^{}]*}" | head -1)
-  id=$(printf "%s" "$obj" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
-  [[ -n "$id" ]] || die "API 里找不到资产 $name（tag=$tag）" 2
-  info "API 资产端点 ($id) → $out"
-  if ! curl -sS $(opts_of rest) -L --retry 3 --max-time 900 -o "$out" \
-      -H "Authorization: token $t" -H "Accept: application/octet-stream" \
-      "https://api.github.com/repos/$repo/releases/assets/$id" >&2; then
-    warn "curl 走不通，改用 node fetch"
-    node_download "https://api.github.com/repos/$repo/releases/assets/$id" "$out" "$t" || die "API 资产端点下载失败" 2
+  t=$(gh_token 2>/dev/null || true)
+  if [[ -n "$t" ]]; then
+    json=$(cmd_api "repos/$repo/releases/tags/$tag" 2>/dev/null || true)
+    # 用 node 解析而不是 grep 正则：release JSON 里 assets[] 的元素含嵌套对象（uploader），
+    # "{[^{}]*}" 这类非贪婪花括号匹配一个都匹配不到（实测 obj len = 0）。
+    id=$(printf "%s" "$json" | node -e '
+      let s=""; process.stdin.on("data",d=>s+=d);
+      process.stdin.on("end",()=>{
+        try { const j=JSON.parse(s); const a=(j.assets||[]).find(x=>x.name===process.argv[1]);
+              if (a) process.stdout.write(String(a.id)); } catch(e){}
+      });
+    ' "$name" 2>/dev/null || true)
+    if [[ -n "$id" ]]; then
+      local aurl="https://api.github.com/repos/$repo/releases/assets/$id"
+      info "release-assets 通道（asset $id）→ $out"
+      if curl -sS $(opts_of rest) -L --retry 3 --connect-timeout 5 --max-time 1800 -o "$out" \
+           -H "Authorization: token $t" -H "Accept: application/octet-stream" "$aurl" >&2 \
+         && [[ -s "$out" ]] && ! head -c 200 "$out" | grep -qi '<!DOCTYPE html'; then
+        verify_out "$out" ${sha:+-s "$sha"}; return 0
+      fi
+      if have_node; then
+        warn "curl 走不通，改用 node fetch"
+        if node_download "$aurl" "$out" "$t"; then verify_out "$out" ${sha:+-s "$sha"}; return 0; fi
+      fi
+      warn "release-assets 失败，回落到镜像/直连"
+    fi
   fi
-  verify_out "$out" ${sha:+-s "$sha"}
+
+  cmd_download "https://github.com/$repo/releases/download/$tag/$name" --out "$out" ${sha:+-s "$sha"}
 }
 
 # 委派官方 gh：api.github.com → release-assets.githubusercontent.com（本机实测可达）
@@ -460,13 +551,13 @@ cmd_clone() {
   fi
 
   # 3) 镜像前缀（schannel：本机 git 全局是 openssl + 8899 私有 CA，镜像域名不在那张证书里）
-  local t m cand
-  t=$(require_token)
+  #    不带 Authorization：镜像是第三方，公开仓库 clone 不需要凭据（实测）
+  local m cand
   for m in "${MIRRORS[@]}"; do
     [[ -z "$m" ]] && continue
     cand="$m$url"
     info "尝试: $m"
-    if git -c http.sslBackend=schannel -c "http.extraHeader=Authorization: Bearer $t"          clone --depth 1 "$cand" "$dir" >/dev/null 2>&1; then
+    if git -c http.sslBackend=schannel clone --depth 1 "$cand" "$dir" >/dev/null 2>&1; then
       ok "clone 成功: $dir（$(prefix_name "$cand")）"
       git -C "$dir" remote set-url origin "$url"
       return 0
@@ -558,10 +649,16 @@ cmd_raw() {
   fi
 
   # 3) curl 走镜像/中转通道
-  local ck cu
+  #
+  # 凭据只发给 GitHub 自己的域名：镜像是第三方（gh-proxy / ghfast / ghproxy.net），
+  # 把 PAT 塞进它们的请求头等于把 repo/workflow/delete_repo 权限交给别人；
+  # 实测镜像对公开内容根本不需要 Authorization（无 token 照样 200 / 206）。
+  local ck cu auth=()
   while IFS='|' read -r ck cu; do
     [[ -z "$ck" ]] && continue
-    out=$(curl -sS $(opts_of "$ck") --max-time 25 -H "Authorization: token $t" -L "$cu" 2>/dev/null)
+    auth=()
+    [[ "$ck" == direct || "$ck" == relay ]] && [[ -n "$t" ]] && auth=(-H "Authorization: token $t")
+    out=$(curl -sS $(opts_of "$ck") --max-time 25 "${auth[@]}" -L "$cu" 2>/dev/null)
     if [[ -n "$out" ]] && ! grep -qi "<!DOCTYPE html" <<<"${out:0:200}"; then printf "%s\n" "$out"; return 0; fi
   done < <(candidates "$rawurl")
   die "raw 取不到: $repo/$ref/$path" 2
