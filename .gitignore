@@ -1,0 +1,30 @@
+# 大件与运行时产物：不进仓库
+work/
+out/
+elevate/
+
+# 工具与代理留下的状态
+.agent-teams/
+.workbuddy/tmp/
+*.db
+*.log
+logs/
+
+# 凭据一律不进仓库
+.env
+.env.*
+!.env.example
+*.token
+.github-token
+github.env
+id_*_ed25519*
+*.pem
+*.pfx
+
+# 系统垃圾
+Thumbs.db
+desktop.ini
+.DS_Store
+node_modules/
+__pycache__/
+*.pyc
