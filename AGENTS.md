@@ -30,7 +30,7 @@
 
 ## 实测网络速度（2026-11-06）
 
-**上行才是瓶颈**：2026-11-06 实测 58–364 KB/s，随 4G 时段波动很大，按 **150 KB/s** 估工期。下行并不慢：国际 CDN 2–6 MB/s，GitHub 自己的 codeload / api tarball 0.5–1.6 MB/s。
+**上行才是瓶颈**：2026-11-06 实测 58–364 KB/s，随 4G 时段波动很大，按 **150 KB/s** 估工期。下行总体不慢，但分层明显：国际 CDN 2–6 MB/s；`release-assets.githubusercontent.com` 与可用镜像 2–12 MB/s；GitHub 归档（`codeload` / `api tarball`）0.5–1.6 MB/s，小文件被延迟主导可低到 185 KB/s，且偶发 `Connection was reset`，别当大文件中转。
 
 - 20 MB 的 push 约 1.5–2.5 分钟 → 单次 push 尽量 ≤ 20 MB。
 - **大于 50 MB 的东西不要用 git push 传**（50 MB ÷ 150 KB/s ≈ 5.7 分钟，且失败要整包重传），改用 release 资产。
