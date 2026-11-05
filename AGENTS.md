@@ -18,7 +18,7 @@
 **`github.com` 的 HTTPS（443）被墙**，直连 100% 超时。可达的只有：
 
 - `api.github.com` — `gh` CLI 走这条，不受影响
-- SSH `ssh.github.com:443`（实测稳定通）与 `github.com:22`（时通时不通，2026-11-06 02:33 复测 CLOSED）— 这是唯一的 `git push` 通道，优先 443
+- SSH `ssh.github.com:443`（实测稳定通）与 `github.com:22`（**时通时不通**，2026-11-06 同一小时内测到 02:33 CLOSED / 02:40 OPEN）— 这是唯一的 `git push` 通道，**优先 443**
 
 因此：
 
