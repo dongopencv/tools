@@ -53,7 +53,42 @@ AGENTS.md 里那条「大于 50 MB 不要用 git push」的判据，来源就是
 | `registry.npmmirror.com` | ⚠️ 时通时不通 | 02:13 复测 `fetch failed` |
 | `release-assets.githubusercontent.com` | ✅ 通 | `api.github.com` 资产端点 302 的落点，**预签名 URL，直连可达**，是本机最快路径 |
 
-## 四、选路策略（照这个执行）
+## 四、中转站（8899）：镜像站代理这条链
+
+思路是「在本机起一个代理，把 GitHub 家族的流量统一改道去镜像站」——不用改 URL、不用改各工具配置，只给进程塞一个 `HTTPS_PROXY`：
+
+```
+curl / git / gh / aria2c
+        ↓  HTTPS_PROXY=http://127.0.0.1:8899
+本地 MITM 反代  C:\Users\Admin\dsh-mirror-proxy\server.mjs   (node, 127.0.0.1:8899)
+        ↓  解密后重写 URL
+https://gh-proxy.com/https://<原域名><原路径>          ← 镜像站
+        ↓
+GitHub
+```
+
+- **只碰 GitHub**：仅对 10 个 GitHub 家族域名做 MITM 重写（`github.com` / `raw.githubusercontent.com` / `objects.githubusercontent.com` / `gist.github.com` / `github.githubassets.com` / `avatars.*` / `user-images.*` / `camo.*` / `media.*` / `githubusercontent.com`）；**其它域名一律普通 CONNECT 隧道直连，不解密**（`server.mjs:18-29`、`:48-51`）。
+- **证书是自签的**：MITM 用本地 CA `dsh-mirror-proxy/certs/ca.crt.pem`，客户端必须显式信任（curl `--cacert`、node `NODE_EXTRA_CA_CERTS`）。Windows Schannel 版 curl 还要加 `--ssl-no-revoke`，否则吊销查询失败直接断连——网关脚本 `curl_opts` 已按 Schannel 自动补。
+- **起停**：`bash tools/github.sh relay up|down|status`（`up` 用 `nohup node server.mjs` 拉起）。另有一个**登录时触发**的计划任务 `\dsh-gh-proxy` 负责自启：`node.exe …\node\bin\node.exe C:\Users\Admin\dsh-mirror-proxy\server.mjs`，起始目录 `C:\Users\Admin\dsh-mirror-proxy`。注意它的电源策略是「在电池模式停止 / 不用电池启动」，且「只使用交互方式」——**拔掉电源或非交互登录它不会起**，此时 `relay status` 会报未运行，手动 `relay up` 即可。
+- **网关里是一等通道**：`download` 的探测列表含 relay（`--via relay` 可强制）；`asset` / `ghdl` / `clone` 在别路失败时回落到它。
+
+### 实测（2026-11-06 02:50–02:56）
+
+| 场景 | 结果 |
+|---|---|
+| `github.com:443` 直连（对照） | ❌ curl (28) 21.0 s 超时，http 000 |
+| 经 8899 取 raw 4,698 B | ✅ 200，1.46 s（延迟主导，不算带宽） |
+| 经 8899 取 release 资产 1 MiB（curl 单连接） | ✅ 206，5.37 s，**191 KiB/s**（195,353 B/s） |
+| 经 8899 取 15,721,375 B 资产（aria2c 8 连接） | ✅ 25.09 s，**612 KiB/s**（626,699 B/s），SHA256 通过 |
+| `gh api repos/astral-sh/uv` 经 8899 | ✅ 正常返回 |
+
+### 什么时候用 / 别用
+
+- **该用**：要碰 `github.com` 本体（网页、release 直链、HTTPS clone）的兜底；某一个镜像域名抽风时（`ghfast.top` 就 30 分钟内从 `fetch failed` 变 200），换这条链往往立刻可用。
+- **别用**：`api.github.com` 直连本来通且更快——`gh` / `github.sh api` 塞代理是白绕一圈、多付一次 MITM。
+- **做不到**：写。上游 `gh-proxy.com` 不转发 push，`git push` 仍只走 SSH（`ssh.github.com:443`）。
+
+## 五、选路策略（照这个执行）
 
 | 场景 | 走哪条 | 判据 |
 |---|---|---|
@@ -63,11 +98,12 @@ AGENTS.md 里那条「大于 50 MB 不要用 git push」的判据，来源就是
 | 下载 release 资产 / raw | `bash tools/github.sh asset\|raw ...` | 走镜像选路 + SHA256 校验 |
 | 拉别的仓库做只读分析 | `bash tools/github.sh clone owner/repo` | SSH 优先，回退镜像 |
 | 大文件（>50 MB）取回 | `tools/github.sh download <url> -s <sha256>` | aria2c 多连接，断点续传 |
+| GitHub 域名直连失败时的兜底 | `bash tools/github.sh relay up` 后 `--via relay` 或设 `HTTPS_PROXY=http://127.0.0.1:8899` | 见第四节；只对 GitHub 域生效 |
 
 20 MB push 的预估耗时（按上行 150 KB/s）：**约 2.3 分钟**（实测早先记录 1.5–2.5 分钟，一致）。
 **切 release 资产的判据**：单个文件 > 50 MB，或一次 push 预计超过 5 分钟——即总量 > 45 MB。
 
-## 五、怎么复测
+## 六、怎么复测
 
 下行（改 `bytes` 调大小，10 MB 量级最稳）：
 
@@ -88,7 +124,27 @@ for hp in 'api.github.com 443' 'ssh.github.com 443' 'github.com 22'; do set -- $
   if timeout 8 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; then echo "$1:$2 OPEN"; else echo "$1:$2 CLOSED"; fi; done
 ```
 
-## 六、只在 workspace-write 沙箱里成立的做法/失败（不是本机属性）
+中转站（8899）是否在跑、是否真能转发：
+
+```bash
+bash tools/github.sh relay status        # 端口探活
+
+# 经 8899 取一个已知内容的 raw 文件；不写 --ssl-no-revoke 会假装超时/断开
+curl -sS --ssl-no-revoke -o /dev/null -w '%{http_code} %{size_download}B %{time_total}s\n' \
+  -x http://127.0.0.1:8899 \
+  --cacert /c/Users/Admin/dsh-mirror-proxy/certs/ca.crt.pem \
+  https://raw.githubusercontent.com/github/gitignore/main/Python.gitignore
+# 期望：200 4698B（该文件当日大小）
+
+# 想看链路是否真在重写，看日志
+tail -5 /c/Users/Admin/dsh-mirror-proxy/logs/proxy-$(date +%F).log
+```
+
+**测中转站的两个坑（都踩过）**：
+1. 它是 **CONNECT 正向代理**，不是「把 URL 拼在路径后面」的网关。`http://127.0.0.1:8899/https://...` 返回 **400**，别据此判断它坏了。
+2. Windows 自带的 Schannel 版 curl 必须配 `--ssl-no-revoke`，否则握手完成后立刻断连、报 `(28)` 超时——看起来像镜像不通，实际是吊销查询失败。
+
+## 七、只在 workspace-write 沙箱里成立的做法/失败（不是本机属性）
 
 下面这几条曾被当成「机器缺陷」写进文档，**在宽策略（danger-full-access）会话里逐条复测推翻**。它们只在 DSH 的 workspace-write 沙箱下成立——判断依据就一条命令：
 
@@ -106,7 +162,7 @@ gh issue view 3 --json number   # 成功 = 宽策略；报 pipe: Access is denie
 
 **结论**：这是文件/进程策略的差异，不是网络或安装问题。写文档时按「策略相关」表述，别写成绝对结论。
 
-## 七、测带宽的坑
+## 八、测带宽的坑
 
 - **小文件测带宽** —— 19 KB 的文件量出 19 KB/s，那是 RTT，不是带宽。
 - **上行波动极大** —— 同一 1 MB 载荷，02:00 测 364 KB/s，02:33 测 57.9 KB/s。单次结果不可当基线，至少三跑取中位数。

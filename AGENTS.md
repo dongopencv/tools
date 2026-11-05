@@ -27,6 +27,7 @@
   `bash tools/github.sh asset owner/repo v1.2.3 file.zip -s <sha256>`
   用法见 `tools/README.md`（#5 落地）；背景与踩坑见 `C:\Users\Admin\.skills-vault\download\SKILL.md` 的「GitHub 唯一入口」一节。
 - `gh release download` **本身是可用的**：它走 `api.github.com` 拿 302 跳到 `release-assets.githubusercontent.com`，全程不经 github.com（实测 2.3 MB 资产秒下）。网关的价值是镜像回退 + SHA256 校验 + 断点续传，不是「gh 不能用」。
+- **`github.com` 域名的兜底是 8899 中转站**（本地 MITM 反代 → `gh-proxy.com`）：`bash tools/github.sh relay up` 后加 `--via relay`，或给任意进程塞 `HTTPS_PROXY=http://127.0.0.1:8899`。实测 15,721,375 B 资产 25 s / 612 KiB/s（同域直连是 21 s 超时）。它只代理 GitHub 家族域名、只读；登录时由计划任务 `\dsh-gh-proxy` 自启（电池模式不启动），没起就 `relay up`；细节见 `docs/network-baseline.md` 第四节。
 
 ## 实测网络速度（2026-11-06）
 
