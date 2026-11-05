@@ -44,57 +44,57 @@ Used by `/wayfinder`. The **map** is a single issue with **child** issues as tic
 - **Claim**: `gh issue edit <n> --add-assignee @me`, the session's first write.
 - **Resolve**: `gh issue comment <n> --body "<answer>"`, then `gh issue close <n>`, then append a context pointer (gist + link) to the map's Decisions-so-far.
 
-## 本机网络限制（重要，会改变上面所有命令的用法）
+## 本机网络限制
 
-这台机器（PC1）**`github.com` 的 HTTPS 443 被墙**，`api.github.com` 与 SSH（22/443）可达。因此：
+这台机器（PC1）**`github.com` 的 HTTPS 443 被墙**（实测 `curl https://github.com/` 15 s 超时、http_code 000），`api.github.com` 与 SSH（22/443）可达。因此：
 
 - 上面所有 `gh` 命令在本机**可以直接用**——`gh` 走 `api.github.com`，不受 443 封锁影响，token 已存在 Windows 凭据管理器。
 - **`git clone` / `git push` 一律用 SSH**：`git@github.com:owner/repo.git`。HTTPS 写操作在本机三条路全死（直连被墙 / 本地 8899 MITM 反代只读 / 镜像不转发写）。
-- 下载 release 资产、raw 文件不要用 `gh release download`，改用网关脚本，它做了镜像选路和 SHA256 校验：
+- 下载 release 资产、raw 文件优先走网关脚本（镜像回退 + SHA256 校验 + 断点续传）：
   `bash tools/github.sh asset owner/repo v1.2.3 file.zip -s <sha256>`
+- `gh release download` **不是不能用**：它经 `api.github.com` 302 到 `release-assets.githubusercontent.com`，全程不经 github.com，本机实测可用。网关的价值在镜像回退与校验，不是替代它。
 - 详细原因与踩坑记录见 `C:\Users\Admin\.skills-vault\download\SKILL.md` 的「GitHub 唯一入口」一节。
 
-## agent 沙箱里跑 gh 的硬性注意事项（实测，2026-11-06）
+## agent 会话里的行为差异（取决于文件策略，不是机器属性）
 
-在 DSH agent 会话（沙箱 workspace-write）里操作 issue，和人在终端里手动敲是两回事，以下每条都踩过：
-
-### 1. `gh` 必须显式带 `-R`，或者先离开仓库目录
-
-`gh` 会尝试用当前 git 仓库推断 `owner/repo`，而它推断时要 fork 一个子进程读 remote。沙箱禁止 fork 管道，于是直接失败：
-
-```
-failed to run git: pipe: Access is denied.
-```
-
-**两种可用写法**（任选其一）：
+DSH 会话的**文件策略不同，同一批命令的结果完全不同**。先探明策略，再决定写哪个命令：
 
 ```bash
-gh issue list -R dongopencv/tools --state open          # 显式指定仓库
-GH_REPO=dongopencv/tools gh issue list --state open     # 环境变量
-cd /tmp && gh issue list --state open                   # 离开仓库目录
+gh issue view 3 --json number   # 成功 = 宽策略；报 pipe: Access is denied = workspace-write 沙箱
 ```
 
-`gh api ...` **不受影响**（路径里已带 owner/repo，不需要推断），在仓库目录里也能跑。
+| 操作 | 宽策略（danger-full-access） | workspace-write 沙箱 |
+|---|---|---|
+| `gh issue`/`gh list` 不带 `-R` | ✅ 自动从 git remote 推断 | ❌ `failed to run git: pipe: Access is denied.` |
+| `gh api …` | ✅ | ✅ 路径自带 owner/repo，不需要 fork git |
+| `gh issue view <n> --comments` | ✅ | ❌ 静默返回空（退出码 0） |
+| `curl` 任意 HTTPS | ✅ | ❌ `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS` |
+| `git fetch`/`push`/`ls-remote` | ✅ | ❌ `cannot create standard input pipe for ssh: Permission denied` |
+| `node -e` 的 `fetch` | ✅ | ✅ 沙箱内最稳的出网方式 |
 
-### 2. 读 issue 正文用 `gh api`，别指望 `gh issue view --comments`
-
-`gh issue view <n> --comments` 在沙箱里**静默返回空**（退出码 0、无输出、也不报错），`--json body` 倒是正常。要正文和评论就分两条：
+**通用写法（两种策略下都能跑）**：显式带仓库，避免依赖推断。
 
 ```bash
-gh api repos/dongopencv/tools/issues/<n> --jq '.title, .body'
-gh api repos/dongopencv/tools/issues/<n>/comments --jq '.[] | "== \(.user.login) ==\n\(.body)"'
+gh issue list -R dongopencv/tools --state open
+GH_REPO=dongopencv/tools gh issue list --state open
+gh api repos/dongopencv/tools/issues/3 --jq '.title, .body'
+gh api repos/dongopencv/tools/issues/3/comments --jq '.[] | "== \(.user.login) ==\n\(.body)"'
 ```
 
-`gh issue view <n>`（不带 `--comments`）的纯文本输出是好的，还会显示 `parent:` 和 `sub-issues:`。
+## 父子与阻塞边（实测端点，2026-11-06）
 
-### 3. 父子与阻塞边都走原生 API
+- **子票挂在 map 下（读）**：`gh api repos/dongopencv/tools/issues/2/sub_issues --jq '.[].number'`
+- **挂载（写）**：`gh api --method POST repos/dongopencv/tools/issues/2/sub_issues -F sub_issue_id=<子票数据库 id>`，返回子票号即成功。
+- **摘除（写）**：`gh api --method DELETE repos/dongopencv/tools/issues/2/sub_issue -F sub_issue_id=<子票数据库 id>`。注意是**单数 sub_issue 且 id 走 body**；写成 `/sub_issues/<id>` 会 404。
+- **反查父票**：`gh api repos/dongopencv/tools/issues/<n>/parent --jq '.number'`
+- **阻塞边读**：`gh api repos/dongopencv/tools/issues/<n>/dependencies/blocked_by`
+- **阻塞边写**：`POST repos/<o>/<r>/issues/<child>/dependencies/blocked_by -F issue_id=<blocker 数据库 id>`；删：`DELETE repos/<o>/<r>/issues/<child>/dependencies/blocked_by/<blocker 数据库 id>`。
+- **汇总**：`gh api repos/<o>/<r>/issues/<n> --jq '.issue_dependencies_summary'`。字段含义不一样，别混：
+  - `blocked_by` = **仍未关闭**的阻塞者数量（活闸门）
+  - `total_blocked_by` = 全部阻塞者数量（含已关闭）
+  - 删掉阻塞边后 `blocked_by` 立刻归 0；若阻塞者只是被关闭，`total_blocked_by` 仍保留。
 
-- **子票挂在 map 下**：`gh api repos/dongopencv/tools/issues/2/sub_issues --jq '.[].number'`
-- **反查某票的父票**：`gh api repos/dongopencv/tools/issues/<n>/parent --jq '.number'`
-- **阻塞关系**：`gh api repos/dongopencv/tools/issues/<n>/dependencies/blocked_by`；写入要 blocker 的**数据库 id**（`gh api repos/<o>/<r>/issues/<n> --jq .id`），不是 `#` 号。
-- **汇总**：`gh api repos/<o>/<r>/issues/<n> --jq '.issue_dependencies_summary'`，其中 `blocked_by` 是**未关闭**阻塞者数量，就是活的闸门。
-
-### 4. 写操作
+## 写操作
 
 ```bash
 gh issue comment <n> -R dongopencv/tools --body "..."
@@ -102,17 +102,9 @@ gh issue edit  <n> -R dongopencv/tools --add-label "ready-for-agent"
 gh issue close <n> -R dongopencv/tools --comment "resolution 见正文 / 上一条评论"
 ```
 
-`gh issue comment` **没有** `--dry-run`，别试。
+- `gh issue comment` **没有** `--dry-run`，别试。
+- 探针票用完要删干净：关闭只是留着，删除用 `gh api graphql -f query='mutation($id:ID!){deleteIssue(input:{issueId:$id}){repository{name}}}' -f id=<node_id>`；删除后再读该票返回 HTTP 410。
 
-### 5. `curl` 在沙箱里是废的；出网用 `node`
-
-```
-curl: (35) schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030E)
-```
-
-不是网络问题，是沙箱没给 curl 需要的 TLS 凭据句柄。要发 HTTP 就用 `node -e` 的 `fetch`（实测能出网、api.github.com 200）。同理 **`git fetch/push/ls-remote` 在沙箱里全废**（`cannot create standard input pipe for ssh: Permission denied`），只有本地 git 操作（commit/branch/worktree/diff/log）可用——push 得由人在非沙箱终端执行，或用网关脚本的 git-data 兜底。
-
-### 6. 凭据纪律
+## 凭据纪律
 
 token 在 `C:\Users\Admin\.skills-vault\download\scripts\.github-token`。**不要 `cat` 它、不要把内容写进任何被 git 跟踪的文件或 issue 正文**。上面所有命令都让 `gh` 自己从 keyring 取，不需要你碰 token。
-

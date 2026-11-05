@@ -8,6 +8,7 @@ elevate/
 # 只忽略 tmp/ 不足以挡住 memory/。这类文件只该留在本机。
 .agent-teams/
 .workbuddy/
+.dsh/
 *.db
 *.log
 logs/
@@ -22,6 +23,17 @@ github.env
 id_*_ed25519*
 *.pem
 *.pfx
+
+# 本机临时脚本与探针产物：不进仓库（.bench-* 测速、.status/.api/.push 是会话里的临时 helper）
+.bench-*
+.api.sh
+.status.sh
+.push.sh
+.raw.sh
+.nodedl.sh
+.helpers.sh
+nul
+*.bak
 
 # 系统垃圾
 Thumbs.db

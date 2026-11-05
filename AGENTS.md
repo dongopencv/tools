@@ -11,49 +11,60 @@
 | `work/` | 临时工作区，大量实验产物（不提交） |
 | `out/` | 截图、导出物（不提交） |
 | `docs/agents/` | 工程技能（matt pocock skills deck）需要的配置 |
+| `docs/network-baseline.md` | 本机出网带宽与选路规则（#4 落地） |
 
 ## 本机网络限制（重要）
 
 **`github.com` 的 HTTPS（443）被墙**，直连 100% 超时。可达的只有：
 
 - `api.github.com` — `gh` CLI 走这条，不受影响
-- SSH `github.com:22`（约 4/5 成功率）与 `ssh.github.com:443`（5/5）— 这是唯一的 `git push` 通道
+- SSH `ssh.github.com:443`（实测稳定通）与 `github.com:22`（时通时不通，2026-11-06 02:33 复测 CLOSED）— 这是唯一的 `git push` 通道，优先 443
 
 因此：
 
 - **`git clone` / `git push` 一律用 SSH**：`git@github.com:owner/repo.git`。HTTPS 写操作在本机三条路全死（直连被墙 / 本地 8899 MITM 反代只读 / 镜像不转发写）。
-- 所有 GitHub 操作（API / 下载 / clone / push）统一走仓库里的网关脚本 `tools/github.sh`，别手搓 `curl`/`gh` 直连，也别用 `gh release download`：
+- 所有 GitHub 操作（API / 下载 / clone / push）优先走网关脚本 `tools/github.sh`，别各处手搓 `curl`/`gh`/`git`：
   `bash tools/github.sh asset owner/repo v1.2.3 file.zip -s <sha256>`
-  用法见 `tools/README.md`；背景与踩坑见 `C:\Users\Admin\.skills-vault\download\SKILL.md` 的「GitHub 唯一入口」一节。
+  用法见 `tools/README.md`（#5 落地）；背景与踩坑见 `C:\Users\Admin\.skills-vault\download\SKILL.md` 的「GitHub 唯一入口」一节。
+- `gh release download` **本身是可用的**：它走 `api.github.com` 拿 302 跳到 `release-assets.githubusercontent.com`，全程不经 github.com（实测 2.3 MB 资产秒下）。网关的价值是镜像回退 + SHA256 校验 + 断点续传，不是「gh 不能用」。
 
 ## 实测网络速度（2026-11-06）
 
-上行 140–200 KB/s，下行同时段约 90 KB/s。20 MB 的 push 约 1.5–2.5 分钟。**大于 50 MB 的东西不要用 git push 传**，改用 release 资产。
+**上行才是瓶颈**：2026-11-06 实测 58–364 KB/s，随 4G 时段波动很大，按 **150 KB/s** 估工期。下行并不慢：国际 CDN 2–6 MB/s，GitHub 自己的 codeload / api tarball 0.5–1.6 MB/s。
 
-复测方法与完整选路策略见 `docs/network-baseline.md`。
+- 20 MB 的 push 约 1.5–2.5 分钟 → 单次 push 尽量 ≤ 20 MB。
+- **大于 50 MB 的东西不要用 git push 传**（50 MB ÷ 150 KB/s ≈ 5.7 分钟，且失败要整包重传），改用 release 资产。
 
-## agent 沙箱与交互终端不一样（重要）
+完整实测表、复测方法与选路策略见 `docs/network-baseline.md`（#4 落地）。
 
-在 DSH agent 会话里，本机这套工具的行为和你在终端里手敲有实质差别，下面每条都实测过：
+## agent 会话的能力边界（取决于文件策略，不是机器属性）
 
-| 操作 | 沙箱内 | 说明 |
+同一台机器，DSH 会话的**文件策略不同，命令行为天差地别**。动手前先探明：
+
+```bash
+gh issue view 3 --json number   # 成功 = 宽策略；报 pipe: Access is denied = workspace-write 沙箱
+```
+
+| 操作 | 宽策略（danger-full-access） | workspace-write 沙箱 |
 |---|---|---|
-| `gh issue/list/api ...` | ✅ 可用 | 但**必须带 `-R dongopencv/tools`** 或 `GH_REPO=` 环境变量，否则报 `failed to run git: pipe: Access is denied` |
-| `gh api ...` | ✅ 可用 | 路径里自带 owner/repo，不需要推断，仓库目录里也能跑 |
-| `gh issue view <n> --comments` | ❌ 静默返回空 | 退出码 0 但没有输出；正文和评论改用 `gh api .../issues/<n>` 与 `.../comments` |
-| `curl` 任意 HTTPS | ❌ 全废 | `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`，不是网络问题 |
-| `node -e` 的 `fetch` | ✅ 可用 | 沙箱内唯一可靠的出网方式 |
-| `git` 本地操作 | ✅ 可用 | commit / branch / worktree / diff / log 都正常 |
-| `git` 远端操作 | ❌ 全废 | `fetch/push/ls-remote` 一律 `cannot create standard input pipe for ssh: Permission denied` / `fatal: unable to fork` |
-| `ssh -T git@github.com` | ✅ 可用 | 单独的 ssh 进程能通（`Hi dongopencv!`）；只有 git 要 fork 它时被拦 |
+| `gh issue` / `gh list` 不带 `-R` | ✅ 自己从 git remote 推断 | ❌ `failed to run git: pipe: Access is denied.`，须加 `-R owner/repo` 或 `GH_REPO=` |
+| `gh api …` | ✅ | ✅ 路径自带 owner/repo，不需要 fork git |
+| `gh issue view <n> --comments` | ✅ | ❌ 静默返回空（退出码 0），改用 `gh api .../issues/<n>/comments` |
+| `curl` 任意 HTTPS | ✅ | ❌ `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS` |
+| `node -e` 的 `fetch` | ✅ | ✅ 沙箱内最稳的出网方式 |
+| `git` 本地操作 | ✅ | ✅ commit / branch / worktree / diff / log 都正常 |
+| `git fetch` / `push` / `ls-remote` | ✅ | ❌ `cannot create standard input pipe for ssh: Permission denied` |
+| `ssh -T git@github.com` | ✅ | ✅ 单独的 ssh 进程能通，只有 git 要 fork 它时被拦 |
 
-含义：**agent 能读写 issue、能改文件、能本地提交，但不能把提交推上去**。push 得由人在非沙箱终端跑 `bash tools/github.sh push dongopencv/tools <ref>`，或由人直接 `git push`。
+含义：**沙箱会话里能改文件、能本地 commit、能读写 issue，但推不上去**——push 交给宽策略会话或人在终端跑。
+反过来，**别把某一种策略下的观察当成这台机器的固有事实写进文档**：本仓库上一版就把沙箱的限制写成了「本机缺陷」，逐条复测后全部推翻（见 #3）。
 
 ## 凭据纪律
 
 - token 只存在 `C:\Users\Admin\.skills-vault\download\scripts\.github-token`，**不进仓库、不进 issue 正文、不进任何被 git 跟踪的文件**。
 - `.workbuddy/` 整个目录不提交。它的 `memory/` 里天然会出现明文口令、PIN、token——这类文件只该留在本机。
 - 提交前自查：`git diff --cached | grep -iE 'ghp_|pin|password|token'` 应为空。
+- 已经泄露过的口令，删文件不够（历史提交里还在）。处置顺序：先轮换口令，再评估是否改写历史。
 
 ## Agent skills
 
