@@ -4,8 +4,10 @@ out/
 elevate/
 
 # 工具与代理留下的状态
+# .workbuddy/ 整个目录不提交：agent 的每日记忆里天然会出现明文口令/PIN/token，
+# 只忽略 tmp/ 不足以挡住 memory/。这类文件只该留在本机。
 .agent-teams/
-.workbuddy/tmp/
+.workbuddy/
 *.db
 *.log
 logs/
