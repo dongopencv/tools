@@ -36,6 +36,10 @@
 
 Issues live as GitHub issues in `dongopencv/tools`. See `docs/agents/issue-tracker.md`.
 
+### Triage labels
+
+The five canonical triage roles, each label string equal to its role name. See `docs/agents/triage-labels.md`.
+
 ### Domain docs
 
 single-context. See `docs/agents/domain.md`.
