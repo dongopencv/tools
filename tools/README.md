@@ -99,6 +99,8 @@ fatal: unable to fork
 ### 依赖
 
 - `gh`（必需，MSI 装完要重开 shell 才进 PATH；脚本会自己去 `C:/Program Files/GitHub CLI/gh.exe` 找）
+  - 本机实测版本：`gh version 2.103.3 (2026-10-26)`（release tag `v2.103.3`）
+  - 已装二进制的 SHA256：`d303d8ac3f5e9438bf7c977b64dd6425513eae46218f8881d30694f28c1d0dfd`（`sha256sum '/c/Program Files/GitHub CLI/gh.exe'`）；核对官方 hash 以 `v2.103.3` release 的 `gh_2.103.3_checksums.txt` 为准
 - `node`（兜底传输器 + 中转站）
 - `aria2c`（可选，多连接下载；没有就回退 curl 续传）
 - `ssh` + `~/.ssh/id_ed25519_gh`（push 通道）

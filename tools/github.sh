@@ -101,6 +101,30 @@ CSL=(); while IFS= read -r x; do CSL+=("$x"); done < <(curl_opts rest)
 
 opts_of() { local -a a=(); while IFS= read -r v; do a+=("$v"); done < <(curl_opts "$1"); echo "${a[*]}"; }
 
+# 预热系统解析器缓存。
+# 为什么需要：4G 网络下首次解析 release-assets.githubusercontent.com 实测 11119 ms，
+# 之后 0–1 ms（走 OS 缓存）。而 curl 的 --connect-timeout 连 DNS 一起管，5 秒一到就报
+#   curl: (28) Resolving timed out after 5000 milliseconds
+# 于是同一个 2.2 MiB 文件有时 2.2 秒、有时 15 秒 —— 差的全是 DNS，不是带宽。
+# 实测四次：15098 / 2187 / 2324 / 11143 ms，冷缓存那次必挂。
+# 用 node 的 dns.lookup（走 getaddrinfo，结果会留在 OS 缓存里）先问一次。
+# 不钉 IP：DNS 变了也能跟得上，只是要重付一次预热成本。
+DNS_WARMED=""
+dns_warm() {
+  local host="$1"
+  case " $DNS_WARMED " in *" $host "*) return 0 ;; esac
+  DNS_WARMED="$DNS_WARMED $host"
+  have_node || return 0
+  node -e 'require("dns").lookup(process.argv[1],()=>{})' "$host" >/dev/null 2>&1 &
+  local pid=$!
+  local i=0
+  while (( i < 60 )); do kill -0 $pid 2>/dev/null || break; sleep 0.1; i=$((i+1)); done
+  kill $pid 2>/dev/null
+  wait $pid 2>/dev/null
+  return 0
+}
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # 传输通道：gh 优先 → curl → node fetch
 #
@@ -122,10 +146,10 @@ node_get() {
     fetch(u, { headers: h })
       .then(async r => {
         const t = await r.text();
-        if (!r.ok) { process.stderr.write("http " + r.status + "\n"); process.exit(1); }
+        if (!r.ok) { process.stderr.write("http " + r.status + "\n"); process.exitCode = 1; return; }
         process.stdout.write(t);
       })
-      .catch(e => { process.stderr.write(String(e.message || e) + "\n"); process.exit(1); });
+      .catch(e => { process.stderr.write(String(e.message || e) + "\n"); process.exitCode = 1; });
   ' "$url" "$tok"
 }
 
@@ -146,10 +170,10 @@ node_download() {
         if (tok) h["Authorization"] = "Bearer " + tok;
         fetch(u, { headers: h, redirect: "follow" })
           .then(async r => {
-            if (!r.ok) { process.stderr.write("http " + r.status + "\n"); process.exit(1); }
+            if (!r.ok) { process.stderr.write("http " + r.status + "\n"); process.exitCode = 1; return; }
             fs.writeFileSync(o, Buffer.from(await r.arrayBuffer()));
           })
-          .catch(e => { process.stderr.write(String(e.message || e) + "\n"); process.exit(1); });
+          .catch(e => { process.stderr.write(String(e.message || e) + "\n"); process.exitCode = 1; });
       ' "$url" "$out" "$tok"
     return $?
   fi
@@ -160,10 +184,10 @@ node_download() {
     if (tok) h["Authorization"] = "Bearer " + tok;
     fetch(u, { headers: h, redirect: "follow" })
       .then(async r => {
-        if (!r.ok) { process.stderr.write("http " + r.status + "\n"); process.exit(1); }
+        if (!r.ok) { process.stderr.write("http " + r.status + "\n"); process.exitCode = 1; return; }
         fs.writeFileSync(o, Buffer.from(await r.arrayBuffer()));
       })
-      .catch(e => { process.stderr.write(String(e.message || e) + "\n"); process.exit(1); });
+      .catch(e => { process.stderr.write(String(e.message || e) + "\n"); process.exitCode = 1; });
   ' "$url" "$out" "$tok"
 }
 
@@ -316,12 +340,26 @@ fetch_one() {
   rm -f "$out" 2>/dev/null
   local alog; alog="$(mktemp 2>/dev/null || echo "$out.aria2.log")"
   local okflag=0
+  # rest = api.github.com 的资产端点（302 到 release-assets 预签名 URL）。
+  # token 与 Accept 只该发给 GitHub 自己的域名，镜像/中转站一律不带。
+  local -a auth=() akx=() akh=()
+  if [[ "$kind" == rest ]]; then
+    dns_warm api.github.com
+    dns_warm release-assets.githubusercontent.com
+    local t; t=$(gh_token 2>/dev/null || true)
+    if [[ -n "$t" ]]; then
+      auth=(-H "Authorization: token $t")
+      akh+=(--header="Authorization: token $t")
+    fi
+    auth+=(-H "Accept: application/octet-stream")
+    akh+=(--header="Accept: application/octet-stream")
+  fi
   if command -v "$ARIA2" >/dev/null 2>&1 && (( fsize >= ARIA2_MIN )); then
     info "  aria2c 8 连接（文件 $(( fsize / 1048576 )) MiB）"
     local -a ax=()
     [[ "$kind" == relay ]] && ax+=(--all-proxy="$RELAY")
     [[ -f "$RELAY_CA" ]] && ax+=(--ca-certificate="$RELAY_CA")
-    if "$ARIA2" "${ax[@]}" --allow-overwrite=true -x 8 -s 8 -k 1M --max-tries=2 --timeout=30 \
+    if "$ARIA2" "${ax[@]}" "${akh[@]}" --allow-overwrite=true -x 8 -s 8 -k 1M --max-tries=2 --timeout=30 \
          --summary-interval=0 --console-log-level=warn --show-console-readout=false \
          --auto-file-renaming=false --connect-timeout=5 \
          -o "$(basename "$out")" -d "$(dirname "$out")" "$url" >"$alog" 2>&1; then okflag=1; fi
@@ -329,8 +367,12 @@ fetch_one() {
     [[ $okflag -eq 1 ]] || info "  aria2 失败，改用 curl"
   fi
   if [[ $okflag -eq 0 ]]; then
-    curl -sS $(opts_of "$kind") -L --connect-timeout 5 --retry 2 --max-time 1800 \
-      -o "$out" "$url" >&2 && okflag=1
+    # 必须校验 HTTP 状态码：镜像对不存在的资产会回 200 + "Not Found" 正文，
+    # 只看 curl 退出码会把 9 字节的 "Not Found" 当成下载成功（实测踩到）。
+    local code
+    code=$(curl -sS $(opts_of "$kind") -L --connect-timeout 5 --retry 2 --max-time 1800 \
+      -o "$out" -w '%{http_code}' "${auth[@]}" "$url" 2>/dev/null || echo 000)
+    [[ "$code" == 2* ]] && okflag=1 || info "  curl 拿到 http=$code"
   fi
   if [[ $okflag -eq 0 ]] && have_node; then
     info "  curl 没成，改用 node fetch"
@@ -339,8 +381,15 @@ fetch_one() {
     node_download "${ndl[@]}" && okflag=1
   fi
   [[ $okflag -eq 1 && -s "$out" ]] || return 1
-  # 拿到 HTML 说明是错误页/拦截页，不是目标文件
-  head -c 200 "$out" | grep -qi '<!DOCTYPE html' && return 1
+  # 拿到 HTML / 短文本说明是错误页/拦截页，不是目标文件。
+  # 只判 HTML 不够：镜像对 404 会回 200 + 正文 "Not Found"（9 字节），
+  # 不加这个检查就会把错误页当成品写进目标路径。
+  if (( $(stat -c %s "$out" 2>/dev/null || echo 0) < 4096 )); then
+    if head -c 200 "$out" | grep -qiE '<!DOCTYPE html|<html|^Not Found$|Bad Gateway|^404:|"message"\s*:\s*"Not Found"'; then
+      info "  产物是错误页（$(head -c 40 "$out" | tr -d '\r\n')…），丢弃"
+      return 1
+    fi
+  fi
   if (( fsize > 0 )); then
     local got; got=$(stat -c %s "$out" 2>/dev/null || echo 0)
     (( got == fsize )) || { info "  大小不符（$got / $fsize），丢弃重试"; return 1; }
@@ -429,11 +478,12 @@ cmd_download() {
 cmd_asset() {
   local repo="${1:?需要 owner/repo}" tag="${2:?需要 tag}" name="${3:?需要文件名}"
   shift 3
-  local out="" sha=""
+  local out="" sha="" via=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -o|--out) out="$2"; shift 2 ;;
       -s|--sha256) sha="$2"; shift 2 ;;
+      --via) via="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
@@ -450,19 +500,24 @@ cmd_asset() {
     json=$(cmd_api "repos/$repo/releases/tags/$tag" 2>/dev/null || true)
     # 用 node 解析而不是 grep 正则：release JSON 里 assets[] 的元素含嵌套对象（uploader），
     # "{[^{}]*}" 这类非贪婪花括号匹配一个都匹配不到（实测 obj len = 0）。
-    id=$(printf "%s" "$json" | node -e '
+    # 一次拿 id + size：size 直接来自 release JSON 的 assets[].size，
+    # 不要去 HEAD 资产端点 —— 它 302 到 release-assets 后 HEAD 会被拒/超时
+    # （实测 5 s 解析超时），拿不到 content-length。
+    local meta
+    meta=$(printf "%s" "$json" | node -e '
       let s=""; process.stdin.on("data",d=>s+=d);
       process.stdin.on("end",()=>{
         try { const j=JSON.parse(s); const a=(j.assets||[]).find(x=>x.name===process.argv[1]);
-              if (a) process.stdout.write(String(a.id)); } catch(e){}
+              if (a) process.stdout.write(a.id + " " + (a.size||0)); } catch(e){}
       });
     ' "$name" 2>/dev/null || true)
+    id="${meta%% *}"
+    local asize="${meta#* }"
+    [[ "$asize" =~ ^[0-9]+$ ]] || asize=0
     if [[ -n "$id" ]]; then
       local aurl="https://api.github.com/repos/$repo/releases/assets/$id"
-      info "release-assets 通道（asset $id）→ $out"
-      if curl -sS $(opts_of rest) -L --retry 3 --connect-timeout 5 --max-time 1800 -o "$out" \
-           -H "Authorization: token $t" -H "Accept: application/octet-stream" "$aurl" >&2 \
-         && [[ -s "$out" ]] && ! head -c 200 "$out" | grep -qi '<!DOCTYPE html'; then
+      info "release-assets 通道（asset $id，$(( asize / 1048576 )) MiB）→ $out"
+      if fetch_one rest "$aurl" "$out" "$asize"; then
         verify_out "$out" ${sha:+-s "$sha"}; return 0
       fi
       if have_node; then
@@ -473,7 +528,7 @@ cmd_asset() {
     fi
   fi
 
-  cmd_download "https://github.com/$repo/releases/download/$tag/$name" --out "$out" ${sha:+-s "$sha"}
+  cmd_download "https://github.com/$repo/releases/download/$tag/$name" --out "$out" ${sha:+-s "$sha"} ${via:+--via "$via"}
 }
 
 # 委派官方 gh：api.github.com → release-assets.githubusercontent.com（本机实测可达）
@@ -635,8 +690,8 @@ cmd_raw() {
         try { const j = JSON.parse(s);
           if (j && j.content && j.encoding === "base64") {
             process.stdout.write(Buffer.from(j.content, "base64").toString("utf8"));
-          } else { process.exit(1); }
-        } catch (e) { process.exit(1); }
+          } else { process.exitCode = 1; }
+        } catch (e) { process.exitCode = 1; }
       });
     ' 2>/dev/null)
     if [[ -n "$b64" ]]; then printf "%s\n" "$b64"; return 0; fi
