@@ -171,7 +171,7 @@ fatal: unable to fork
 
 **只有一份实现：本仓库的 `tools/github.sh`。**
 
-`C:/Users/Admin/.skills-vault/download/scripts/github.sh` 现在是一个 **10 行转发器（shim）**，执行时 `exec` 到本仓库的这份，自己不含任何逻辑：
+`C:/Users/Admin/.skills-vault/download/scripts/github.sh` 现在是一个 **转发器（shim）**（29 行 / 1099 B，真正的逻辑只有定位 + `exec` 那 10 行，其余是注释），执行时 `exec` 到本仓库的这份，自己不含任何逻辑：
 
 ```bash
 bash C:/Users/Admin/.skills-vault/download/scripts/github.sh status   # 跑的是仓库里的真身，不是另一份实现
