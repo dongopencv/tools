@@ -25,7 +25,7 @@
 - **`git clone` / `git push` 一律用 SSH**：`git@github.com:owner/repo.git`。HTTPS 写操作在本机三条路全死（直连被墙 / 本地 8899 MITM 反代只读 / 镜像不转发写）。
 - 所有 GitHub 操作（API / 下载 / clone / push）优先走网关脚本 `tools/github.sh`，别各处手搓 `curl`/`gh`/`git`：
   `bash tools/github.sh asset owner/repo v1.2.3 file.zip -s <sha256>`
-  用法见 `tools/README.md`（#5 落地）；背景与踩坑见 `C:\Users\Admin\.skills-vault\download\SKILL.md` 的「GitHub 唯一入口」一节。
+  用法见 `tools/README.md`（#5 落地）。**权威副本是本仓库的 `tools/github.sh`**；`skills-vault` 里那份是旧副本（缺 `ghdl`/`env`/`relay`，且仍有 `sha256sum` 反斜杠 bug），只在凭据相关（`setup-gh.sh`、`.github-token`）时参考，别照它改。
 - `gh release download` **本身是可用的**：它走 `api.github.com` 拿 302 跳到 `release-assets.githubusercontent.com`，全程不经 github.com（实测 2.3 MB 资产秒下）。网关的价值是镜像回退 + SHA256 校验 + 断点续传，不是「gh 不能用」。
 - **`github.com` 域名的兜底是 8899 中转站**（本地 MITM 反代 → `gh-proxy.com`）：`bash tools/github.sh relay up` 后加 `--via relay`，或给任意进程塞 `HTTPS_PROXY=http://127.0.0.1:8899`。实测 15,721,375 B 资产 25 s / 612 KiB/s（同域直连是 21 s 超时）。它只代理 GitHub 家族域名、只读；登录时由计划任务 `\dsh-gh-proxy` 自启（电池模式不启动），没起就 `relay up`；细节见 `docs/network-baseline.md` 第四节。
 
@@ -73,7 +73,12 @@ gh issue view 3 --json number   # 成功 = 宽策略；报 pipe: Access is denie
 
 - token 只存在 `C:\Users\Admin\.skills-vault\download\scripts\.github-token`，**不进仓库、不进 issue 正文、不进任何被 git 跟踪的文件**。
 - `.workbuddy/` 整个目录不提交。它的 `memory/` 里天然会出现明文口令、PIN、token——这类文件只该留在本机。
-- 提交前自查：`git diff --cached | grep -iE 'ghp_|pin|password|token'` 应为空。
+- 提交前自查（**只匹配真正的凭据形状，不是散文关键词**）：
+  ```bash
+  git diff --cached | grep -nE 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|(PIN|pin|password|passwd|token)[[:space:]]*[:=][[:space:]]*[^[:space:]'"'"']{6,}'
+  ```
+  命中即为闸门失败。旧版本写的是 `grep -iE 'ghp_|pin|password|token'`——这个词表会命中 55 行正常散文
+  （"token 文件"、"PIN 码"…），等于永远失败、于是没人看，**不能当校验用**。
 - 已经泄露过的口令，删文件不够（历史提交里还在）。处置顺序：先轮换口令，再评估是否改写历史。
 
 ## Agent skills
@@ -89,3 +94,21 @@ The five canonical triage roles, each label string equal to its role name. See `
 ### Domain docs
 
 single-context. See `docs/agents/domain.md`.
+
+## 仓库的双重定位
+
+这个仓库不只管工具，也管**认知**。两件事都必须持续维护：
+
+| 用途 | 落点 | 说明 |
+|---|---|---|
+| 工具与脚本管理 | `tools/`、`AGENTS.md`、`docs/*.md`（research 除外） | 这台机器上跑了什么、怎么用、踩过什么坑 |
+| 个人认知管理 | `docs/research/` | 对重要外部项目的长期跟踪结论、判断依据，以及**后来被推翻的判断** |
+
+`docs/research/` 的写法要求：
+
+- 结论必须能追到**源码位置（带行号）或一次实测**，不能只写「感觉它很成熟」。
+- 每条采纳建议必须写明**适用边界与失效条件**——什么情况下这条不成立。
+- 保留被推翻的判断（标出「原以为是 X，证据是 Y」）。认知管理的价值在记录**判断如何变化**，不在只留正确答案。
+- 引用外部项目源码时写相对路径（`src/policy.ts`），不写本机绝对路径；临时副本放 `work/`（不提交）。
+
+现有研究笔记：[docs/research/superagent.md](docs/research/superagent.md)——DSH Superagent 原型，长期跟踪中。

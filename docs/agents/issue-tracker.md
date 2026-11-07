@@ -53,7 +53,24 @@ Used by `/wayfinder`. The **map** is a single issue with **child** issues as tic
 - 下载 release 资产、raw 文件优先走网关脚本（镜像回退 + SHA256 校验 + 断点续传）：
   `bash tools/github.sh asset owner/repo v1.2.3 file.zip -s <sha256>`
 - `gh release download` **不是不能用**：它经 `api.github.com` 302 到 `release-assets.githubusercontent.com`，全程不经 github.com，本机实测可用。网关的价值在镜像回退与校验，不是替代它。
-- 详细原因与踩坑记录见 `C:\Users\Admin\.skills-vault\download\SKILL.md` 的「GitHub 唯一入口」一节。
+- 详细原因与踩坑记录见 `tools/README.md`（本仓库权威副本）；`C:\Users\Admin\.skills-vault\download\SKILL.md` 是同一套做法的旧说明，命令仍可用但没跟上仓库里的修复。
+
+### API 走网关单入口
+
+#5 的要求是「把 GitHub 访问收敛到 `github.sh` 单入口」，所以**读 API 优先走网关**：
+它自带 gh → curl → node 三级选路，还能把「GitHub 返回 4xx/5xx」和「传输器坏了」分开报
+（裸 `gh api` 只能给你一个退出码）。
+
+```bash
+# 读（等价于 gh api，但错误分类更清楚）
+bash tools/github.sh api repos/dongopencv/tools/issues/3 --jq '.title'
+# 某个仓库没有 latest release 时报「GitHub 返回错误」，不再报「网络故障」
+bash tools/github.sh api repos/<owner>/<repo>/releases/latest
+```
+
+裸 `gh api` 仍然可用（它是网关的第一级传输器），但**新写脚本时优先用网关**。
+**例外**：issue 的写操作（comment / edit / close / 父子边）走 `gh issue ...` / `gh api --method`，
+网关的 `api` 子命令只封装了 GET。
 
 ## agent 会话里的行为差异（取决于文件策略，不是机器属性）
 
@@ -67,7 +84,7 @@ gh issue view 3 --json number   # 成功 = 宽策略；报 pipe: Access is denie
 |---|---|---|
 | `gh issue`/`gh list` 不带 `-R` | ✅ 自动从 git remote 推断 | ❌ `failed to run git: pipe: Access is denied.` |
 | `gh api …` | ✅ | ✅ 路径自带 owner/repo，不需要 fork git |
-| `gh issue view <n> --comments` | ✅ | ❌ 静默返回空（退出码 0） |
+| `gh issue view <n> --comments` | ✅ | ❌ 退出码 1、stdout 空、stderr `failed to run git: pipe: Access is denied.`（**不是**静默返回空） |
 | `curl` 任意 HTTPS | ✅ | ❌ `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS` |
 | `git fetch`/`push`/`ls-remote` | ✅ | ❌ `cannot create standard input pipe for ssh: Permission denied` |
 | `node -e` 的 `fetch` | ✅ | ✅ 沙箱内最稳的出网方式 |

@@ -68,9 +68,13 @@ if ($policy -eq "Restricted") {
 # 脚本被 `irm <url> | iex` 单独执行时没有脚本目录，会退回直连并给出提示。
 $script:GitHubGateway = $null
 foreach ($cand in @(
-    $(if ($PSScriptRoot) { Join-Path $PSScriptRoot "toolsgithub.sh" }),
-    (Join-Path $HOME "projPC1	oolsgithub.sh"),
-    "D:projPC1	oolsgithub.sh"
+    # 脚本在仓库里：<repo>/octop-install.ps1 → <repo>/tools/github.sh
+    $(if ($PSScriptRoot) { Join-Path $PSScriptRoot "tools/github.sh" }),
+    # 仓库的上一级（<parent>/tools/github.sh）
+    $(if ($PSScriptRoot) { Join-Path (Split-Path -Parent $PSScriptRoot) "tools/github.sh" }),
+    # 本机固定位置
+    (Join-Path $HOME "proj/PC1/tools/github.sh"),
+    "D:/proj/PC1/tools/github.sh"
 )) {
     if ($cand -and (Test-Path $cand)) { $script:GitHubGateway = (Resolve-Path $cand).Path; break }
 }

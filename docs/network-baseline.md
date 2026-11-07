@@ -4,7 +4,7 @@
 AGENTS.md 里那条「大于 50 MB 不要用 git push」的判据，来源就是这里。
 
 采测环境：DESKTOP-OGBQE3B（192.168.1.38），Asia/Shanghai，2026-11-06 02:00–02:20。
-测量方式：`node` 的 `fetch`（本机 `curl` 在沙箱里全废，见文末「已知不成立的做法」），每次记录实际 body 字节数与墙钟耗时。
+测量方式：`node` 的 `fetch`（本机 `curl` 在沙箱里全废，见第七节「只在 workspace-write 沙箱里成立的做法/失败」），每次记录实际 body 字节数与墙钟耗时。
 
 ## 一、下行实测
 
@@ -25,7 +25,9 @@ AGENTS.md 里那条「大于 50 MB 不要用 git push」的判据，来源就是
 **结论**：下行本身不慢。国际 CDN（Cloudflare）4–6 MB/s，GitHub 自己的 codeload / api tarball 0.5–1.6 MB/s。
 小文件（<1 MB）的「速率」基本是延迟噪声，别拿它算带宽。
 
-> 与 AGENTS.md 旧记录（「下行同时段约 90 KB/s」）不一致。旧数是 2026-11-06 早些时候、疑似单线程小文件测出来的，本次独立复测明显更高。**以本表为准**，旧数保留在 AGENTS.md 里作为历史对照。
+> AGENTS.md 现在只写分层结论、不再给单一下行数字，逐条实测以**本表**为准。
+> 历史变更：2026-11-06 早些时候记过「下行同时段约 90 KB/s」，那是单线程小文件测出来的延迟噪声，
+> 后来独立复测明显更高，该数字已从 AGENTS.md 删除（2026-11-07 复核，两处不再互相引用）。
 
 ## 二、上行实测
 
@@ -35,7 +37,8 @@ AGENTS.md 里那条「大于 50 MB 不要用 git push」的判据，来源就是
 | 2,000,000 B → 同上 | 14.54 s | 134 KB/s |
 | 2,000,000 B → 同上 | 10.77 s | 181 KB/s |
 
-**结论**：上行 134–364 KB/s，大载荷稳态约 **140–180 KB/s**——和 AGENTS.md 记的「上行 140–200 KB/s」吻合。
+**结论**：上行 134–364 KB/s，大载荷稳态约 **140–180 KB/s**。后续批量复测见到 58–364 KB/s 的更宽区间，
+所以规划一律按 **150 KB/s** 保守估（AGENTS.md 记的就是这个值，两边一致）。
 上行是本机的瓶颈，下行不是。所有「大文件怎么传」的判据都应该用上行来算。
 
 ## 三、通道可达性
@@ -44,14 +47,14 @@ AGENTS.md 里那条「大于 50 MB 不要用 git push」的判据，来源就是
 |---|---|---|
 | `api.github.com:443` | ✅ 通 | `gh` 与 `github.sh api` 走这条，不受 443 封锁影响 |
 | `github.com:443` | ❌ 不通 | 被墙。网页、raw、release 直链全部不通 |
-| `ssh.github.com:443` | ✅ 通 | **git push 的主力通道**，5/5 成功 |
-| `github.com:22` | ⚠️ 时通时不通 | 本次探测 CLOSED；历史上约 4/5 成功率。有 443 就别赌 22 |
+| `ssh.github.com:443` | ✅ 通 | 03:53 复测 5/6 通；当天早些时候 5/5 全通。脚本默认走 22，需要 443 时用 `ssh.github.com:443` |
+| `github.com:22` | ✅ 通（波动） | 03:53 复测 6/6 通；02:33 同一小时内测到 CLOSED，历史上约 4/5 成功率。**两个端口都试**，别赌任一个 |
 | `codeload.github.com` | ✅ 通 | GitHub 的归档下载域，意外地没被墙 |
 | `gh-proxy.com` | ✅ 通 | 镜像，转发 GitHub 资产 |
 | `ghfast.top` | ✅ 通 | 镜像。02:13 复测 `fetch failed`、02:33 复测 200 且转发资产 206——**时好时坏，别默认可用** |
 | `ghproxy.net` | ✅ 通 | 镜像。02:33 复测转发资产 206，1 MB range 5.2 s |
 | `registry.npmmirror.com` | ⚠️ 时通时不通 | 02:13 复测 `fetch failed` |
-| `release-assets.githubusercontent.com` | ✅ 通 | `api.github.com` 资产端点 302 的落点，**预签名 URL，直连可达**，是本机最快路径 |
+| `release-assets.githubusercontent.com` | ✅ 通 | `api.github.com` 资产端点 302 的落点，**预签名 URL，直连可达**。同一批 324 MB 资产实测 5.09 MiB/s（ghfast 3.39、gh-proxy 1.32），是资产下载的最优路径 |
 
 ## 四、中转站（8899）：镜像站代理这条链
 
@@ -86,13 +89,13 @@ GitHub
 
 - **该用**：要碰 `github.com` 本体（网页、release 直链、HTTPS clone）的兜底；某一个镜像域名抽风时（`ghfast.top` 就 30 分钟内从 `fetch failed` 变 200），换这条链往往立刻可用。
 - **别用**：`api.github.com` 直连本来通且更快——`gh` / `github.sh api` 塞代理是白绕一圈、多付一次 MITM。
-- **做不到**：写。上游 `gh-proxy.com` 不转发 push，`git push` 仍只走 SSH（`ssh.github.com:443`）。
+- **做不到**：写。上游 `gh-proxy.com` 不转发 push，`git push` 仍只走 SSH（22 或 443，见第三节）。
 
 ## 五、选路策略（照这个执行）
 
 | 场景 | 走哪条 | 判据 |
 |---|---|---|
-| 代码 / 文档提交 | `git push` 走 SSH（`ssh.github.com:443`） | 单次 < 10 MB |
+| 代码 / 文档提交 | `git push` 走 SSH（默认 22 端口 `git@github.com:owner/repo.git`，22 不通改 `ssh.github.com:443`） | 单次 < 10 MB |
 | 仓库单次 push 总量 | 尽量 ≤ 20 MB | 上行 150 KB/s 时约 2.3 分钟；超过就该拆 |
 | **> 50 MB 的产物** | **release 资产，禁止 git push** | 50 MB ÷ 150 KB/s ≈ 5.7 分钟，且失败要重传整包；release 支持断点与校验 |
 | 下载 release 资产 / raw | `bash tools/github.sh asset\|raw ...` | 走镜像选路 + SHA256 校验 |
@@ -158,7 +161,7 @@ gh issue view 3 --json number   # 成功 = 宽策略；报 pipe: Access is denie
 | `git fetch`/`push`/`ls-remote` | ❌ `cannot create standard input pipe for ssh: Permission denied` | ✅ `git push --dry-run` 正常 |
 | `git clone` 走 `file://` | ❌ 同样 `unable to fork`（要 fork `git-upload-pack`） | ✅ 正常；本地复制仍建议 `cp -r` |
 | `gh` 不带 `-R` | ❌ `failed to run git: pipe: Access is denied` | ✅ 自动从 git remote 推断 |
-| `gh issue view --comments` | ❌ 静默返回空 | ✅ 正常输出评论 |
+| `gh issue view --comments` | ❌ 退出码 1、stdout 空、stderr `failed to run git: pipe: Access is denied.` | ✅ 正常输出评论 |
 
 **结论**：这是文件/进程策略的差异，不是网络或安装问题。写文档时按「策略相关」表述，别写成绝对结论。
 

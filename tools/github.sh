@@ -6,7 +6,7 @@
 #       github.com 的 443 被墙，api.github.com 通，release 资产要选路，
 #       token 只在网关里读取一次。
 #
-# 下载通道（按序探测，取探测到字节数最大的那条）：
+# 下载通道（按候选表顺序直接试，失败或大小不符才换下一条；不做预探测）：
 #   relay   本机中转站 127.0.0.1:8899。MITM 反代，把 github 家族域名改写到镜像站。
 #           优点：URL 不用改，任何工具都能透明走；中转站在线时自动进入候选。
 #   mirror  gh-proxy.com / ghfast.top / ghproxy.net 前缀改写（直连镜像站）。
@@ -29,6 +29,7 @@
 #   github.sh raw <owner/repo> <ref> <path>
 #
 # 退出码：0 成功 / 1 参数或环境错误 / 2 网络全通道失败 / 3 校验失败
+#         4 受限会话：git 无法 fork 传输进程（clone/push 在沙箱里注定失败，需普通终端）
 set -uo pipefail
 # 关掉通配符展开：curl_opts 会产出 "--noproxy *"，星号必须保持字面量
 set -f
@@ -62,7 +63,7 @@ die()  { echo "[fail] $1" >&2; exit "${2:-1}"; }
 gh_bin() {
   command -v gh 2>/dev/null && return 0
   local c
-  for c in "/c/Program Files/GitHub CLI/gh.exe"            "/c/Program Files (x86)/GitHub CLI/gh.exe"            "$LOCALAPPDATA/GitHubCLI/bin/gh.exe"            /c/Users/Admin/.local/bin/gh.exe; do
+  for c in "/c/Program Files/GitHub CLI/gh.exe"            "/c/Program Files (x86)/GitHub CLI/gh.exe"            "${LOCALAPPDATA:-$HOME/AppData/Local}/GitHubCLI/bin/gh.exe"            /c/Users/Admin/.local/bin/gh.exe; do
     [[ -x "$c" ]] && { echo "$c"; return 0; }
   done
   return 1
@@ -97,7 +98,6 @@ curl_opts() {
   fi
   return 0
 }
-CSL=(); while IFS= read -r x; do CSL+=("$x"); done < <(curl_opts rest)
 
 opts_of() { local -a a=(); while IFS= read -r v; do a+=("$v"); done < <(curl_opts "$1"); echo "${a[*]}"; }
 
@@ -205,26 +205,39 @@ node_probe() {
   ' "$url" 2>/dev/null || echo "000 0"
 }
 
-# gh api 可用性（一次 status 内只测一次）
-GH_API_OK=""
-gh_api_ok() {
-  if [[ -z "$GH_API_OK" ]]; then
-    local g
-    if g=$(gh_bin) && "$g" api user >/dev/null 2>&1; then GH_API_OK=1; else GH_API_OK=0; fi
+# ── SSH 通道选路 ──
+# 文档一直写「默认 22，22 不通改 ssh.github.com:443」，但 2026-11-06 复核发现代码只拼
+# git@github.com:owner/repo.git，端口从不切换——文档承诺的兜底根本没实现。
+# 这里先探 github.com:22（/dev/tcp 探测，一个 TCP 握手，几十毫秒）；不通就换成
+# ssh://git@ssh.github.com:443/owner/repo.git。实测 22 端口同一小时内会整段不通。
+ssh_port_ok() { (exec 3<>/dev/tcp/"$1"/"$2") 2>/dev/null; }
+ssh_target() {
+  if ssh_port_ok github.com 22; then echo "22 github.com"; else echo "443 ssh.github.com"; fi
+}
+ssh_url_of() {
+  local repo="$1"
+  if ssh_port_ok github.com 22; then
+    echo "git@github.com:$repo.git"
+  else
+    info "github.com:22 不通 → 改走 ssh.github.com:443" >&2
+    echo "ssh://git@ssh.github.com:443/$repo.git"
   fi
-  [[ "$GH_API_OK" == 1 ]]
 }
 
 # git 能否 fork 远端助手（不能则 push/fetch/clone 在本会话里全废）
+# 输出两行：第一行状态（ok / blocked / unknown / n/a），第二行人话说明。
+# 以前是 "blocked|说明" 这种三元字符串，调用方用 ${fork#*|} 剥前缀——状态和文案挤在
+# 同一个变量里，多一个状态就得改所有解析点。现在调用方这样读：
+#   local fork fork_msg; { read -r fork; read -r fork_msg; } < <(git_fork_state)
 git_fork_state() {
   local out
-  git rev-parse --show-toplevel >/dev/null 2>&1 || { echo "n/a|不在 git 仓库里"; return 0; }
+  git rev-parse --show-toplevel >/dev/null 2>&1 || { printf 'n/a\n不在 git 仓库里\n'; return 0; }
   out=$(git ls-remote "$(git remote get-url origin 2>/dev/null || echo .)" HEAD 2>&1 || true)
   case "$out" in
     *"cannot create standard input pipe"*|*"unable to fork"*|*"Permission denied"*)
-      echo "blocked|沙箱禁止 git fork 管道（cannot create standard input pipe）" ;;
-    "") echo "unknown|git ls-remote 无输出" ;;
-    *)  echo "ok|git 远端通道可用" ;;
+      printf 'blocked\n沙箱禁止 git fork 管道（cannot create standard input pipe）\n' ;;
+    "") printf 'unknown\ngit ls-remote 无输出\n' ;;
+    *)  printf 'ok\ngit 远端通道可用\n' ;;
   esac
 }
 
@@ -569,17 +582,17 @@ cmd_clone() {
   local repo="${1:?需要 owner/repo}" dir="${2:-$(basename "$1")}"
   [[ "$repo" == */* ]] || die "clone: 需要 owner/repo"
   local url="https://github.com/$repo.git"
-  local ssh_url="git@github.com:$repo.git"
+  local ssh_url; ssh_url=$(ssh_url_of "$repo")
 
   # 本会话的 git 能不能 fork 传输进程？不能的话 clone 在这里注定全灭，先说清楚
-  local fork; fork=$(git_fork_state)
+  local fork fork_msg; { read -r fork; read -r fork_msg; } < <(git_fork_state)
   case "$fork" in
-    blocked\|*)
-      warn "${fork#*|}"
+    blocked)
+      warn "$fork_msg"
       warn "  clone 在本会话里跑不了（git 连 git-remote-https 都 fork 不出来）。"
       warn "  在普通终端执行即可："
       warn ""
-      warn "    git clone git@github.com:$repo.git $dir"
+      warn "    git clone $(ssh_url_of "$repo") $dir"
       warn ""
       warn "  或者只读分析某个仓库的源码：github.sh api repos/$repo/contents/<path>"
       return 4 ;;
@@ -627,21 +640,21 @@ cmd_clone() {
 cmd_push() {
   local repo="${1:?需要 owner/repo}" ref="${2:-HEAD}" remote="${3:-origin}"
   [[ "$repo" == */* ]] || die "push: 需要 owner/repo"
-  local fork; fork=$(git_fork_state)
+  local fork fork_msg; { read -r fork; read -r fork_msg; } < <(git_fork_state)
   case "$fork" in
-    blocked\|*)
-      warn "当前会话的 git 起不了传输进程：${fork#*|}"
+    blocked)
+      warn "当前会话的 git 起不了传输进程：$fork_msg"
       warn ""
       warn "这不是仓库或网络的问题，是受限会话（沙箱）禁止 git fork 子进程。"
       warn "本地提交照常可用；推送要在一个普通终端里执行："
       warn ""
-      warn "  git push git@github.com:$repo.git $ref"
+      warn "  git push $(ssh_url_of "$repo") $ref"
       warn ""
       warn "要在这个会话里确认推送成功，用：github.sh api repos/$repo/commits/<sha> 对照。"
       return 4 ;;
   esac
-  [[ -f "$HOME/.ssh/id_ed25519_gh" ]] || die "push: 缺 SSH 密钥 ~/.ssh/id_ed25519_gh（先跑 setup-gh.sh）" 1
-  local ssh_url="git@github.com:$repo.git"
+  [[ -f "$HOME/.ssh/id_ed25519_gh" ]] || die "push: 缺 SSH 密钥 ~/.ssh/id_ed25519_gh（先跑 setup-gh.sh——它在 skills-vault 里，不在本仓库：C:/Users/Admin/.skills-vault/download/scripts/setup-gh.sh）" 1
+  local ssh_url; ssh_url=$(ssh_url_of "$repo")
   info "push → $ssh_url ($ref @ $remote)"
   local t0 t1 rc out
   t0=$(date +%s)
@@ -653,7 +666,7 @@ cmd_push() {
   # 即便检测漏掉了，也把 fork 拒绝翻译成人话
   case "$out" in
     *"cannot create standard input pipe"*|*"unable to fork"*)
-      warn "git 无法 fork 传输进程（受限会话）。请在普通终端执行：git push git@github.com:$repo.git $ref"
+      warn "git 无法 fork 传输进程（受限会话）。请在普通终端执行：git push $(ssh_url_of "$repo") $ref"
       warn "$out"
       return 4 ;;
   esac
@@ -664,7 +677,8 @@ cmd_push() {
 cmd_sshcheck() {
   [[ -f "$HOME/.ssh/id_ed25519_gh" ]] || { warn "没有 ~/.ssh/id_ed25519_gh"; return 1; }
   local out
-  out=$(timeout 25 ssh -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1)
+  local port host; read -r port host < <(ssh_target)
+  out=$(timeout 25 ssh -p "$port" -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -T "git@$host" 2>&1)
   case "$out" in
     *"successfully authenticated"*) ok "$out"; return 0 ;;
     *) warn "SSH 认证失败: $out"; return 1 ;;
@@ -720,8 +734,27 @@ cmd_raw() {
 }
 
 # 打印可直接 eval 的 export：让当前 shell 里任意工具（gh / git / npm / curl）透明走中转站
+# env 有两种用法，之前只做了第一种却写成「打印脚本会用的环境变量」：
+#   github.sh env              → 打印可直接 eval 的代理 export（中转站在跑才有）
+#   github.sh env --config     → 打印脚本实际读取/推导的全部配置变量及当前值（不要求中转站）
 cmd_env() {
-  relay_up || die "中转站没在跑（先 github.sh relay up）" 1
+  if [[ "${1:-}" == "--config" || "${1:-}" == "-c" ]]; then
+    printf '%-24s %s\n' \
+      GITHUB_TOKEN_FILE   "$TOKEN_FILE（$( [[ -s "$TOKEN_FILE" ]] && echo 存在 || echo 缺失 )）" \
+      GITHUB_DL_DIR       "$DL_DIR" \
+      GITHUB_RELAY        "$RELAY" \
+      GITHUB_RELAY_HOST   "$RELAY_HOST" \
+      GITHUB_RELAY_PORT   "$RELAY_PORT" \
+      GITHUB_RELAY_SERVER "$RELAY_SERVER（$( [[ -f "$RELAY_SERVER" ]] && echo 存在 || echo 缺失 )）" \
+      GITHUB_RELAY_CA     "$RELAY_CA（$( [[ -f "$RELAY_CA" ]] && echo 存在 || echo 缺失 )）" \
+      ARIA2C              "$ARIA2（$( command -v "$ARIA2" >/dev/null 2>&1 && echo 在 PATH || echo 不在 PATH )）" \
+      GITHUB_ARIA2_MIN    "$ARIA2_MIN" \
+      GITHUB_PROBE        "$PROBE（1 = 回到先测速再选路的旧策略）" \
+      GITHUB_PROBE_BYTES  "$PROBE_BYTES" \
+      GITHUB_PROBE_TIMEOUT "$PROBE_TIMEOUT"
+    return 0
+  fi
+  relay_up || die "中转站没在跑（先 github.sh relay up；只想知道配置就加 --config）" 1
   echo "export HTTP_PROXY=$RELAY"
   echo "export HTTPS_PROXY=$RELAY"
   echo "export http_proxy=$RELAY"
@@ -786,15 +819,17 @@ cmd_status() {
   fi
   local t who="" how=""
   if t=$(gh_token) && [[ -n "$t" ]]; then
-    # 依次试 gh → node → curl，谁先成功用谁；失败时如实说是哪个传输器失败
+    # 顺序必须和 cmd_api 一致：gh → curl → node。三处（api / status / asset）以前各写一套，
+    # 同一台机器上「谁先谁后」都不一样，读代码的人没法预测。统一成这一个顺序。
+    # 失败时如实说是哪个传输器失败，不把传输器问题栽给凭据。
     if g=$(gh_bin) && who=$(GH_TOKEN="$t" "$g" api user --jq .login 2>/dev/null) && [[ -n "$who" ]]; then
       how="gh api"
-    elif raw=$(node_get "https://api.github.com/user" "$t" 2>/dev/null) && [[ -n "$raw" ]]; then
-      who=$(printf "%s" "$raw" | grep -o "\"login\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | cut -d"\"" -f4)
-      how="node fetch"
     elif raw=$(curl -sS $(opts_of rest) --max-time 15 -H "Authorization: token $t" -H "Accept: application/vnd.github+json" https://api.github.com/user 2>/dev/null) && [[ -n "$raw" ]]; then
       who=$(printf "%s" "$raw" | grep -o "\"login\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | cut -d"\"" -f4)
       how="curl"
+    elif raw=$(node_get "https://api.github.com/user" "$t" 2>/dev/null) && [[ -n "$raw" ]]; then
+      who=$(printf "%s" "$raw" | grep -o "\"login\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | cut -d"\"" -f4)
+      how="node fetch"
     fi
     if [[ -n "$who" ]]; then ok "api.github.com 认证为: $who（经 $how）"
     else warn "三个传输器都没能认证 api.github.com —— 先看上面「传输器」一节，别急着换 token"; fi
@@ -853,71 +888,84 @@ cmd_status() {
   done
   if [[ $sshok -eq 1 ]]; then
     local out
-    out=$(timeout 20 ssh -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 || true)
+    local sport shost; read -r sport shost < <(ssh_target)
+    out=$(timeout 20 ssh -p "$sport" -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -T "git@$shost" 2>&1 || true)
     case "$out" in
       *"successfully authenticated"*) ok "SSH 认证: $(printf "%s" "$out" | head -1)" ;;
-      *) warn "SSH 端口通但认证未过（密钥未注册？跑 setup-gh.sh 的 stage 4）" ;;
+      *) warn "SSH 端口通但认证未过（密钥未注册？跑 skills-vault 里的 setup-gh.sh stage 4：C:/Users/Admin/.skills-vault/download/scripts/setup-gh.sh——不在本仓库）" ;;
     esac
   fi
 
   echo "── git 传输（本会话能不能 push/fetch） ──" >&2
-  local fork; fork=$(git_fork_state)
+  local fork fork_msg; { read -r fork; read -r fork_msg; } < <(git_fork_state)
   case "$fork" in
-    ok\|*)      ok "git 可以起远端进程：${fork#*|}" ;;
-    blocked\|*) warn "${fork#*|}"
-                warn "  本会话只能本地提交；push/fetch/clone 要人在普通终端跑。" ;;
-    *)          warn "${fork#*|}" ;;
+    ok)      ok "git 可以起远端进程：$fork_msg" ;;
+    blocked) warn "$fork_msg"
+             warn "  本会话只能本地提交；push/fetch/clone 要人在普通终端跑。" ;;
+    *)       warn "$fork_msg" ;;
   esac
 }
 
 # api：先 gh，再 curl，最后 node。三者的失败理由不一样，不能混为一谈。
 # gh 自带 TLS 栈且处理分页/JSON；curl 在本机可能没有 TLS 凭据句柄；node 永远兜底。
 cmd_api() {
-  local method=GET path="" data=() jq=""
+  local method=GET path="" jq="" body="" x
+  local -a fields=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -X|--method) method="$2"; shift 2 ;;
-      -f|--field)  data+=(-d "$2"); shift 2 ;;
-      -F|--raw)    data+=(--data-raw "$2"); shift 2 ;;
+      -f|--field)  fields+=("$2"); shift 2 ;;
+      -F|--raw)    body="$2"; shift 2 ;;
       --jq)        jq="$2"; shift 2 ;;
       -*)          die "api: 未知选项 $1" ;;
-      *)           if [[ -z "$path" ]]; then path="$1"; else data+=(-d "$1"); fi; shift ;;
+      *)           if [[ -z "$path" ]]; then path="$1"; else fields+=("$1"); fi; shift ;;
     esac
   done
   [[ -n "$path" ]] || die "api: 需要 API 路径，例如 repos/owner/repo"
   [[ "$path" == /* ]] || path="/$path"
 
   # 1) gh api —— 最稳，且能直接 --jq
-  local g out rc i gerr
+  #    gh 的字段参数是 -f k=v（= --raw-field，字符串）；整段 JSON body 用 --input <文件>。
+  #    不要把 -d 塞给 gh：gh 没有 -d，它只认 -f/-F/--input。
+  local g out rc i gerr bodyf=""
   if g=$(gh_bin); then
     local -a gargs=(api -X "$method")
     [[ -n "$jq" ]] && gargs+=(--jq "$jq")
-    if [[ ${#data[@]} -gt 0 ]]; then
-      local x
-      for x in "${data[@]}"; do [[ "$x" != -d ]] && gargs+=(-f "$x"); done
+    if [[ -n "$body" ]]; then
+      bodyf=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/gbody.$$")
+      printf '%s' "$body" > "$bodyf" 2>/dev/null || bodyf=""
+      [[ -n "$bodyf" ]] && gargs+=(--input "$bodyf")
+    elif [[ ${#fields[@]} -gt 0 ]]; then
+      for x in "${fields[@]}"; do gargs+=(-f "$x"); done
     fi
     gargs+=("${path#/}")
     gerr=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/gherr.$$")
     if out=$("$g" "${gargs[@]}" 2>"$gerr"); then
-      rm -f "$gerr" 2>/dev/null
+      rm -f "$gerr" 2>/dev/null; [[ -n "$bodyf" ]] && rm -f "$bodyf" 2>/dev/null
       echo "$out"; return 0
     fi
     # gh 报 HTTP 错误说明传输本身是通的，API 明确拒绝了这个路径——照实说，别再换传输器
     if grep -qi "HTTP [45][0-9][0-9]" "$gerr" 2>/dev/null; then
-      rm -f "$gerr" 2>/dev/null
+      rm -f "$gerr" 2>/dev/null; [[ -n "$bodyf" ]] && rm -f "$bodyf" 2>/dev/null
       die "api: GitHub 返回错误 → $method $path" 3
     fi
-    rm -f "$gerr" 2>/dev/null
+    rm -f "$gerr" 2>/dev/null; [[ -n "$bodyf" ]] && rm -f "$bodyf" 2>/dev/null
   fi
 
   local t; t=$(gh_token 2>/dev/null || true)
   [[ -n "$t" ]] || die "api: 没有 token，且 gh 调用失败" 2
 
-  # 2) curl
+  # 2) curl —— 字段用 -d k=v，整段 body 用 --data-raw
+  local -a cargs=()
+  if [[ -n "$body" ]]; then
+    cargs+=(--data-raw "$body")
+  else
+    for x in "${fields[@]}"; do cargs+=(-d "$x"); done
+  fi
   for ((i=1; i<=2; i++)); do
     out=$(curl -sS $(opts_of rest) --max-time 30 -X "$method" -H "Authorization: token $t" \
       -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
-      "${data[@]}" "https://api.github.com$path" 2>/dev/null)
+      "${cargs[@]}" "https://api.github.com$path" 2>/dev/null)
     rc=$?
     if [[ $rc -eq 0 && -n "$out" ]]; then
       # HTTP 错误也算成功到达：把状态码带出来
@@ -929,8 +977,8 @@ cmd_api() {
     (( i < 2 )) && sleep 1
   done
 
-  # 3) node fetch（GET 兜底；有 body 的写请求不走这条）
-  if [[ "$method" == GET ]]; then
+  # 3) node fetch（只兜底 GET；带 body 的写请求没有 node 实现，别假装成功）
+  if [[ "$method" == GET && -z "$body" && ${#fields[@]} -eq 0 ]]; then
     if out=$(node_get "https://api.github.com$path" "$t" 2>/dev/null) && [[ -n "$out" ]]; then
       echo "$out"; return 0
     fi

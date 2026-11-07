@@ -30,7 +30,7 @@ bash tools/github.sh <子命令> [参数…]
 | `push` | 推送（只走 SSH） | `bash tools/github.sh push owner/repo HEAD` |
 | `ghdl` | 委派官方 `gh release download` | `bash tools/github.sh ghdl owner/repo v1.2.3 -p '*.zip'` |
 | `sshcheck` | 只测 SSH 密钥认证 | `bash tools/github.sh sshcheck` |
-| `env` | 打印脚本会用的环境变量 | `bash tools/github.sh env` |
+| `env` | 打印可直接 eval 的代理 export（中转站在跑才有）；`--config` 打印全部配置变量的当前值 | `eval "$(bash tools/github.sh env)"` / `bash tools/github.sh env --config` |
 | `relay` | 起停本地 8899 中转站 | `bash tools/github.sh relay up` |
 | `token` | 打印 token（调试用，**别贴进 issue/日志**） | `bash tools/github.sh token` |
 
@@ -46,6 +46,10 @@ bash tools/github.sh <子命令> [参数…]
 3. **`node` 的 `fetch`** —— 永远兜底，本机实测稳定可用。
 
 `status` 会分别报告「传输器」和「token 认证」两节，就是为了不把传输器故障误读成凭据故障。
+
+> 这个顺序在 `api`、`status`、`asset` 三处**曾经各不相同**（有的 gh→node→curl，有的只有
+> gh→node），同一台机器上「谁先谁后」读代码都预测不出来。2026-11-07 统一成 gh → curl → node
+> 一条，以后加传输器只改一处。
 
 ### 下载选路（2026-11-06 重做）
 
@@ -110,14 +114,32 @@ fatal: unable to fork
 再回退 node fetch。`curl` 在同一沙箱里是 `SEC_E_NO_CREDENTIALS`。
 **所以沙箱里真正把文件拉下来的通常是 node fetch 这一段**，前两级是给正常终端用的。
 
+### 退出码
+
+脚本只在有明确语义时才返回非零，方便在别的脚本里判断；不要只看「有没有输出」。
+
+| 码 | 含义 | 典型场景 |
+|---|---|---|
+| `0` | 成功 | 下载完成并通过 SHA256、API 返回 JSON、push 成功 |
+| `1` | 参数或环境错误 | 缺 `owner/repo`、未知选项、缺 SSH 密钥、push 被服务端拒绝 |
+| `2` | 网络全通道失败 | 候选通道全试过仍失败；`api` 三个传输器全挂 |
+| `3` | 校验失败 / API 明确拒绝 | SHA256 不符、下到 HTML 错误页；GitHub 返回 4xx/5xx（**传输是通的**，别去查网） |
+| `4` | 受限会话 | git 无法 fork 传输进程（沙箱），clone/push/fetch 注定失败，需普通终端 |
+
+`3` 与 `2` 的区别是有意的：`2` 说明路不通，`3` 说明路通了但结果不对。历史上把
+「GitHub 返回 404」当成传输失败，排查方向直接跑偏。
+
 ### 环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `GITHUB_TOKEN_FILE` | `tools/.github-token`，若不存在则回退 `C:/Users/Admin/.skills-vault/download/scripts/.github-token` | token 文件（**不在仓库里**，靠 `.gitignore` 的 `*.token` 挡住） |
 | `GITHUB_DL_DIR` | `$HOME/Downloads/github` | 下载落地目录 |
-| `GITHUB_RELAY` | `http://127.0.0.1:8899` | 本地中转站 |
+| `GITHUB_RELAY` | `http://127.0.0.1:8899` | 本地中转站地址（喂给代理变量） |
+| `GITHUB_RELAY_HOST` | `127.0.0.1` | 中转站主机（`relay_up` 用它做 TCP 探活） |
+| `GITHUB_RELAY_PORT` | `8899` | 中转站端口（同上） |
 | `GITHUB_RELAY_SERVER` | `/c/Users/Admin/dsh-mirror-proxy/server.mjs` | 中转站服务文件 |
+| `GITHUB_RELAY_CA` | `/c/Users/Admin/dsh-mirror-proxy/certs/ca.crt.pem` | 中转站 MITM 证书；存在时 `env` 会一起导出 `NODE_EXTRA_CA_CERTS` |
 | `ARIA2C` | `aria2c` | aria2 可执行文件 |
 | `GITHUB_ARIA2_MIN` | `8388608` | 文件小于这个字节数就不用 aria2（小文件多连接是负优化） |
 | `GITHUB_PROBE` | `0` | 设 `1` 回到「先逐通道测速再选」的旧策略 |
@@ -143,6 +165,15 @@ fatal: unable to fork
 现在 `fetch_one` 校验 `%{http_code}` 必须是 `2xx`，并对小于 4 KiB 的产物再查一遍
 `<!DOCTYPE html` / `Not Found` / `Bad Gateway` / `404:` 等错误页特征。
 实测：不存在的资产现在是 **exit=2**，日志写 `[fail] 下载失败（候选表里的通道全试过…）`。
+
+### 这份脚本与 skills-vault 里那份的关系
+
+`C:/Users/Admin/.skills-vault/download/scripts/github.sh`（421 行、只读、由 skill 分发）是**旧副本**，
+仍然带着 `sha256sum "$out"` 的 Windows 反斜杠误判。**本仓库的 `tools/github.sh` 才是权威版本**：
+它多了 `ghdl` / `env` / `relay` 三个子命令、修掉了校验 bug、也修了 aria2 / curl 的沙箱降级路径。
+
+两份并存本身就是隐患——两个「唯一入口」等于没有入口。收敛方向：以本仓库为准，vault 副本只在
+`setup-gh.sh` 与 `.github-token` 这两件**凭据相关**的事上仍有价值。改动不要只改 vault 那份。
 
 ### 相关文档
 
