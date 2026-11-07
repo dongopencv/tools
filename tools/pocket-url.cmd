@@ -1,0 +1,3 @@
+@echo off
+chcp 65001 >nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$l='C:\Users\Admin\.dsh\dsh-pocket\cloudflared.log'; if(-not (Test-Path $l)){Write-Host '没有隧道日志：计划任务 dsh-pocket-tunnel 还没跑成功过'; exit 1}; $m=[regex]::Matches((Get-Content $l -Raw),'https://[a-z0-9-]+\.trycloudflare\.com'); if($m.Count -eq 0){Write-Host '日志里没有 URL（隧道没起成功，去任务计划里重跑 dsh-pocket-tunnel）'; exit 1}; $u=$m[$m.Count-1].Value; Write-Host ('公网地址: ' + $u); $p='C:\Users\Admin\.dsh\dsh-pocket\token'; if(Test-Path $p){Write-Host ('访问密码: ' + (Get-Content $p -Raw).Trim())}; try{ $r=Invoke-WebRequest ($u + '/') -UseBasicParsing -TimeoutSec 20; Write-Host ('自检: HTTP ' + $r.StatusCode + '（出现 DSH Pocket 访问验证页即正常）') }catch{ Write-Host ('自检失败: ' + $_.Exception.Message) }"
