@@ -166,14 +166,21 @@ fatal: unable to fork
 `<!DOCTYPE html` / `Not Found` / `Bad Gateway` / `404:` 等错误页特征。
 实测：不存在的资产现在是 **exit=2**，日志写 `[fail] 下载失败（候选表里的通道全试过…）`。
 
-### 这份脚本与 skills-vault 里那份的关系
+### 这份脚本与 skills-vault 里那份的关系（2026-11-07 已收敛）
 
-`C:/Users/Admin/.skills-vault/download/scripts/github.sh`（421 行、只读、由 skill 分发）是**旧副本**，
-仍然带着 `sha256sum "$out"` 的 Windows 反斜杠误判。**本仓库的 `tools/github.sh` 才是权威版本**：
-它多了 `ghdl` / `env` / `relay` 三个子命令、修掉了校验 bug、也修了 aria2 / curl 的沙箱降级路径。
+**只有一份实现：本仓库的 `tools/github.sh`。**
 
-两份并存本身就是隐患——两个「唯一入口」等于没有入口。收敛方向：以本仓库为准，vault 副本只在
-`setup-gh.sh` 与 `.github-token` 这两件**凭据相关**的事上仍有价值。改动不要只改 vault 那份。
+`C:/Users/Admin/.skills-vault/download/scripts/github.sh` 现在是一个 **10 行转发器（shim）**，执行时 `exec` 到本仓库的这份，自己不含任何逻辑：
+
+```bash
+bash C:/Users/Admin/.skills-vault/download/scripts/github.sh status   # 跑的是仓库里的真身，不是另一份实现
+```
+
+- 定位顺序：`$GITHUB_GATEWAY` → `$HOME/proj/PC1/tools/github.sh` → `/d/proj/PC1/tools/github.sh`。仓库换位置就 `export GITHUB_GATEWAY=/path/to/tools/github.sh`。
+- 收敛前 vault 那份是 421 行旧副本（缺 `ghdl`/`env`/`relay`，且带着 `sha256sum "$out"` 的 Windows 反斜杠误判），已备份为同目录 `github.sh.bak-2026-11-07-pre-shim`。**不要再改那份备份、也不要照着它改。**
+- vault 根 `~/.skills-vault` 是三个客户端的 junction 目标（`~/.workbuddy/skills`、`~/.trae-cn/skills`、`~/.dsh/skills`），所以 `bash <任意客户端>/download/scripts/github.sh` 走到的都是同一个真身。
+- vault 里仍独立存在的只有两件**凭据相关**的东西：`setup-gh.sh`（五段向导）与 `.github-token`（token 文件，真身也把它当 fallback 读，见脚本第 37–41 行）。它们不属于网关实现，不在收敛范围内。
+- 改网关只改本仓库 `tools/github.sh`，commit + push；vault 侧不需要同步，也不会再分叉。
 
 ### 相关文档
 
