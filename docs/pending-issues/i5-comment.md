@@ -4,7 +4,7 @@
 
 ### 做法
 
-`C:/Users/Admin/.skills-vault/download/scripts/github.sh` 从 421 行实现换成 **10 行转发器**：
+`C:/Users/Admin/.skills-vault/download/scripts/github.sh` 从 421 行实现换成 **转发器**（29 行 / 1099 B，逻辑只有下面这 10 行，其余是注释）：
 
 ```bash
 #!/usr/bin/env bash

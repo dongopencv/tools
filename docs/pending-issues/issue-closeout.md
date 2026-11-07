@@ -38,7 +38,7 @@ gh api -X PATCH repos/dongopencv/tools/issues/2 -F body=@/tmp/i2.md
 第 11 条要写的内容：
 
 > **11. 同一个脚本不许留两份实现，哪怕其中一份「只是旧一点」。**
-> `tools/github.sh` 的真身在仓库，`skills-vault` 里那份 2026-11-07 收敛成了 10 行转发器（`exec` 到真身，
+> `tools/github.sh` 的真身在仓库，`skills-vault` 里那份 2026-11-07 收敛成了转发器（29 行，逻辑只有定位 + `exec` 那 10 行；执行时 `exec` 到真身，
 > 可用 `GITHUB_GATEWAY` 覆盖）。判据：文档里出现的每个入口，都必须能 `exec` 到同一份实现；
 > 否则两份会各自长 bug（旧副本至今带着 `sha256sum "$老家"` 那条反斜杠 bug）。
 > 附带一条实测：MSYS bash 里 `ln -s <绝对路径>` **不建符号链接、而是复制实体文件**，所以收敛只能靠转发脚本。
