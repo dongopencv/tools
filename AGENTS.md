@@ -18,7 +18,7 @@
 **`github.com` 的 HTTPS（443）被墙**，直连 100% 超时。可达的只有：
 
 - `api.github.com` — `gh` CLI 走这条，不受影响
-- SSH `ssh.github.com:443`（实测稳定通）与 `github.com:22`（**时通时不通**，2026-11-06 同一小时内测到 02:33 CLOSED / 02:40 OPEN）— 这是唯一的 `git push` 通道，**优先 443**
+- SSH `github.com:22` 与 `ssh.github.com:443`（2026-11-06 03:53 复测：22 端口 6/6 通、443 端口 5/6 通；当天早些时候 22 曾整段不通、443 全通）— 这是唯一的 `git push` 通道。**脚本默认走 22**（`git@github.com:owner/repo.git`），22 不通时改走 `ssh.github.com:443`
 
 因此：
 
@@ -31,7 +31,7 @@
 
 ## 实测网络速度（2026-11-06）
 
-**上行才是瓶颈**：2026-11-06 实测 58–364 KB/s，随 4G 时段波动很大，按 **150 KB/s** 估工期。下行总体不慢，但分层明显：国际 CDN 2–6 MB/s；`release-assets.githubusercontent.com` 与可用镜像 2–12 MB/s；GitHub 归档（`codeload` / `api tarball`）0.5–1.6 MB/s，小文件被延迟主导可低到 185 KB/s，且偶发 `Connection was reset`，别当大文件中转。
+**上行才是瓶颈**：2026-11-06 实测 58–364 KB/s，随 4G 时段波动很大，按 **150 KB/s** 估工期。下行总体不慢，但分层明显：国际 CDN 2–6 MB/s；`release-assets.githubusercontent.com` 与可用镜像在同一批资产上 1.3–5.1 MiB/s；GitHub 归档（`codeload` / `api tarball`）0.5–1.6 MB/s，小文件被延迟主导可低到 19 KB/s。逐条实测见 `docs/network-baseline.md`——**别用这里的摘要数字当带宽用**，那里才是表格。
 
 - 20 MB 的 push 约 1.5–2.5 分钟 → 单次 push 尽量 ≤ 20 MB。
 - **大于 50 MB 的东西不要用 git push 传**（50 MB ÷ 150 KB/s ≈ 5.7 分钟，且失败要整包重传），改用 release 资产。
@@ -50,7 +50,7 @@ gh issue view 3 --json number   # 成功 = 宽策略；报 pipe: Access is denie
 |---|---|---|
 | `gh issue` / `gh list` 不带 `-R` | ✅ 自己从 git remote 推断 | ❌ `failed to run git: pipe: Access is denied.`，须加 `-R owner/repo` 或 `GH_REPO=` |
 | `gh api …` | ✅ | ✅ 路径自带 owner/repo，不需要 fork git |
-| `gh issue view <n> --comments` | ✅ | ❌ 静默返回空（退出码 0），改用 `gh api .../issues/<n>/comments` |
+| `gh issue view <n> --comments` | ✅ | ❌ 退出码 1、stdout 空、stderr `failed to run git: pipe: Access is denied.`（**不是**静默返回空） |
 | `curl` 任意 HTTPS | ✅ | ❌ `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS` |
 | `node -e` 的 `fetch` | ✅ | ✅ 沙箱内最稳的出网方式 |
 | `git` 本地操作 | ✅ | ✅ commit / branch / worktree / diff / log 都正常 |
@@ -59,6 +59,15 @@ gh issue view 3 --json number   # 成功 = 宽策略；报 pipe: Access is denie
 
 含义：**沙箱会话里能改文件、能本地 commit、能读写 issue，但推不上去**——push 交给宽策略会话或人在终端跑。
 反过来，**别把某一种策略下的观察当成这台机器的固有事实写进文档**：本仓库上一版就把沙箱的限制写成了「本机缺陷」，逐条复测后全部推翻（见 #3）。
+
+## 复用与自研：不要重复造轮子
+
+**判断一个东西是不是轮子，只看它有没有被大量测试过、并把测试暴露的问题修掉。**
+看着能跑、代码漂亮、AI 现写的——都不算轮子，自娱自乐而已。
+
+- 有批量验证（高 star + 生产使用 + 持续维护，至少两项可查）→ 直接复用，别自己写。
+- 没有批量验证 → 不管它多合理，都不要当基础件；自己写更不该当基础件。
+- 自研只允许出现在"确实没人做过"的空白处，且必须先证明空白存在（搜过、比对过、留证据）。
 
 ## 凭据纪律
 
