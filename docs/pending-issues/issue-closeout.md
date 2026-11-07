@@ -45,9 +45,19 @@ gh api -X PATCH repos/dongopencv/tools/issues/2 -F body=@/tmp/i2.md
 
 ### 4. 报一次处理进度
 
-```bash
-# deck_issue_report 需 auth；恢复后对 2/3/4/5 各报一次
-```
+deck 上报要先把票读回来，读不回来就报不了。2026-11-08 02:1x 实测四次全失败：
+
+| 票 | `deck_issue_report` 返回 |
+|---|---|
+| #2 | `这张票没上报（票 2 没读回来，后端原话：gh: Bad credentials (HTTP 401)）` |
+| #3 | `这张票没上报（票 3 没读回来，后端原话：get: repo.refId missing: pc1）` |
+| #4 | `…gh: Bad credentials (HTTP 401)` |
+| #5 | `…gh: Bad credentials (HTTP 401)` |
+
+恢复身份后的顺序：① 先确认 `gh api repos/dongopencv/tools/issues/2 --jq .number` 返回数字而不是 401；
+② 再对 2/3/4/5 各跑一次 `deck_issue_report`。
+#3 那条 `get: repo.refId missing: pc1` 是**另一个**缺陷（见 `deck-refid-bug.md`），与身份无关，
+身份回来后仍会复现——先把那条缺陷票建出来。
 
 ## 恢复身份的两条路（任选一，人来做）
 
