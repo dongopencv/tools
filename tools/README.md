@@ -5,6 +5,7 @@
 | 文件 | 用途 |
 |---|---|
 | `github.sh` | GitHub 访问的**唯一入口**：API、release 资产、raw、clone、push、通道体检 |
+| `attention.sh` | 票库注意力视图：等我拍板 / agent 可接 / 被阻塞 / 沉睡 |
 
 ## github.sh
 
@@ -187,3 +188,37 @@ bash C:/Users/Admin/.skills-vault/download/scripts/github.sh status   # 跑的�
 - `docs/network-baseline.md` —— 上下行实测、通道可达性、选路判据（>50 MB 不走 git push）
 - `AGENTS.md` —— 本机网络限制与凭据纪律
 - `docs/agents/issue-tracker.md` —— issue 操作约定（含沙箱内跑 `gh` 的坑）
+## attention.sh
+
+票越开越多、大部分卡在别人的票后面，于是干脆不看了。这个脚本把整个票库收敛成
+**「今天该管哪几件」**，人只管从里面挑一件。
+
+```bash
+bash tools/attention.sh              # 默认全部，沉睡阈值 3 天
+bash tools/attention.sh --days 7     # 沉睡阈值改成 7 天
+bash tools/attention.sh --blocks     # 额外打印阻塞链的下一动作
+bash tools/attention.sh -R o/r       # 换仓库（默认 dongopencv/tools）
+```
+
+输出分五段，另加可选的第六段：
+
+| 段 | 判据 | 含义 |
+|---|---|---|
+| 1. 等我拍板 | 无人认领 + 有 `w:grilling` 或 `needs-triage` | **我不决定，它就永远停着**。这是唯一必须由人做的事 |
+| 2. agent 可接 | 无人认领 + 无 OPEN 阻塞者 + 非上面两类 | 即 wayfinder 的 frontier，可以直接认领开工 |
+| 3. 被阻塞 | 有 OPEN 阻塞者 | 显示「等 <- #a,#b」，先动左边才能动右边 |
+| 4. 地图进度 | label `wayfinder:map` | 子票张数 + 开图天数 |
+| 5. 沉睡 | 最后 update >= N 天 | 该降级、合并或关掉，别再假装还在跟 |
+| 6. 阻塞链（--blocks） | 被阻塞段的展开 | 「#阻塞者 -> #被阻塞者 阻塞者标题」 |
+
+设计要点：
+
+- **只读**：不发任何写请求，不改票、不打标签、不 assign。判断权留在人手里。
+- 一次 `gh issue list --json …,blockedBy,parent,assignees` 取全量，靠 gh 自带聚合，
+  不逐票 round-trip（35 张票 1 次调用，约 2 秒）。
+- **字段分隔符用 `|` 不用 TAB**：bash 的 `IFS` 把 TAB 当空白类，连续 TAB 会塌成一个，
+  空字段（未认领、无标签、无父票）会让整行左移 —— 2026-11-08 实测踩过，症状是
+  `date: invalid date 会话治理的路线裁决…` 和所有区间都是 `(空)`。
+- 年龄用 `date -d` 算，失败回退 0：一条坏日期不该毁掉整个视图。
+
+2026-11-08 首次实跑（沉睡 3d）：合计 open 35 张，等我 7 · 可接 11 · 被阻塞 12 · 地图 5 · 沉睡 14。
