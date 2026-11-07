@@ -15,7 +15,7 @@
 # 用法：
 #   github.sh status                       # 自检：gh / token / 身份 / 各通道 / SSH
 #   github.sh env                          # 打印 export，eval 后当前 shell 全走中转站
-#   github.sh relay [up|down|status]       # 中转站起停查
+#   github.sh relay [up|down|deploy|status] # 中转站起停查 / 部署新版本（多上游回退）
 #   github.sh token                        # 打印 token（供其它脚本 $(...) 取用）
 #   github.sh api <path>                   # GET api.github.com（自动带 token）
 #   github.sh api -X POST <path> -f k=v    # 带 body 的写操作
@@ -53,6 +53,10 @@ RELAY_HOST="${GITHUB_RELAY_HOST:-127.0.0.1}"
 RELAY_PORT="${GITHUB_RELAY_PORT:-8899}"
 RELAY_SERVER="${GITHUB_RELAY_SERVER:-/c/Users/Admin/dsh-mirror-proxy/server.mjs}"
 RELAY_CA="${GITHUB_RELAY_CA:-/c/Users/Admin/dsh-mirror-proxy/certs/ca.crt.pem}"
+# 中转站运行目录：server.mjs 是部署副本，证书与日志都在这里（源码在 tools/relay/，用 deploy.sh 同步）
+RELAY_HOME="${GITHUB_RELAY_HOME:-/c/Users/Admin/dsh-mirror-proxy}"
+RELAY_CERT_DIR="${RELAY_CERT_DIR:-$RELAY_HOME/certs}"
+RELAY_LOG_DIR="${RELAY_LOG_DIR:-$RELAY_HOME/logs}"
 
 info() { echo "$*" >&2; }
 ok()   { echo "[ok] $*" >&2; }
@@ -244,18 +248,47 @@ git_fork_state() {
 # ── 中转站探测 / 起停 ──
 relay_up() { (exec 3<>/dev/tcp/$RELAY_HOST/$RELAY_PORT) 2>/dev/null; }
 
+# 中转站版本探针：新版有 /__relay/status（能报上游顺序与超时），旧版没有。
+# 它决定了「回退」是不是真的存在——旧版只认死一个上游 gh-proxy.com。
+relay_version() {
+  relay_up || { echo none; return 0; }
+  local body
+  body=$(curl -s --max-time 5 "$RELAY/__relay/status" 2>/dev/null)
+  case "$body" in
+    *'"ok": true'*|*'"ok":true'*) echo multi ;;
+    *) echo legacy ;;
+  esac
+}
+
 relay_start() {
-  relay_up && { echo "[ok] 中转站已在跑 ($RELAY)" >&2; return 0; }
+  if relay_up; then
+    case "$(relay_version)" in
+      legacy) warn "中转站已在跑，但它是**单上游旧版**（无 /__relay/status）；跑 github.sh relay deploy 换成多上游回退版" ;;
+      *)      ok "中转站已在跑 ($RELAY)" ;;
+    esac
+    return 0
+  fi
   [[ -f "$RELAY_SERVER" ]] || { warn "中转站服务文件不存在: $RELAY_SERVER"; return 1; }
   command -v node >/dev/null 2>&1 || { warn "没有 node，起不了中转站"; return 1; }
-  info "拉起中转站: node $RELAY_SERVER"
-  nohup node "$RELAY_SERVER" >/dev/null 2>&1 &
+  info "拉起中转站: node $RELAY_SERVER（证书 $RELAY_CERT_DIR）"
+  RELAY_CERT_DIR="$RELAY_CERT_DIR" RELAY_LOG_DIR="$RELAY_LOG_DIR" \
+    nohup node "$RELAY_SERVER" >/dev/null 2>&1 &
   local i
   for i in $(seq 1 40); do
     relay_up && { ok "中转站就绪 ($RELAY)"; return 0; }
     sleep 0.25
   done
   warn "中转站启动超时"
+  return 1
+}
+
+# 把仓库里的 tools/relay/server.mjs 部署到运行目录并重启（备份 + 自检）
+relay_deploy() {
+  local script
+  for script in "$SCRIPT_DIR/relay/deploy.sh" "/d/proj/PC1/tools/relay/deploy.sh"; do
+    [[ -f "$script" ]] && { RELAY_DEPLOY_DIR="$RELAY_HOME" RELAY_PORT="$RELAY_PORT" bash "$script" "$@"; return $?; }
+  done
+  warn "找不到 relay/deploy.sh（应在仓库 tools/relay/ 下）"
   return 1
 }
 
@@ -746,7 +779,10 @@ cmd_env() {
       GITHUB_RELAY_HOST   "$RELAY_HOST" \
       GITHUB_RELAY_PORT   "$RELAY_PORT" \
       GITHUB_RELAY_SERVER "$RELAY_SERVER（$( [[ -f "$RELAY_SERVER" ]] && echo 存在 || echo 缺失 )）" \
+      GITHUB_RELAY_HOME   "$RELAY_HOME" \
       GITHUB_RELAY_CA     "$RELAY_CA（$( [[ -f "$RELAY_CA" ]] && echo 存在 || echo 缺失 )）" \
+      RELAY_CERT_DIR      "$RELAY_CERT_DIR" \
+      RELAY_LOG_DIR       "$RELAY_LOG_DIR" \
       ARIA2C              "$ARIA2（$( command -v "$ARIA2" >/dev/null 2>&1 && echo 在 PATH || echo 不在 PATH )）" \
       GITHUB_ARIA2_MIN    "$ARIA2_MIN" \
       GITHUB_PROBE        "$PROBE（1 = 回到先测速再选路的旧策略）" \
@@ -770,8 +806,18 @@ cmd_relay() {
   case "${1:-status}" in
     up)     relay_start ;;
     down)   relay_stop ;;
-    status) if relay_up; then ok "中转站在线: $RELAY"; else warn "中转站未运行: $RELAY"; fi ;;
-    *)      die "relay: 只支持 up|down|status" ;;
+    deploy) shift; relay_deploy "$@" ;;
+    status)
+      if relay_up; then
+        case "$(relay_version)" in
+          multi)  ok "中转站在线: $RELAY（多上游回退版）"; curl -s --max-time 5 "$RELAY/__relay/status" | sed 's/^/  /'; echo >&2 ;;
+          legacy) warn "中转站在线: $RELAY，但是**单上游旧版**（无回退）。github.sh relay deploy 可换成新版" ;;
+          *)      ok "中转站在线: $RELAY" ;;
+        esac
+      else
+        warn "中转站未运行: $RELAY（github.sh relay up 拉起）"
+      fi ;;
+    *)      die "relay: 只支持 up|down|deploy|status" ;;
   esac
 }
 
@@ -838,7 +884,12 @@ cmd_status() {
   fi
 
   echo "── 中转站 ──" >&2
-  if relay_up; then ok "在线 $RELAY（下载通道之一，也是 gh/git 的透明代理）"
+  if relay_up; then
+    case "$(relay_version)" in
+      multi)  ok "在线 $RELAY，多上游回退版（下载通道之一，也是 gh/git 的透明代理）" ;;
+      legacy) warn "在线 $RELAY，但是单上游旧版：上游 gh-proxy.com 挂了就整条断。github.sh relay deploy 换新版" ;;
+      *)      ok "在线 $RELAY" ;;
+    esac
   else warn "未运行（github.sh relay up 可拉起；不影响镜像通道）"; fi
 
   echo "── 通道可达性（用 node fetch 探测，绕开 curl 的 TLS 问题）──" >&2

@@ -32,7 +32,7 @@ bash tools/github.sh <子命令> [参数…]
 | `ghdl` | 委派官方 `gh release download` | `bash tools/github.sh ghdl owner/repo v1.2.3 -p '*.zip'` |
 | `sshcheck` | 只测 SSH 密钥认证 | `bash tools/github.sh sshcheck` |
 | `env` | 打印可直接 eval 的代理 export（中转站在跑才有）；`--config` 打印全部配置变量的当前值 | `eval "$(bash tools/github.sh env)"` / `bash tools/github.sh env --config` |
-| `relay` | 起停本地 8899 中转站 | `bash tools/github.sh relay up` |
+| `relay` | 起停/部署本地 8899 中转站（`deploy` 把仓库版同步到运行目录并重启） | `bash tools/github.sh relay up` / `relay deploy` |
 | `token` | 打印 token（调试用，**别贴进 issue/日志**） | `bash tools/github.sh token` |
 
 ### 传输器选路
@@ -140,7 +140,10 @@ fatal: unable to fork
 | `GITHUB_RELAY_HOST` | `127.0.0.1` | 中转站主机（`relay_up` 用它做 TCP 探活） |
 | `GITHUB_RELAY_PORT` | `8899` | 中转站端口（同上） |
 | `GITHUB_RELAY_SERVER` | `/c/Users/Admin/dsh-mirror-proxy/server.mjs` | 中转站服务文件 |
-| `GITHUB_RELAY_CA` | `/c/Users/Admin/dsh-mirror-proxy/certs/ca.crt.pem` | 中转站 MITM 证书；存在时 `env` 会一起导出 `NODE_EXTRA_CA_CERTS` |
+| `GITHUB_RELAY_HOME` | `/c/Users/Admin/dsh-mirror-proxy` | 中转站运行目录（证书与日志都在这里；真身是仓库 `tools/relay/server.mjs`，用 `relay deploy` 同步） |
+| `GITHUB_RELAY_CA` | `<RELAY_HOME>/certs/ca.crt.pem` | 中转站 MITM 证书；存在时 `env` 会一起导出 `NODE_EXTRA_CA_CERTS` |
+| `RELAY_CERT_DIR` | `<RELAY_HOME>/certs` | 传给 server.mjs 的证书目录 |
+| `RELAY_LOG_DIR` | `<RELAY_HOME>/logs` | 传给 server.mjs 的日志目录 |
 | `ARIA2C` | `aria2c` | aria2 可执行文件 |
 | `GITHUB_ARIA2_MIN` | `8388608` | 文件小于这个字节数就不用 aria2（小文件多连接是负优化） |
 | `GITHUB_PROBE` | `0` | 设 `1` 回到「先逐通道测速再选」的旧策略 |

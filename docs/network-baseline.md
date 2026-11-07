@@ -63,24 +63,29 @@ AGENTS.md 里那条「大于 50 MB 不要用 git push」的判据，来源就是
 
 ## 四、中转站（8899）：镜像站代理这条链
 
-思路是「在本机起一个代理，把 GitHub 家族的流量统一改道去镜像站」——不用改 URL、不用改各工具配置，只给进程塞一个 `HTTPS_PROXY`：
+思路是「在本机起一个代理，把 GitHub 家族的流量统一改道去镜像站」——不用改 URL、不用改各工具配置，只给进程塞一个 `HTTPS_PROXY`（或让网关脚本自动走）：
 
 ```
 curl / git / gh / aria2c
         ↓  HTTPS_PROXY=http://127.0.0.1:8899
-本地 MITM 反代  C:\Users\Admin\dsh-mirror-proxy\server.mjs   (node, 127.0.0.1:8899)
-        ↓  解密后重写 URL
-https://gh-proxy.com/https://<原域名><原路径>          ← 镜像站
+本地 MITM 反代  tools/relay/server.mjs → 部署副本 C:\Users\Admin\dsh-mirror-proxy\server.mjs
+        ↓  解密后重写 URL，多上游按序回退
+https://ghfast.top/https://<原域名><原路径>     ← 首选
+https://gh-proxy.com/…  https://ghproxy.net/…  ← 失败就换下一个
         ↓
 GitHub
 ```
 
-- **只碰 GitHub**：仅对 10 个 GitHub 家族域名做 MITM 重写（`github.com` / `raw.githubusercontent.com` / `objects.githubusercontent.com` / `gist.github.com` / `github.githubassets.com` / `avatars.*` / `user-images.*` / `camo.*` / `media.*` / `githubusercontent.com`）；**其它域名一律普通 CONNECT 隧道直连，不解密**（`server.mjs:18-29`、`:48-51`）。
-- **证书是自签的**：MITM 用本地 CA `dsh-mirror-proxy/certs/ca.crt.pem`，客户端必须显式信任（curl `--cacert`、node `NODE_EXTRA_CA_CERTS`）。Windows Schannel 版 curl 还要加 `--ssl-no-revoke`，否则吊销查询失败直接断连——网关脚本 `curl_opts` 已按 Schannel 自动补。
-- **起停**：`bash tools/github.sh relay up|down|status`（`up` 用 `nohup node server.mjs` 拉起）。另有一个**登录时触发**的计划任务 `\dsh-gh-proxy` 负责自启：`node.exe …\node\bin\node.exe C:\Users\Admin\dsh-mirror-proxy\server.mjs`，起始目录 `C:\Users\Admin\dsh-mirror-proxy`。注意它的电源策略是「在电池模式停止 / 不用电池启动」，且「只使用交互方式」——**拔掉电源或非交互登录它不会起**，此时 `relay status` 会报未运行，手动 `relay up` 即可。
-- **网关里是一等通道**：`download` 的探测列表含 relay（`--via relay` 可强制）；`asset` / `ghdl` / `clone` 在别路失败时回落到它。
+- **只碰 GitHub**：仅对 10 个 GitHub 家族域名做 MITM 重写（`github.com` / `raw.githubusercontent.com` / `objects.githubusercontent.com` / `gist.github.com` / `github.githubassets.com` / `avatars.*` / `user-images.*` / `camo.*` / `media.*` / `githubusercontent.com`）；**其它域名一律普通 CONNECT 隧道直连、不解密**。
+- **源码在仓库、运行在别处**：真身是 `tools/relay/server.mjs`；`C:\Users\Admin\dsh-mirror-proxy\server.mjs` 是**部署副本**（那个目录不是 git 仓库）。改完源码用 `bash tools/github.sh relay deploy`（= `tools/relay/deploy.sh`）同步：语法检查 → 备份 → 拷贝 → 停旧进程 → 起新进程 → 打 `/__relay/status` 自检。
+- **多上游回退（2026-11-08 落地）**：旧版写死单上游 `gh-proxy.com`，它一抽风整条链就死。新版默认顺序 `ghfast.top → gh-proxy.com → ghproxy.net`，可由 `RELAY_UPSTREAMS`（逗号分隔）覆盖；单次尝试超时 `RELAY_ATTEMPT_TIMEOUT_MS`（默认 15000）。遇到 5xx/429/连接错误/超时即换下一个，全失败才回 502 `all upstreams failed`；成功的上游会被**置顶记忆**（进程内），日志里有 `ORDER` 行。
+- **版本判据**：`curl -s http://127.0.0.1:8899/__relay/status` 有响应 = 新版（能报上游顺序与超时）；没响应 = 旧版没有回退。`github.sh relay status` / `github.sh status` 都会打这个判据，看到「单上游旧版」就说明该 deploy 了。
+- **证书是自签的**：MITM 用本地 CA `certs/ca.crt.pem`，客户端必须显式信任（curl `--cacert`、node `NODE_EXTRA_CA_CERTS`）。Windows Schannel 版 curl 还要加 `--ssl-no-revoke`，否则吊销查询失败直接断连——网关脚本 `curl_opts` 已按 Schannel 自动补。
+- **证书续期（定时炸弹）**：CA 到 2036-11-02，但 **leaf 只到 2028-11-02**；而且目录里**没有 CA 私钥**，所以届时不能用同一 CA 重签，只能换一套新 CA 并重装信任库。`tools/relay/gen-certs.sh` 就是为此写的：`--dry-run` 会打出现有证书剩余天数，实跑会生成新 CA + 覆盖 `MITM_HOSTS` 全部 13 条 SAN 的 leaf 并自检通过（实测 `2026-11-08` 生成到 `work/certs-test` 全绿）。装信任库那步需要管理员，脚本只打印指令。
+- **起停**：`bash tools/github.sh relay up|down|deploy|status`。另有一个**登录时触发**的计划任务 `\dsh-gh-proxy` 负责自启。注意它的电源策略是「电池模式停止 / 不用电池启动」，且「只使用交互方式」——**拔掉电源或非交互登录它不会起**，此时 `relay status` 报未运行，手动 `relay up` 即可。
+- **网关里是一等通道**：`download` 的探测/候选表含 relay（`--via relay` 可强制）；`asset` / `ghdl` / `clone` 在别路失败时回落到它。
 
-### 实测（2026-11-06 02:50–02:56）
+### 实测（2026-11-06 02:50–02:56，单上游旧版）
 
 | 场景 | 结果 |
 |---|---|
@@ -90,11 +95,26 @@ GitHub
 | 经 8899 取 15,721,375 B 资产（aria2c 8 连接） | ✅ 25.09 s，**612 KiB/s**（626,699 B/s），SHA256 通过 |
 | `gh api repos/astral-sh/uv` 经 8899 | ✅ 正常返回 |
 
+### 实测（2026-11-08，多上游回退版）
+
+| 场景 | 结果 |
+|---|---|
+| 经 8899 取 raw 4,698 B（多上游版，线上 8899） | ✅ 200，12.5 s |
+| 首选上游坏（`http://127.0.0.1:1/`，必拒）→ 次选 `ghfast.top` | ✅ 日志 `RETRY … connect ECONNREFUSED` → `200 1459ms via https://ghfast.top/` → `ORDER` 置顶；客户端 200 / 1.47 s / 4,698 B |
+| 上游全坏 | ✅ 502 `all upstreams failed`（不是假 200，也不是挂死） |
+| `github.com` HTML 页面经 8899 | ⚠️ 403 —— 镜像站不代理网页，是上游策略，不是 relay 缺陷 |
+| 不存在的文件 | ✅ 404 正常透传 |
+
 ### 什么时候用 / 别用
 
-- **该用**：要碰 `github.com` 本体（网页、release 直链、HTTPS clone）的兜底；某一个镜像域名抽风时（`ghfast.top` 就 30 分钟内从 `fetch failed` 变 200），换这条链往往立刻可用。
+- **该用**：要碰 `github.com` 本体（release 直链、HTTPS clone）的兜底；某个镜像域名抽风时，换这条链往往立刻可用。
 - **别用**：`api.github.com` 直连本来通且更快——`gh` / `github.sh api` 塞代理是白绕一圈、多付一次 MITM。
-- **做不到**：写。上游 `gh-proxy.com` 不转发 push，`git push` 仍只走 SSH（22 或 443，见第三节）。
+- **做不到**：写。上游镜像不转发 push，`git push` 仍只走 SSH（22 或 443，见第三节）。
+
+### 改这个服务时的两个坑（都踩过）
+
+1. **`taskkill /PID <pid> /F` 对计划任务拉起的进程会报「拒绝访问」**，即使进程属主就是当前用户。正确做法是 `schtasks /end /tn dsh-gh-proxy` 让任务自己收；`deploy.sh` 现在先问任务，停不掉才退回 taskkill。
+2. **git-bash（MSYS）会吃掉 `/` 开头的参数**：`schtasks /query /tn X` 里的 `/query` 被改写成 `C:/Program Files/Git/query`，于是任务查询静默失败、脚本误判「没有计划任务」；`openssl -subj "/CN=…"` 同样被改写，报 `subject name is expected to be in the format /type0=value0`。解法分别是 `MSYS_NO_PATHCONV=1 schtasks …` 与 `-subj "//CN=…"`（双斜杠只被吃掉一层）。**别用全局 `MSYS_NO_PATHCONV=1` 跑 openssl**：它连文件路径转换一起关掉，原生 openssl 就读不到 `/c/Users/…` 形式的 `-in` 参数（实测报「找不到指定路径」）。
 
 ## 五、选路策略（照这个执行）
 
@@ -146,6 +166,17 @@ curl -sS --ssl-no-revoke -o /dev/null -w '%{http_code} %{size_download}B %{time_
 
 # 想看链路是否真在重写，看日志
 tail -5 /c/Users/Admin/dsh-mirror-proxy/logs/proxy-$(date +%F).log
+# 多上游回退版专有：上游顺序、超时、有没有回退能力
+curl -s --max-time 5 http://127.0.0.1:8899/__relay/status
+# 期望：{"ok":true,"listen":"127.0.0.1:8899","order":[...],"timeoutMs":15000}
+
+# 回退链自检：首选换成必然失败的地址，看会不会自动换下一个（另起端口，不动线上 8899）
+cd tools/relay
+RELAY_PORT=8898 RELAY_ATTEMPT_TIMEOUT_MS=15000 \
+RELAY_UPSTREAMS="http://127.0.0.1:1/,https://ghfast.top/" \
+RELAY_CERT_DIR=/c/Users/Admin/dsh-mirror-proxy/certs \
+RELAY_LOG_DIR=/d/proj/PC1/work/relay-logs node server.mjs &
+# 期望客户端 200；日志先 RETRY … ECONNREFUSED，再 200 … via https://ghfast.top/
 ```
 
 **测中转站的两个坑（都踩过）**：
