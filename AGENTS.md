@@ -13,6 +13,7 @@
 | `docs/agents/` | 工程技能（matt pocock skills deck）需要的配置 |
 | `docs/network-baseline.md` | 本机出网带宽与选路规则（#4 落地） |
 | `docs/log/` | 每日状态记录：一天一行，推进了什么 / 卡在哪 / 明天第一件事 |
+| `docs/pending-issues/` | 写好但发不出去的东西：待建票草稿、待发评论、待做的收尾写操作（等身份恢复） |
 
 ## 本机网络限制（重要）
 
@@ -81,6 +82,8 @@ gh issue view 3 --json number   # 成功 = 宽策略；报 pipe: Access is denie
   命中即为闸门失败。旧版本写的是 `grep -iE 'ghp_|pin|password|token'`——这个词表会命中 55 行正常散文
   （"token 文件"、"PIN 码"…），等于永远失败、于是没人看，**不能当校验用**。
 - 已经泄露过的口令，删文件不够（历史提交里还在）。处置顺序：先轮换口令，再评估是否改写历史。
+- 本仓库已知的泄露面与待办见 [docs/pending-issues/credential-rotation.md](docs/pending-issues/credential-rotation.md)
+  （那份文件**只记位置与动作、不记口令值**，别在里面补明文）。
 
 ## Agent skills
 
