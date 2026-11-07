@@ -37,4 +37,5 @@ gh api repos/dongopencv/tools/issues/47 --jq .sub_issues_summary
 | `deck-refid-bug.md` | 票草稿：deck 插件 repoOf() 解析不出 owner/name，父子边与阻塞边全落空 | 独立缺陷票 |
 | `issue-closeout.md` | 收尾写操作：删坏的评论 / 补 map #2 进度与 Decisions / 报进度 | map #2 与 #5 |
 | `i5-comment.md` | #5 的 resolution 补充评论正文（干净版，等 PATCH/POST） | #5 |
+| `map47-progress.md` | map #47 正文追加草稿：#49 交付物 + 身份失效期间的真实状态 | map #47 |
 | `credential-rotation.md` | 已泄露凭据清单与待轮换项（**不含任何口令值**） | 人来做 |
