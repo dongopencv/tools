@@ -18,7 +18,7 @@
 **`github.com` 的 HTTPS（443）被墙**，直连 100% 超时。可达的只有：
 
 - `api.github.com` — `gh` CLI 走这条，不受影响
-- SSH `github.com:22` 与 `ssh.github.com:443`（2026-11-06 03:53 复测：22 端口 6/6 通、443 端口 5/6 通；当天早些时候 22 曾整段不通、443 全通）— 这是唯一的 `git push` 通道。**脚本默认走 22**（`git@github.com:owner/repo.git`），22 不通时改走 `ssh.github.com:443`
+- SSH `github.com:22` 与 `ssh.github.com:443`（2026-11-06 03:53 复测：22 端口 6/6 通、443 端口 5/6 通；当天早些时候 22 曾整段不通、443 全通）— 这是唯一的 `git push` 通道。**脚本默认走 22**（`git@github.com:owner/repo.git`），22 不通时改走 `ssh://git@ssh.github.com:443/owner/repo.git`（2026-11-07 实测 22 端口 `Connection reset` 时 443 正常）。`~/.ssh/config` 必须同时有 `Host github.com` 与 `Host ssh.github.com`（后者带 `Port 443`），否则走 443 时不带密钥、报 `Permission denied (publickey)`
 
 因此：
 

@@ -47,7 +47,7 @@ AGENTS.md 里那条「大于 50 MB 不要用 git push」的判据，来源就是
 |---|---|---|
 | `api.github.com:443` | ✅ 通 | `gh` 与 `github.sh api` 走这条，不受 443 封锁影响 |
 | `github.com:443` | ❌ 不通 | 被墙。网页、raw、release 直链全部不通 |
-| `ssh.github.com:443` | ✅ 通 | 03:53 复测 5/6 通；当天早些时候 5/5 全通。脚本默认走 22，需要 443 时用 `ssh.github.com:443` |
+| `ssh.github.com:443` | ✅ 通 | 03:53 复测 5/6 通；当天早些时候 5/5 全通。脚本默认走 22，需要 443 时用 `ssh://git@ssh.github.com:443/owner/repo.git` |
 | `github.com:22` | ✅ 通（波动） | 03:53 复测 6/6 通；02:33 同一小时内测到 CLOSED，历史上约 4/5 成功率。**两个端口都试**，别赌任一个 |
 | `codeload.github.com` | ✅ 通 | GitHub 的归档下载域，意外地没被墙 |
 | `gh-proxy.com` | ✅ 通 | 镜像，转发 GitHub 资产 |
@@ -55,6 +55,11 @@ AGENTS.md 里那条「大于 50 MB 不要用 git push」的判据，来源就是
 | `ghproxy.net` | ✅ 通 | 镜像。02:33 复测转发资产 206，1 MB range 5.2 s |
 | `registry.npmmirror.com` | ⚠️ 时通时不通 | 02:13 复测 `fetch failed` |
 | `release-assets.githubusercontent.com` | ✅ 通 | `api.github.com` 资产端点 302 的落点，**预签名 URL，直连可达**。同一批 324 MB 资产实测 5.09 MiB/s（ghfast 3.39、gh-proxy 1.32），是资产下载的最优路径 |
+
+> **坑（2026-11-07 23:2x 实测）**：`~/.ssh/config` 里只有 `Host github.com` 一段时，走 `ssh.github.com` **不会匹配**、等于不带密钥，直接 `git@ssh.github.com: Permission denied (publickey)`。必须单开一段 `Host ssh.github.com`（HostName ssh.github.com / Port 443 / User git / IdentityFile ~/.ssh/id_ed25519_gh / IdentitiesOnly yes）。
+>
+> 同一小时里 22 端口出现过 `Connection reset by 20.205.243.166 port 22`，而 443 一路正常——这就是为什么要留 443 兜底且必须先把 config 配好。
+
 
 ## 四、中转站（8899）：镜像站代理这条链
 
