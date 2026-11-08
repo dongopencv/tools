@@ -56,7 +56,7 @@ gh api graphql -f query='query { repository(owner:"dongopencv", name:"tools") {
 | `pat-permission-fix.md` | 给 PAT 补两处写权限的实测矩阵与操作步骤 | 人工 |
 | `credential-rotation.md` | 泄露面清点与处置顺序（先删公开副本 → 再轮换 → 最后才谈历史改写） | 人工 |
 | `capswriter-speech-rollout.md` | dsh-capswriter-speech 两端重启与写回的待办 | #30 map |
-| `auto-handoff-v1.1.0-restart.md` | auto-handoff v1.1.0 重启核验清单 | 人工 |
+| `auto-handoff-restart.md` | auto-handoff **v1.1.2** 重启核验清单（两条脚本命令 + 9 项对照表 + 地图 #12 结账） | 人工 |
 
 ## 一条命令跑完 1–3 步
 
