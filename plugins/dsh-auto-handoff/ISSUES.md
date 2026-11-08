@@ -187,16 +187,17 @@ enforceMidTurn: readBool(raw.enforceMidTurn, DEFAULTS.enforceMidTurn),
 
 为什么不是「把 `link:` 直接改成仓库路径」：`Dsh` 的 profile 依赖表在 `~/.dsh/profiles/<name>/package.json`，四份 profile（desktop / zz-audit / zz-caps / zz-desktop-probe）都写着 `link:D:/tools/dsh-auto-handoff`，且 desktop 的 `pnpm-lock.yaml` 把同一行固化在 26–28 行。改 profile 必须连 lockfile 一起改，而本机**没有 pnpm**（`which pnpm` 为空），改完无法用 `pnpm install` 重建 `node_modules` 符号链接——只能手改 package.json + 手建链接，风险高于收益。
 
-所以分两段：**先在仓库里立住权威源码**（这一段已完成），**等宿主重启窗口再切 `link:`**（清单见下）。
+所以分两段：**先在仓库里立住权威源码**（这一段已完成），**再一次性切 `link:`**（清单见下）。
+不用等宿主重启：改 profile 的 `package.json` 本身就是 `dsh-hmr` 的监听输入，改完即触发 profile 重组。
 
-**切换清单（待宿主重启时一次性做）**：
+**切换清单（一次性）**：
 
 1. 改四份 profile 的 `package.json` 依赖行：`"dsh-auto-handoff": "link:D:/proj/PC1/plugins/dsh-auto-handoff"`。
 2. 改 `profiles/desktop/pnpm-lock.yaml` 的 26–28 行（`specifier` 与 `version` 两处都要改）。
 3. 重建 `node_modules/dsh-auto-handoff` 符号链接（用 `cmd /c mklink /D`，**不要** `ln -s`——本机 `ln -s` 在 `node_modules` 里建出的是 junction，`readlink` 不可用且删的时候 `rm` 删不掉，只能 `rmdir`）。
-4. 重启 DSH，跑 `node tools/handoff-check.mjs --deep`，确认「代码版本」通过。
+4. 跑 `node tools/handoff-check.mjs --deep`，确认「代码版本」通过；没通过就看 `~/.dsh/auto-handoff/auto-handoff.log` 有没有新的「已启用」行。
 
-验证方式（不重启也能做）：
+验证方式（不触发重载也能做）：
 
 ```bash
 node --preserve-symlinks -e "import('dsh-auto-handoff').then(m=>console.log(Object.keys(m)))"

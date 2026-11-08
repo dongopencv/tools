@@ -152,8 +152,14 @@
 
 ## 已知边界
 
-- **改代码不会自动进运行中的宿主。** Node ESM 有模块缓存，改完必须重启 DSH 才加载新版本。
-  判断方法：看新生成的交接文档里有没有「## 交接前 REVIEW」一节。
+- **改代码不会自动生效，但通常不用人重启。** Node ESM 有模块缓存，光改文件不会进运行中的宿主；
+  DSH 自带 `dsh-hmr`，它监听 profile 的 `package.json` 与 `cordis.patch.yml`，改动即触发一次
+  profile 重组（recomposition），把「被改动过的 linked 包」整体换掉。本插件正是 profile 里的
+  `link:` 包，所以改完只要碰一下这两个文件之一，就会在数秒内生效（实测 3 秒）。
+  最轻量的做法是往 profile 的 `cordis.patch.yml` 末尾加一行注释，改前先备份。
+  判据不要用文件 mtime，用日志：`auto-handoff.log` 里出现新格式行（带 `[sessionId]` 前缀）
+  或新一条「已启用：…交接目录 .dsh/handoff…」，即说明新模块已加载。
+  `node tools/handoff-check.mjs` 的「代码版本」一项就是按这个判据算的。
 - `tokenMeter.measure()` 返回的是估算值，阈值 300000 是经验值，不是模型窗口的精确比例。
 - 「进度与下一步」与「最近的用户指令」在信息上有重叠，属于 #29 待定稿的结构问题。
 - **摘要按节裁剪，不是一刀切。** 模型把「下一步」写在第三节，旧实现 `clamp(1600)` 直接从尾部砍，
@@ -206,7 +212,8 @@ node test/claims.test.mjs        # 10 个场景
 四份 profile（`desktop` / `zz-audit` / `zz-caps` / `zz-desktop-probe`）的 `package.json` 都写着
 `"dsh-auto-handoff": "link:D:/tools/dsh-auto-handoff"`，`desktop` 的 `pnpm-lock.yaml` 又把同一行固化在 26–28 行。
 改 profile 必须连 lockfile 一起改，而本机没有 pnpm，改完没法用 `pnpm install` 重建 `node_modules` 符号链接。
-所以分两段：先在仓库里立住权威源码（已完成），再在宿主重启窗口一次性切 `link:`。
+所以分两段：先在仓库里立住权威源码（已完成），再一次性切 `link:`。切换本身不用等重启——
+改 profile 的 `package.json` 正好就是 `dsh-hmr` 监听的输入，改完触发一次 profile 重组即可（见上节「已知边界」）。
 
 ### 切换清单（一次性）
 
@@ -214,9 +221,10 @@ node test/claims.test.mjs        # 10 个场景
 2. `~/.dsh/profiles/desktop/pnpm-lock.yaml` 的 26–28 行（`specifier` 与 `version` 两处）。
 3. 重建 `node_modules/dsh-auto-handoff` 链接：用 `cmd /c mklink /D`，**不要 `ln -s`**
    （本机 `ln -s` 在 `node_modules` 里建出的是 junction，`readlink` 不可用、`rm` 也删不掉，只能 `rmdir`）。
-4. 重启 DSH，跑 `node tools/handoff-check.mjs --deep` 确认「代码版本」这一项通过。
+4. 跑 `node tools/handoff-check.mjs --deep` 确认「代码版本」这一项通过；没过就看
+   `~/.dsh/auto-handoff/auto-handoff.log` 有没有新的「已启用」行（没有说明重组没触发）。
 
-不重启也能验证链接与 peer 依赖：
+不触发重载也能单独验证链接与 peer 依赖：
 
 ```bash
 cd /c/Users/Admin/.dsh/profiles/desktop
