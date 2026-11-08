@@ -1,7 +1,7 @@
-# dsh-auto-handoff：现网生效与待验证（2026-11-08 13:30 版）
+# dsh-auto-handoff：现网生效与待验证（2026-11-08 14:05 版）
 
-代码已到 **v1.1.2**（`D:\proj\PC1\plugins\dsh-auto-handoff`，过渡期运行副本 `D:\tools\dsh-auto-handoff` 与它 md5 一致），
-四套离线测试全绿（integration 16 / midturn 5 / chain 8 / claims 10），两部分设计票（10 张）已全部关闭。
+代码已到 **v1.1.3**（`D:\proj\PC1\plugins\dsh-auto-handoff`，过渡期运行副本 `D:\tools\dsh-auto-handoff` 与它 md5 一致），
+四套离线测试全绿（integration 15 / midturn 7 / chain 8 / claims 10 = **40 条断言**），两部分设计票（10 张）已全部关闭。
 
 ## 「必须人重启」这条结论已被推翻
 
@@ -36,14 +36,24 @@ node tools/handoff-metrics.mjs --verify  # 阈值该设多少、验收够不够�
 现在改成从插件日志里抽**最后一次桌面配置的「已启用」行**当 `loadedAt`，所有检查只看这之后的产物：
 更早的行与文档是旧模块的历史遗留，不计入缺陷。
 
-## 当前实测（2026-11-08T05:29Z，`node tools/handoff-check.mjs`）
+## v1.1.3 修的是什么（链为什么会静默停摆）
 
-**0 FAIL / 8 WARN / 1 PASS**，exit 0。8 条 WARN 全是同一句：「本次加载后还没有跑过一次真实交接」。
+v1.1.2 于 05:18:20Z 通过 HMR 进现网之后，本会话又跑了 **118 次工具调用**（阈值 80），却一次都没再触发交接，
+日志里没有任何报错。根因见 `ISSUES.md` I-12：轮中闸抢占位失败时**不论原因**都 `midTurnFired.add(id)`，
+把「暂时抢不到（inflight / cooldown / 次数用尽）」当成「这一棒永远不用再管」，而占位放开后没人清这个标记。
+
+修法是把两件事拆开：`midTurnFired` 只管「这一棒已交接」，日志去重另用 `blockedNoted`（键 `sessionId|reason`），
+不参与触发判断；抢到占位时 `blockedNoted.clear()`。补的测试是**时序**而不是分支：先被拦 → 占位放开 → 还能交接。
+
+## 当前实测（2026-11-08T06:02Z，`node tools/handoff-check.mjs --deep`）
+
+**0 FAIL / 8 WARN / 5 PASS**，exit 0。8 条 WARN 全是同一句：「本次加载后还没有跑过一次真实交接」
+（本次加载时刻 **2026-11-08T05:58:12.392Z**，桌面配置第 5 代，v1.1.3 已进现网）。
 
 | 检查项 | 现在 | 说明 |
 |---|---|---|
-| 代码版本 | ✅ PASS | 加载于 05:18:20.463Z，晚于 `lib/index.js` mtime 04:38:06.718Z |
-| 链深（genesis） | ◐ WARN | 加载后没有新棒。历史 claims 17 条：done×14 / stopped×3（3 条 stopped 是 headless e2e 探针，note=no-session-controller） |
+| 代码版本 | ✅ PASS | 加载于 05:58:12.392Z，晚于 `lib/index.js` mtime 05:57:36.627Z |
+| 链深（genesis） | ◐ WARN | 加载后没有新棒。历史 claims 17 条：done×13 / **genesis×1** / stopped×3。那条 genesis 是本会话（旧模块把它写成 done，已手工修回并留 note），所以「链条能走过第 2 棒」现在只剩**实跑验证** |
 | 交接是否真发生过 | ◐ WARN | 历史 7 次，末次 02:41:33Z（305b→c454，369385 tokens / 242 次工具调用）；本次加载后 0 次 |
 | 交接前 REVIEW | ◐ WARN | 历史 9 次，末次 04:40:34Z（e2e）；本次加载后 0 次 |
 | 日志是新格式 | ◐ WARN | 本次加载后只有 1 行（「已启用」），没有 `[sessionId] 轮中触发…` 这类行为行 |
@@ -58,6 +68,9 @@ node tools/handoff-metrics.mjs --verify  # 阈值该设多少、验收够不够�
 2. 日志出现 **`[sessionId]` 前缀**的行，并且「轮中触发被占位拦下」不再逐次刷屏。
 3. 日志出现 **「父会话当前轮已取消」**（`cancelParentAfterHandoff` 默认 true）。
 4. `claims.json` 里新出现的棒是 **`genesis`** 而不是 `done`，说明链条能走过第 2 棒。
+
+> 截至 14:02 的现况：v1.1.3 已进现网（05:58:12.392Z），本会话 claim 已是 `genesis`、累计工具调用早过阈值，
+> 但重载后只跑了 19 次调用（阈值 80），**还差一点才会真正触发**。所以上面四条仍是「待验」，不是「已验」。
 
 ## 票库现状（地图 #12：12 张子票，已关 10）
 
@@ -83,7 +96,7 @@ node tools/handoff-metrics.mjs --verify  # 阈值该设多少、验收够不够�
 - **headless e2e 验不到全链路**：headless profile 没有 `sessionController`，只能验文档生成与 REVIEW，验不到 cancel 父会话与 genesis 占位。
 - **e2e 与桌面宿主共用 `USERPROFILE`**：同一份 `claims.json` 与日志会被互相污染，跑 e2e 后要手工清理（claims 里那 3 条 `no-session-controller` 的 stopped 就是 e2e 残留）。
 - **`dongopencv/dsh-auto-handoff` 不存在（404）**：要进版本控制只能落 `dongopencv/tools` 内。
-- **待裁决：`REQUIREMENTS.md:78` 的 N2（不杀掉旧会话、不调用 `sessionController.cancel`）与已落地的
+- **待裁决（优先于 #65）：`REQUIREMENTS.md:78` 的 N2（不杀掉旧会话、不调用 `sessionController.cancel`）与已落地的
   `cancelParentAfterHandoff: true` 正面冲突**。票 #15 的结论是「采纳 L2、拒绝 L3」，而 L3 恰恰就是 cancel。
   代码已经做了票面与需求都写明不做的事，三条路：改 N2（承认需求变更，需拍板）、默认值改回 `false`（只留开关）、撤回 cancel。
   **在动 #65 之前必须先定这一条**，否则 #65 会照着错误的需求边界施工。
