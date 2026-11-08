@@ -306,3 +306,38 @@ v1.1.0 让流水线跑通了，但有三处在真实数据里仍然不成立：
 3. **轮中闸把日志埋了。** 926 行日志里 878 行是同一条 INFO。终态挡住的是「再建会话」，挡不住「再记一行」。
    修法：`terminalSeen` 集合 + `toolCallCounts.delete`，终态会话只留一条证据行；日志行统一加 `[sessionId]` 前缀（旧日志无会话 id，是本次排查最大的障碍）。
    附带设计原则：**证据行只记「状态与预期不符」的那一次**，正常路径不产生重复日志。
+
+## 2026-11-08 第三轮修订（v1.1.2）
+
+v1.1.1 的三条修法在**离线测试里全部通过**，但装进真实 DSH 宿主后，「下一步」仍然是半句话就断了：
+
+```
+2. 逐条调用 bash 执行追加，每条单独一次工具调用，      ← 句子没写完
+```
+
+这一轮修的是截断的**第四个来源**，也是唯一一个离线测不出来的：
+
+4. **输出预算与字数上限脱钩。** `requestModelSummary` 里 `maxTokens: 1200` 是写死的常数，而 `summaryMaxChars` 默认 1600。中文约 1.5–2 token/字，1600 字要 2400–3200 token。I-8 的 `orderSummary` 只能保证「下一步」**排在前面**，它保证不了模型**写得完**——重排序决定「谁先被裁剪」，输出预算决定「谁能被生成」。
+   修法：`summaryTokenBudget(summaryMaxChars) = min(max(ceil(chars*2)+400, 800), 8000)`（默认 1600 字 → 3600 token）；`buildSummaryPrompt` 同时把「下一步」改成第一节、要求每节 ≤350 字，让总量落在预算里。
+   设计含义：**凡是「上限」类参数，必须成对出现并有函数关系**（字数上限 ↔ token 预算、超时 ↔ 重试次数）。只写一个，另一个就是隐含的、无人审视的硬约束。
+
+### 为什么必须有一条真宿主 e2e
+
+同一套代码，离线 16 条测试全绿，真宿主里「下一步」断了。差别只在假件：
+
+| 契约 | 真宿主 | 假件 |
+| --- | --- | --- |
+| `controller.prompt(request, signal)` | 第一行 `signal.throwIfAborted()` | 旧假件单参数、永不抛 → 简报 0/86 |
+| `controller.create()` | 必返回 `{sessionId}` | 可能返回空 → 空壳会话疯涨 |
+| `llm.stream({maxTokens})` | 真按预算截断 | 一次吐出整段 → 「下一步」半句 |
+
+三次都栽在同一个模式上：**假件比真件宽松**。所以 e2e 不是「可选的高成本验证」，它是唯一能验契约的东西。
+
+做法（可复用）：`~/.dsh/profiles/zz-handoff-e2e/`（bundles = base + headless + auto-handoff，`node_modules/dsh-auto-handoff` 用 junction 指向 `D:\\tools\\dsh-auto-handoff`），阈值压到 token 1000 / 工具 5，跑：
+
+```bash
+cd "C:/Users/Admin/AppData/Local/Programs/DeepSeek Harness/resources/runtime/cli/bin"
+DEEPSEEK_API_KEY=<key> cmd //c "dsh.cmd --profile zz-handoff-e2e --json '<让模型连续调 8 次工具的任务>'"
+```
+
+产出落在 CLI 进程的 cwd 下 `.dsh/handoff-e2e/`。headless profile 的 `sessionController` 不可用，所以它只写文档、不开新会话——**这正好是验证文档质量的最小闭环**。

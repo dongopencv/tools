@@ -170,6 +170,19 @@ async function checkLog() {
     reviews.length > 0 ? 'REVIEW 跑了 ' + reviews.length + ' 次' : '日志里没有 REVIEW 记录',
     (reviews[reviews.length - 1] ?? '').slice(0, 220))
 
+  // v1.1.1 的两个新信号：父会话被取消 / 父会话没停（终态仍在产生工具调用）
+  const cancelled = lines.filter((l) => l.includes('父会话当前轮已取消'))
+  const stuck = lines.filter((l) => l.includes('但该会话仍在产生工具调用'))
+  record(cancelled.length > 0 ? 'PASS' : 'WARN', '父会话是否被停',
+    cancelled.length > 0
+      ? '交接后有 ' + cancelled.length + ' 次取消了父会话当前轮'
+      : '日志里没有「父会话当前轮已取消」——旧模块不会停父会话，它和子会话同时烧 token',
+    (cancelled[cancelled.length - 1] ?? '').slice(0, 220))
+  if (stuck.length > 0) {
+    record('WARN', '父会话仍在跑', stuck.length + ' 条「已交接但仍在产生工具调用」的证据行',
+      '取消只停当前轮；这些是交接后又被唤醒、或取消失败后继续跑的会话')
+  }
+
   const ratio = lines.length === 0 ? 0 : blockedMid.length / lines.length
   if (ratio > 0.5) {
     record('WARN', '日志刷屏', '「轮中触发被占位拦下」' + blockedMid.length + ' / ' + lines.length + ' 行（' + Math.round(ratio * 100) + '%）',
@@ -204,6 +217,13 @@ async function checkDoc() {
   record(hasReview ? 'PASS' : 'WARN', '交接文档结构',
     '最新一份' + (hasReview ? '含' : '缺') + '「## 交接前 REVIEW」',
     newest.n + ' · ' + newest.s.size + 'B · ' + new Date(newest.s.mtimeMs).toISOString())
+
+  // 「下一步」是这份文档存在的理由：新会话靠它知道该干什么。
+  // 旧模块在 requestModelSummary 里先砍到 1600 字，「下一步」作为第三节必被砍掉（实测 8 份里 4 份）。
+  const hasNext = body.includes('## 下一步')
+  record(hasNext ? 'PASS' : 'FAIL', '交接文档有「下一步」',
+    hasNext ? '最新一份含「## 下一步」' : '最新一份没有「## 下一步」——新会话拿到的是没有方向的进度报告',
+    '摘要按节裁剪（orderSummary）是 v1.1.1 才有的；旧模块必砍第三节')
 }
 
 // 5) 新会话到底收到简报没有（只认 user/message 里的正文，助手贴源码会假阳性）

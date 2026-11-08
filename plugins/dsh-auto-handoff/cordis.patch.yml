@@ -15,7 +15,9 @@
         modelSummary: true
         # 自动续作链的深度上限，防止无限自我续作
         chainLimit: 8
-        # 模型摘要的字符上限
+        # 模型摘要的字符上限。
+        # 注意：输出的 token 预算由 summaryTokenBudget() 按本值折算（默认 1600 字 → 3600 token），
+        # 不要单独写死 maxTokens——中文 1.5~2 token/字，预算不足会让「下一步」在句中就被截断。
         summaryMaxChars: 1600
         # 交接文档总字符上限
         docMaxChars: 6000

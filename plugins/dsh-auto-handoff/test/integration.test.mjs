@@ -196,11 +196,15 @@ async function scenario({ plugin, name, tokens, toolCalls, chainDepth, modelText
   const sessionHeader = modelText === undefined ? {} : { requestContext: { provider: 'test-provider', model: 'test-model' } }
   sessions.set('sess-a', buildSession('sess-a', dir, sessionHeader, events))
 
+  const llmRequests = []
   const llm =
     modelText === undefined
       ? undefined
       : {
-          async *stream() {
+          async *stream(request) {
+            // 记下请求参数：maxTokens 必须随 summaryMaxChars 缩放，
+            // 否则中文摘要在第三节中途被输出预算截断（「下一步」整节消失的第四个来源）。
+            llmRequests.push(request)
             yield { type: 'text-delta', index: 0, text: modelText }
             yield { type: 'finish', reason: { kind: 'stop' } }
           },
@@ -264,7 +268,7 @@ async function scenario({ plugin, name, tokens, toolCalls, chainDepth, modelText
     claims = undefined
   }
 
-  const record = { name, dir, docPath, doc, created: harness.created, prompts: harness.prompts, cancelled: harness.cancelled, commands: ctx._commands, ctx, events, claims }
+  const record = { name, dir, docPath, doc, created: harness.created, prompts: harness.prompts, cancelled: harness.cancelled, commands: ctx._commands, ctx, events, claims, llmRequests }
   if (previousHome === undefined) delete process.env.USERPROFILE
   else process.env.USERPROFILE = previousHome
   await rm(dir, { recursive: true, force: true })
@@ -353,7 +357,14 @@ async function run() {
     const injected = r.prompts[0].content[0].text
     assert.match(injected, /## 下一步/, '注入副本里也必须有「下一步」')
     assert.match(injected, /KEYWORD_NEXT_STEP/, '注入副本里「下一步」的正文也必须完整')
+    // 输出预算必须覆盖中文摘要：1600 字要 2400–3200 token，
+    // 写死 1200 会让模型在第三节中途被截断——这是「下一步」消失的第四个来源，
+    // 也解释了实测文档里「下一步」只有半句就断（2026-11-08 e2e 实跑证据）。
+    const maxTokens = r.llmRequests[0]?.maxTokens
+    assert.ok(maxTokens !== undefined, '应当向模型发出摘要请求')
+    assert.ok(maxTokens >= 3200, '输出预算必须 >= summaryMaxChars 的中文 token 需求，实际 ' + String(maxTokens))
     results.push('PASS 超长摘要裁剪后仍保留「下一步」')
+    results.push('PASS 摘要输出预算随 summaryMaxChars 缩放')
   }
 
   // 3c) 模型漏写「下一步」：必须用本地兜底补一节，不能交给模型自觉

@@ -43,8 +43,9 @@
 - **最近的用户指令 / 最近的助手输出** —— 用最近两轮校准方向
 - **触及的文件** —— 从工具参数里抽出来、并且**在磁盘上真的存在**的路径
 - **工具轨迹** —— 每个工具被调用了多少次
+- **进度与下一步** —— 模型摘要（`modelSummary: true`），或零成本本地兜底。**排在文档前部**，
+  因为它最要紧，而注入副本会按 `docMaxChars` 截断、排在后面的先被砍
 - **交接前 REVIEW** —— 这一棒交出去会缺什么，逐条标注 ⛔ / ⚠️ / ℹ️
-- **进度与下一步** —— 模型摘要（`modelSummary: true`），或零成本本地兜底
 
 ### 落盘与注入是两份长度
 
@@ -59,6 +60,19 @@
    避免把「文件被删了」误报成「没识别到文件」。
 3. **路径可能藏在代码正文里。** `run_code` / `bash` 这类工具的路径在 `arguments.code` 里，
    只按白名单键（`file_path`/`path`）抓会全军覆没。
+### 摘要的四道截断闸，缺一道「下一步」就没了
+
+「下一步」是被四条独立的截断来源轮流砍掉的，2026-11-08 才全部堵上：
+
+| # | 位置 | 现象 | 修法 |
+| --- | --- | --- | --- |
+| 1 | `requestModelSummary` 的 `clampText(summaryMaxChars)` | 摘要 1600 字一刀切，第三节整节消失 | 先按节重排（`orderSummary`）把「下一步」提到最前，再裁剪 |
+| 2 | `renderDoc` 把摘要放在文档最末 | 注入副本按 `docMaxChars` 截断，先砍到它 | 摘要在文档里前移，紧跟标题 |
+| 3 | 模型漏写「下一步」 | 模型自觉不可靠 | `ensureNextStep` 用本地兜底补一节 |
+| 4 | `maxTokens: 1200` 输出预算 | **生成到一半就断**，句子没写完 | `summaryTokenBudget` 按字数折算（默认 3600） |
+
+前三条靠读代码就能发现，第四条只有在**真实宿主里跑 e2e** 才暴露——离线测试的假 llm 一次吐出整段文本，永远不受输出预算限制。
+
 ## 交接前 REVIEW 判什么
 
 | 检查项 | 级别 | 为什么要有 |
@@ -146,6 +160,9 @@
   实测 8 份真实文档里 4 份整节丢掉「下一步」。现在 `orderSummary` 先把含「下一步」的那节提到最前再裁剪，
   模型漏写时 `ensureNextStep` 用本地兜底补一节；文档里「进度与下一步」也移到了注入副本靠前的位置
   （注入副本按 `docMaxChars` 截断，排最后的最先被砍）。
+- **摘要输出预算跟着字数走。** `maxTokens` 旧值写死 1200，而中文 1600 字要 2400–3200 token，
+  模型会在第三节中途被截断——「下一步」只剩半句。现在由 `summaryTokenBudget` 按字数折算（默认 3600）。
+  这一条**离线测试测不出来**：假 llm 一次吐出整段文本，不受输出预算限制。
 - 已交接（`done`/`stopped`）的会话若继续产生工具调用，只记**一条**证据行并清掉它的内存计数，
   不再逐个调用刷「占位拦下」。这行日志本身就是证据：父会话仍在跑。
 - 只支持 root 会话；`header.origin === 'subagent'` 一律跳过。
@@ -155,13 +172,24 @@
 ```
 cd D:/proj/PC1/plugins/dsh-auto-handoff
 node --check lib/index.js
-node test/integration.test.mjs   # 10 个场景
-node test/midturn.test.mjs       # 4 个场景
+node test/integration.test.mjs   # 16 个场景
+node test/midturn.test.mjs       # 5 个场景
+node test/chain.test.mjs         # 8 个场景
+node test/claims.test.mjs        # 10 个场景
 ```
 
-测试里的假 `sessionController.prompt` **必须用真实签名**（第二参数是 AbortSignal，缺失即抛）：
-旧假件是单参数、永不抛，比真实宿主宽松，所以「少传 signal」这类契约级 bug 离线 100% 漏过——
-这正是线上 86 个会话 0 送达的真因。
+### 假件必须比真件严格，否则测试全绿也没用
+
+真宿主里踩过的三个坑，离线测试一次都没拦住，原因都是**假件比真件宽松**：
+
+| 契约 | 真宿主 | 旧假件 | 后果 |
+| --- | --- | --- | --- |
+| `controller.prompt(request, signal)` | 第一行 `signal.throwIfAborted()` | 单参数、永不抛 | 简报 0/86 送达 |
+| `controller.create()` | 一定返回 `{sessionId}` | 可能返回空 | 空壳会话疯涨 |
+| `llm.stream({maxTokens})` | 真按预算截断 | 一次吐出整段 | 「下一步」半句就断 |
+
+所以：**凡是对接宿主能力的参数（signal、token 预算、超时），假件必须同样严格地行使它**。
+只证明代码逻辑是不够的，还需要一条在真宿主里跑的 e2e（见 `work/e2e-handoff` 的探针做法）。
 
 ## 源码位置
 

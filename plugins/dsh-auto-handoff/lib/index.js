@@ -286,6 +286,17 @@ function ensureNextStep(summary, facts) {
 }
 
 /**
+ * 摘要输出预算是字符上限的函数，不是写死的常数。
+ * 中文约 1.5–2 token/字，1600 字要 2400–3200 token；给 1200 必然在第三节中途断掉。
+ * 取 2 token/字 + 400 余量，下限 800，上限 8000（避免把 summaryMaxChars 调大后失控）。
+ */
+function summaryTokenBudget(summaryMaxChars) {
+  const budget = Math.ceil(summaryMaxChars * 2) + 400
+  if (!Number.isFinite(budget)) return 4000
+  return Math.min(Math.max(budget, 800), 8000)
+}
+
+/**
  * 把「下一步」这一节提到摘要最前面，再整体裁剪。
  * 裁剪仍然会发生，但被裁掉的只会是「进度概述」「关键决定与坑」的尾巴——
  * 实测 8 份交接文档里 4 份因为按原始顺序切 1600 字而整节丢掉「下一步」。
@@ -537,16 +548,17 @@ function buildSummaryPrompt(facts) {
           .join('、')
   return [
     '你在为一个即将结束的长会话撰写交接文档，新的会话会据此继续工作。',
-    '请只输出下面三个小节，中文，简洁，不要寒暄，不要复述本指令：',
+    '请只输出下面三个小节，中文，简洁，不要寒暄，不要复述本指令。',
+    '三个小节都要写，每节不超过 350 字；「下一步」必须写在最前面，因为它是新会话唯一真正要执行的东西。',
+    '',
+    '## 下一步',
+    '（新会话应当立刻着手的具体动作，可执行、可验证）',
     '',
     '## 进度概述',
     '（这个任务已经做到哪一步，已产出什么）',
     '',
     '## 关键决定与坑',
     '（已确定的做法、已被排除的方向、失败过的地方）',
-    '',
-    '## 下一步',
-    '（新会话应当立刻着手的具体动作，可执行、可验证）',
     '',
     '会话事实如下：',
     `- 原始目标：${facts.firstUser === '' ? '（未捕获）' : facts.firstUser}`,
@@ -697,7 +709,9 @@ async function requestModelSummary(ctx, session, facts, options, signal) {
     provider: route.provider,
     model: route.model,
     messages: [{ role: 'user', content: [{ type: 'text', text: buildSummaryPrompt(facts) }] }],
-    maxTokens: 1200,
+    // 输出预算必须跟着摘要上限走：中文摘要写满 1600 字要远超 1200 token，
+    // 硬写 1200 会让模型在第三节中途被截断——那正是「下一步」整节消失的第四个来源。
+    maxTokens: summaryTokenBudget(options.summaryMaxChars),
     signal: withTimeout(signal, options.summaryTimeoutMs),
   })
 
