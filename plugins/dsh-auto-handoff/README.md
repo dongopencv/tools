@@ -171,6 +171,10 @@
   这一条**离线测试测不出来**：假 llm 一次吐出整段文本，不受输出预算限制。
 - 已交接（`done`/`stopped`）的会话若继续产生工具调用，只记**一条**证据行并清掉它的内存计数，
   不再逐个调用刷「占位拦下」。这行日志本身就是证据：父会话仍在跑。
+- **「暂时抢不到占位」不等于「以后都不管」。** `inflight`（另一棒正在交接）、`cooldown`、`次数用尽`
+  都是**暂时**状态，占位放开后本会话必须还能再触发。v1.1.2 之前轮中闸无论什么原因抢占位失败都
+  `midTurnFired.add(id)`，等于把「暂时」当「永久」——链条会静默停摆，日志却一切正常（ISSUES I-12）。
+  现在 `midTurnFired` 只表示「这一棒已交接」，日志去重另有 `blockedNoted`，两者不共用。
 - 只支持 root 会话；`header.origin === 'subagent'` 一律跳过。
 
 ## 测试
@@ -178,10 +182,11 @@
 ```
 cd D:/proj/PC1/plugins/dsh-auto-handoff
 node --check lib/index.js
-node test/integration.test.mjs   # 16 个场景
-node test/midturn.test.mjs       # 5 个场景
+node test/integration.test.mjs   # 15 个场景
+node test/midturn.test.mjs       # 7 个场景
 node test/chain.test.mjs         # 8 个场景
 node test/claims.test.mjs        # 10 个场景
+# 合计 40 条断言
 ```
 
 ### 假件必须比真件严格，否则测试全绿也没用

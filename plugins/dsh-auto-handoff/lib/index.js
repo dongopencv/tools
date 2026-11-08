@@ -1019,6 +1019,13 @@ export function apply(ctx, config) {
    */
   const terminalSeen = new Set()
 
+  /**
+   * 「被占位拦下」的原因去重表：同一会话同一原因只记一条。
+   * 只用来去重日志，**绝不阻止**它之后再触发——被 inflight/cooldown 拦下是暂时的，
+   * 把「暂时」当「永久」写进 midTurnFired 就会让链条静默停摆（ISSUES I-12）。
+   */
+  const blockedNoted = new Set()
+
   /** 把某个会话的占位状态说成人话（/handoff-status 用）。 */
   function describeClaim(sessionId) {
     const entry = readClaims(claimsFile).get(sessionId)
@@ -1108,7 +1115,6 @@ export function apply(ctx, config) {
         const now = Date.now()
         const reserved = reserveClaim(claimsFile, id, options, now, false)
         if (!reserved.reserved) {
-          midTurnFired.add(id)
           if (reserved.reason === 'done' || reserved.reason === 'stopped') {
             // 这一棒已经交接过（终态），之后每一次工具调用都是「旧会话还在继续跑」，
             // 不是重复触发，没有新信息。旧实现每次都记一行 INFO，实测刷出 926 行、
@@ -1122,11 +1128,20 @@ export function apply(ctx, config) {
             toolCallCounts.delete(id)
             return
           }
-          // 剩下的（inflight / cooldown / 次数用尽）是真正的竞态，值得留痕。
-          logInfo(`[${id}] 轮中触发被占位拦下（${reserved.reason}），不重复交接`)
+          // 剩下的（inflight / cooldown / 次数用尽）是真正的竞态，值得留痕——
+          // 但只留一次：同一个会话同一个原因重复喊没有新信息。
+          // 关键是**不能**在这里 midTurnFired.add(id)：那等于把「暂时被拦」当成
+          // 「这一棒永远不用再管」，占位一放开链条就永久停摆，而日志看上去一切正常
+          // （本会话就这么停了一整轮，见 ISSUES.md I-12）。
+          const noteKey = id + '|' + reserved.reason
+          if (!blockedNoted.has(noteKey)) {
+            blockedNoted.add(noteKey)
+            logInfo(`[${id}] 轮中触发被占位拦下（${reserved.reason}），不重复交接`)
+          }
           return
         }
         midTurnFired.add(id)
+        blockedNoted.clear()
         logInfo(`[${id}] 轮中触发：工具调用已达 ${String(next)} 次（阈值 ${String(options.toolCallThreshold)}），立即交接`)
         void (async () => {
           try {
@@ -1399,7 +1414,11 @@ export function apply(ctx, config) {
           }
           return
         }
-        logInfo(`[${sessionId}] 阈值已过但占位拦下（${reserved.reason}），不重复交接`)
+        const noteKey = sessionId + '|turn|' + reserved.reason
+        if (!blockedNoted.has(noteKey)) {
+          blockedNoted.add(noteKey)
+          logInfo(`[${sessionId}] 阈值已过但占位拦下（${reserved.reason}），不重复交接`)
+        }
         return
       }
       void (async () => {

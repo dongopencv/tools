@@ -86,7 +86,7 @@ function toolCall(seq, name, args) {
   return { type: 'tool/call', seq, time: 0, data: { turn: 1, step: 1, callId: 'c' + String(seq), name, arguments: JSON.stringify(args) } }
 }
 
-async function scenario({ plugin, toolCalls, enforce, fireTurnStopping, extraAfter, preDone }) {
+async function scenario({ plugin, toolCalls, enforce, fireTurnStopping, extraAfter, preDone, preState, settleBeforeExtra }) {
   const dir = await mkdtemp(join(tmpdir(), 'auto-handoff-midturn-'))
   const previousHome = process.env.USERPROFILE
   process.env.USERPROFILE = dir
@@ -123,16 +123,18 @@ async function scenario({ plugin, toolCalls, enforce, fireTurnStopping, extraAft
     },
   }
 
-  // 预置一条终态占位：模拟「上一棒已经交接完、父会话还在跑」的真实局面。
-  if (preDone === true) {
-    const claimsFile = join(dir, '.dsh', 'auto-handoff', 'claims.json')
+  // 预置占位：模拟「上一棒已经交接完、父会话还在跑」或「另一棒正在交接中」的真实局面。
+  const claimsFile = join(dir, '.dsh', 'auto-handoff', 'claims.json')
+  const writeClaim = async (state, at) => {
     await mkdir(join(dir, '.dsh', 'auto-handoff'), { recursive: true })
     await writeFile(
       claimsFile,
-      JSON.stringify({ claims: { 'sess-a': { state: 'done', at: Date.now(), attempts: 1, chainRoot: 'sess-a', chainDepth: 0 } }, updatedAt: new Date().toISOString() }),
+      JSON.stringify({ claims: { 'sess-a': { state, at, attempts: 1, chainRoot: 'sess-a', chainDepth: 0 } }, updatedAt: new Date().toISOString() }),
       'utf8',
     )
   }
+  const presetState = preDone === true ? 'done' : preState
+  if (typeof presetState === 'string') await writeClaim(presetState, Date.now())
 
   const ctx = makeCtx({ services })
   plugin.apply(ctx, {
@@ -160,6 +162,7 @@ async function scenario({ plugin, toolCalls, enforce, fireTurnStopping, extraAft
 
   // 交接已经发生之后，父会话往往还在继续跑（宿主不会自动关它）。
   // 这段就是在模拟那段时间里继续冒出来的工具调用。
+  if (typeof settleBeforeExtra === 'string') await writeClaim(settleBeforeExtra, Date.now())
   if (typeof extraAfter === 'number' && extraAfter > 0) {
     for (let i = 0; i < extraAfter; i += 1) {
       events.push(toolCall(10000 + i, 'read', { file_path: 'D:/bulk/after.ts' }))
@@ -239,6 +242,28 @@ async function run() {
     const evidence = lines.filter((line) => line.includes('但该会话仍在产生工具调用')).length
     assert.equal(evidence, 1, '每个会话只留一条「父会话仍在烧 token」的证据行，不能又刷起来')
     results.push('PASS 已交接会话继续跑工具时只留一条证据行，不再刷屏')
+  }
+
+  // 6) 被「另一棒正在交接（inflight）」拦下之后，那一棒结束了：本会话必须还能交接。
+  //    这正是本会话踩到的坑——旧实现无论什么原因被拦下都 midTurnFired.add(id)，
+  //    于是「暂时被拦」被当成「永远不用再管」，链条就此停摆，且日志看上去一切正常。
+  {
+    const r = await scenario({
+      plugin,
+      toolCalls: 85,
+      enforce: true,
+      fireTurnStopping: false,
+      preState: 'inflight',
+      settleBeforeExtra: 'genesis',
+      extraAfter: 85,
+    })
+    assert.equal(r.created.length, 1, '占位从 inflight 放开后，本会话必须还能交接（不能永久静默）')
+    assert.ok(r.doc !== undefined, '放开后必须写出交接文档')
+    // 拦下的日志也要去重，否则「每调一次工具喊一句」还是刷屏。
+    const blocked = r.log.split('\n').filter((line) => line.includes('轮中触发被占位拦下')).length
+    assert.equal(blocked, 1, '同一会话同一原因的「被占位拦下」只应记一条，实际 ' + String(blocked))
+    results.push('PASS 被 inflight 拦下后，占位一放开仍能交接（不会永久静默）')
+    results.push('PASS 被占位拦下的日志按「会话+原因」去重，不随工具调用刷屏')
   }
 
   console.log(['', ...results, '', 'ALL MID-TURN TESTS PASSED'].join('\n'))
