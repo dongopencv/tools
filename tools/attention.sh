@@ -84,7 +84,8 @@ while IFS="|" read -r num pnum blocked assignees labels cdate udate title; do
   fi
   if [[ -n "$assignees" ]]; then
     : # 有人认领 = 在飞，不占注意力（这正是 superagent 那条纪律）
-  elif [[ "$labels" == *wayfinder:grilling* || "$labels" == *needs-triage* ]]; then
+  elif [[ "$labels" == *wayfinder:grilling* || "$labels" == *needs-triage* || "$labels" == *ready-for-human* ]]; then
+    # ready-for-human：范围决策/人眼确认这类 agent 做不了的事，不该混进「可接」里组队
     DECIDE+=("$num|$ud|$title")
     [[ $ud -ge $STALE_DAYS ]] && STALE+=("decide|$num|$ud|$title")
   else
