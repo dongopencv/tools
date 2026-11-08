@@ -64,10 +64,31 @@ let currentGen = null
 for (const l of logLines) {
   let m
   if (/\[session-/.test(l.msg) || /^- /.test(l.msg)) withSessionId++
-  if ((m = /^已启用：token 阈值 (\d+) \/ 工具调用阈值 (\d+)，交接目录 (\S+)，模型摘要 (开|关)，链上限 (\d+)/.exec(l.msg))) {
-    currentGen = { handoffDir: m[3], tokenThreshold: Number(m[1]), toolCallThreshold: Number(m[2]) }
-    enabled.push({ at: l.at, tokenThreshold: Number(m[1]), toolCallThreshold: Number(m[2]), handoffDir: m[3], modelSummary: m[4] === '开', chainLimit: Number(m[5]) })
-  } else if ((m = /^已交接：(\S+) → (\S+)（(\d+) tokens \/ (\d+) 次工具调用）/.exec(l.msg))) {
+  // 「已启用」行的两代格式：
+  //   v1.1.x  token 阈值 300000 / 工具调用阈值 80，交接目录 .dsh/handoff，模型摘要 开，链上限 8
+  //   v1.2+   token 阈值 45% 窗口（窗口读不到时按 1000000 算） / 工具调用阈值 80，交接目录 …，链上限 8 棒 / 同目录并发 2，REVIEW block 规则 …
+  // 两代都要能解析，否则升级后整份日志的阈值与配置代数统计会静默归零。
+  if ((m = /^已启用：(.*?)，交接目录 (\S+?)，模型摘要 (开|关)，链上限 (\d+)/.exec(l.msg))) {
+    const head = m[1]
+    const ratio = /(\d+)% 窗口/.exec(head)
+    const abs = /token 阈值 (\d+)(?!%)/.exec(head)
+    const tool = /工具调用阈值 (\d+)/.exec(head)
+    const conc = /同目录并发 (\d+)/.exec(head)
+    const tokenText = (abs ? abs[1] : '0') + (ratio ? '%' : '')
+    currentGen = { handoffDir: m[2], tokenThreshold: abs ? Number(abs[1]) : 0, tokenThresholdRatio: ratio ? Number(ratio[1]) / 100 : null, toolCallThreshold: tool ? Number(tool[1]) : 80 }
+    enabled.push({
+      at: l.at,
+      tokenThreshold: currentGen.tokenThreshold,
+      tokenThresholdRatio: currentGen.tokenThresholdRatio,
+      toolCallThreshold: currentGen.toolCallThreshold,
+      handoffDir: m[2],
+      modelSummary: m[3] === '开',
+      chainLimit: Number(m[4]),
+      maxAutoHops: Number(m[4]),
+      maxConcurrentHops: conc ? Number(conc[1]) : null,
+      tokenText,
+    })
+  } else if ((m = /^(?:\[[^\]]+\] )?已交接：(\S+) → (\S+)（(\d+) tokens \/ (\d+) 次工具调用）/.exec(l.msg))) {
     handoffs.push({ at: l.at, from: m[1], to: m[2], tokens: Number(m[3]), toolCalls: Number(m[4]), gen: currentGen ? currentGen.handoffDir + '|' + currentGen.tokenThreshold + '/' + currentGen.toolCallThreshold : 'unknown' })
   } else if ((m = /^轮中触发：工具调用已达 (\d+) 次/.exec(l.msg))) {
     midTurnFires++
@@ -106,13 +127,19 @@ if (evText) {
   }
 }
 out.sources.events = { path: EVENTS, exists: events.length > 0, lines: events.length }
+// v1.2 的事件枚举：gate/skip、gate/fire、doc/write、review/verdict、session/create、
+// prompt/deliver、claim/settle、chain/limit、error。一次成功交接 = claim/settle 里 state=done。
+// 这里保留对旧名 handoff/done 的兼容，否则升级后历史事件会全部丢掉。
 if (events.length > 0) {
-  const done = events.filter(e => e.event === 'handoff/done')
+  const done = events.filter(e => (e.event === 'claim/settle' && e.state === 'done') || e.event === 'handoff/done')
   out.structured = {
     byEvent: events.reduce((a, e) => { a[e.event] = (a[e.event] ?? 0) + 1; return a }, {}),
     handoffs: done.length,
     durationMs: done.map(e => e.durationMs).filter(n => typeof n === 'number'),
     triggers: done.reduce((a, e) => { a[e.trigger] = (a[e.trigger] ?? 0) + 1; return a }, {}),
+    // 闸门事件：到底哪个闸把这一棒推过线，v1.2 才第一次能复盘。
+    gates: events.filter(e => e.event === 'gate/skip' || e.event === 'gate/fire').length,
+    reviews: events.filter(e => e.event === 'review/verdict').reduce((a, e) => { a[e.verdict] = (a[e.verdict] ?? 0) + 1; return a }, {}),
   }
 }
 
@@ -240,7 +267,10 @@ check('触发与拦下能分开统计', (out.midTurnFires + out.skipTotal) > 0, 
 const noise = (out.skipTotal + handoffs.length + out.midTurnFires) > 0 ? out.skipTotal / (out.skipTotal + handoffs.length + out.midTurnFires) : 0;
 check('日志噪声比 < 20%', noise < 0.2, '噪声 ' + (noise * 100).toFixed(1) + '%（' + out.skipTotal + ' / ' + (out.skipTotal + handoffs.length) + '）');
 check('交接点能对上模型窗口', (ratio?.n ?? 0) > 0, ratio ? ratio.n + ' 次交接拿到 contextWindow，占比 p25=' + (ratio.p25 * 100).toFixed(0) + '% p50=' + (ratio.p50 * 100).toFixed(0) + '% max=' + (ratio.max * 100).toFixed(0) + '%' : '一次都没拿到 contextWindow');
-check('chainLimit 被真实跑到过', out.claims.maxDepth >= (out.thresholds?.chainLimit ?? 8), 'claims 最大链深 ' + out.claims.maxDepth + '，上限 ' + (out.thresholds?.chainLimit ?? '?'));
+// v1.2 把 chainLimit 改名 maxAutoHops（旧名仍作别名读出）。这条要到「真的走满 8 棒」才 PASS——
+// 它同时证明 genesis 占位有效、并发不互相踩、链到顶能落 stopped，是全链路唯一没法离线伪造的证据。
+const hopLimit = out.thresholds?.maxAutoHops ?? out.thresholds?.chainLimit ?? 8;
+check('自动续作链走满过上限（maxAutoHops）', out.claims.maxDepth >= hopLimit, 'claims 最大链深 ' + out.claims.maxDepth + '，上限 ' + hopLimit);
 check('样本量够改默认阈值', realHandoffs.length >= 20 ? true : 'warn', realHandoffs.length + ' 次真实交接（门槛 20；e2e/离线测试不计）');
 check('日志只含一个 profile 的配置', (out.configGenerations ?? []).length <= 1 ? true : 'warn', (out.configGenerations ?? []).length <= 1 ? '单一配置' : (out.configGenerations.length + ' 代配置混在同一份日志：' + out.configGenerations.join(' / ') + '（e2e/离线测试会污染桌面宿主数据）'));
 out.verify = v
@@ -253,7 +283,7 @@ if (AS_JSON) {
   const pc = x => (x * 100).toFixed(0) + '%'
   console.log('dsh-auto-handoff 实测指标 · ' + out.generatedAt)
   console.log('数据源：日志 ' + out.sources.log.lines + ' 行' + (out.sources.events.exists ? '、结构化事件 ' + events.length + ' 条' : '、无结构化事件') + '、占位 ' + out.claims.total + ' 条、会话窗口 ' + Object.keys(out.window.bySession).length + ' 个')
-  if (out.thresholds) console.log('当前阈值：token ' + out.thresholds.tokenThreshold + ' / 工具调用 ' + out.thresholds.toolCallThreshold + ' / 链上限 ' + out.thresholds.chainLimit + ' / 模型摘要 ' + (out.thresholds.modelSummary ? '开' : '关') + '（' + out.thresholds.at + ' 启用）')
+  if (out.thresholds) console.log('当前阈值：token ' + (out.thresholds.tokenThresholdRatio !== null && out.thresholds.tokenThresholdRatio !== undefined ? Math.round(out.thresholds.tokenThresholdRatio * 100) + '% 窗口' : out.thresholds.tokenThreshold) + ' / 工具调用 ' + out.thresholds.toolCallThreshold + ' / 链上限 ' + (out.thresholds.maxAutoHops ?? out.thresholds.chainLimit) + ' 棒' + (out.thresholds.maxConcurrentHops ? ' / 同目录并发 ' + out.thresholds.maxConcurrentHops : '') + ' / 模型摘要 ' + (out.thresholds.modelSummary ? '开' : '关') + '（' + out.thresholds.at + ' 启用）')
   console.log('')
   console.log('交接 ' + handoffs.length + ' 次（真实 ' + realHandoffs.length + ' 次，其余为 e2e/离线测试），失败 ' + handoffFailed + ' 次，REVIEW ' + out.review.count + ' 次 ' + JSON.stringify(out.review.verdicts))
   if (tok) console.log('  交接时 tokens：p25 ' + tok.p25 + ' / p50 ' + tok.p50 + ' / p90 ' + tok.p90 + ' / max ' + tok.max)

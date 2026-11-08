@@ -14,7 +14,7 @@ import { dirname, join } from 'node:path'
 
 export const CLAIMS_FILE = 'claims.json'
 
-/** inflight=正在交接；done=已交接；stopped=终态不再自动重试；failed=失败可重试 */
+/** inflight=正在交接；done=已交接；stopped=终态不再自动重试；failed=失败可重试；genesis=刚开出来的新棒；deferred=并发超限排队 */
 const TERMINAL_STATES = new Set(['done', 'stopped'])
 
 /** 占位文件的路径；拿不到主目录就返回 undefined（此时退化成内存模式）。 */
@@ -24,7 +24,22 @@ export function claimsPath(home) {
   return join(base, '.dsh', 'auto-handoff', CLAIMS_FILE)
 }
 
-/** 读占位表，任何异常都当成空表（占位丢了最多多交接一次，不能因此崩掉主流程）。 */
+function str(value) {
+  return typeof value === 'string' && value !== '' ? value : undefined
+}
+
+function num(value, fallback) {
+  return Number.isFinite(Number(value)) ? Number(value) : fallback
+}
+
+/**
+ * 读占位表，任何异常都当成空表（占位丢了最多多交接一次，不能因此崩掉主流程）。
+ *
+ * 字段说明（v1.2 起）：除了 state/at/attempts，还记 cwd / trigger / tokens /
+ * toolCalls / reviewVerdict / chainRoot / chainDepth / stoppedReason / stoppedAt /
+ * deferredUntil。原因：判「同 cwd 并发几棒」「这一棒为什么停」都要看这些，
+ * 而它们本来就只在交接那一刻短暂存在于内存里，不落盘就永远查不回来（票 #18）。
+ */
 export function readClaims(path) {
   if (path === undefined) return new Map()
   let text
@@ -41,14 +56,22 @@ export function readClaims(path) {
       for (const [sessionId, value] of Object.entries(claims)) {
         if (value === null || typeof value !== 'object') continue
         map.set(sessionId, {
-          at: Number.isFinite(Number(value.at)) ? Number(value.at) : 0,
-          attempts: Number.isFinite(Number(value.attempts)) ? Number(value.attempts) : 0,
+          at: num(value.at, 0),
+          attempts: num(value.attempts, 0),
           state: typeof value.state === 'string' ? value.state : 'failed',
-          docPath: typeof value.docPath === 'string' ? value.docPath : undefined,
-          newSessionId: typeof value.newSessionId === 'string' ? value.newSessionId : undefined,
-          note: typeof value.note === 'string' ? value.note : undefined,
-          chainRoot: typeof value.chainRoot === 'string' ? value.chainRoot : undefined,
-          chainDepth: Number.isFinite(Number(value.chainDepth)) ? Number(value.chainDepth) : 0,
+          docPath: str(value.docPath),
+          newSessionId: str(value.newSessionId),
+          note: str(value.note),
+          chainRoot: str(value.chainRoot),
+          chainDepth: num(value.chainDepth, 0),
+          cwd: str(value.cwd),
+          trigger: str(value.trigger),
+          tokens: num(value.tokens, 0),
+          toolCalls: num(value.toolCalls, 0),
+          reviewVerdict: str(value.reviewVerdict),
+          stoppedReason: str(value.stoppedReason),
+          stoppedAt: num(value.stoppedAt, 0),
+          deferredUntil: num(value.deferredUntil, 0),
         })
       }
     }
@@ -80,12 +103,19 @@ export function writeClaims(path, map) {
  */
 /**
  * @param force true 表示人手动要求（/handoff）：跳过冷却与次数限制，
- *              但仍然不能中断正在进行中的那一次。
+ *              但仍然不能中断正在进行中的那一次，也不越过 deferred 的排队窗口。
  */
 export function canAutoHandoff(entry, options, now, force) {
   if (entry === undefined) return { ok: true, reason: 'first' }
   if (TERMINAL_STATES.has(entry.state)) {
     return force === true ? { ok: true, reason: 'manual-after-' + entry.state } : { ok: false, reason: entry.state }
+  }
+  if (entry.state === 'deferred') {
+    // 并发超限的排队：不是失败，时间到了自动重试。人工可以提前放行。
+    const until = Number.isFinite(entry.deferredUntil) ? entry.deferredUntil : 0
+    if (force === true) return { ok: true, reason: 'manual-after-deferred' }
+    if (now < until) return { ok: false, reason: 'deferred' }
+    return { ok: true, reason: 'deferred-expired' }
   }
   if (force === true && entry.state !== 'inflight') return { ok: true, reason: 'manual' }
   if (force === true && entry.state === 'inflight') {
@@ -123,24 +153,57 @@ export function reserveClaim(path, sessionId, options, now, force) {
     newSessionId: previous === undefined ? undefined : previous.newSessionId,
     chainRoot: previous === undefined ? undefined : previous.chainRoot,
     chainDepth: previous === undefined ? 0 : previous.chainDepth,
+    cwd: previous === undefined ? undefined : previous.cwd,
+    trigger: previous === undefined ? undefined : previous.trigger,
+    tokens: previous === undefined ? 0 : previous.tokens,
+    toolCalls: previous === undefined ? 0 : previous.toolCalls,
+    reviewVerdict: previous === undefined ? undefined : previous.reviewVerdict,
   })
   writeClaims(path, map)
   return { reserved: true, reason: verdict.reason, map }
 }
 
-/** 更新一次占位的状态；succeeded=false 时保持可重试（attempts 已计过）。 */
+/**
+ * 更新一次占位的状态；succeeded=false 时保持可重试（attempts 已计过）。
+ * patch 里的字段是「替换」语义：传了就覆盖，没传就沿用上一次的值。
+ */
 export function settleClaim(path, sessionId, patch, now) {
   const map = readClaims(path)
   const previous = map.get(sessionId)
+  const keep = (key, fallback) => patch[key] ?? (previous === undefined ? fallback : previous[key])
   map.set(sessionId, {
     at: now,
     attempts: previous === undefined ? 1 : previous.attempts,
     state: patch.state,
-    docPath: patch.docPath ?? (previous === undefined ? undefined : previous.docPath),
-    newSessionId: patch.newSessionId ?? (previous === undefined ? undefined : previous.newSessionId),
+    docPath: keep('docPath', undefined),
+    newSessionId: keep('newSessionId', undefined),
     note: patch.note ?? (previous === undefined ? undefined : previous.note),
-    chainRoot: patch.chainRoot ?? (previous === undefined ? undefined : previous.chainRoot),
-    chainDepth: patch.chainDepth ?? (previous === undefined ? 0 : previous.chainDepth),
+    chainRoot: keep('chainRoot', undefined),
+    chainDepth: keep('chainDepth', 0),
+    cwd: keep('cwd', undefined),
+    trigger: keep('trigger', undefined),
+    tokens: keep('tokens', 0),
+    toolCalls: keep('toolCalls', 0),
+    reviewVerdict: keep('reviewVerdict', undefined),
+    stoppedReason: patch.stoppedReason ?? (previous === undefined ? undefined : previous.stoppedReason),
+    stoppedAt: patch.stoppedAt ?? (previous === undefined ? 0 : previous.stoppedAt),
+    deferredUntil: patch.deferredUntil ?? (previous === undefined ? 0 : previous.deferredUntil),
   })
   writeClaims(path, map)
+}
+
+/**
+ * 同一个工作目录里「还活着的棒」：genesis（刚开出来、随时能再交接）与
+ * inflight（正在交接着）。用来算并发上限 maxConcurrentHops。
+ * @returns {string[]} 其他会话 id
+ */
+export function activeHops(map, cwd, excludeId) {
+  const list = []
+  if (typeof cwd !== 'string' || cwd === '') return list
+  for (const [sessionId, entry] of map.entries()) {
+    if (sessionId === excludeId) continue
+    if (entry.cwd !== cwd) continue
+    if (entry.state === 'genesis' || entry.state === 'inflight') list.push(sessionId)
+  }
+  return list
 }

@@ -31,7 +31,8 @@ async function loadPluginUnderTest() {
     node.role = () => node
     return node
   }
-  globalThis.__SCHEMASTERY_STUB__ = { object: (f) => f, boolean: chainable, number: chainable, string: chainable }
+  // array 是 v1.2 新增的（reviewBlockOn 是字符串数组），链式桩同样返回自身。
+  globalThis.__SCHEMASTERY_STUB__ = { object: (f) => f, boolean: chainable, number: chainable, string: chainable, array: () => chainable() }
 
   const dir = await mkdtemp(join(tmpdir(), 'auto-handoff-midturn-mod-'))
   const file = join(dir, 'index.mjs')
@@ -39,6 +40,8 @@ async function loadPluginUnderTest() {
   // 占位表在 ./claims.js；临时目录里要有同目录副本，相对 import 才解析得到。
   const claimsSource = await readFile(join(process.cwd(), 'lib', 'claims.js'), 'utf8')
   await writeFile(join(dir, 'claims.js'), claimsSource, 'utf8')
+  // v1.2 把文档渲染拆到了 ./docs.js，缺它 import 直接失败。
+  await writeFile(join(dir, 'docs.js'), await readFile(join(process.cwd(), 'lib', 'docs.js'), 'utf8'), 'utf8')
   return import(pathToFileURL(file).href)
 }
 
@@ -180,7 +183,9 @@ async function scenario({ plugin, toolCalls, enforce, fireTurnStopping, extraAft
 
   let doc
   try {
-    doc = await readFile(join(dir, '.dsh', 'handoff', 'sess-a.md'), 'utf8')
+    // v1.2 起交接产物是 <sessionId>/{index.md,facts.jsonl,full.md}；
+    // 这里要的是「完整文档」，所以读 full.md。
+    doc = await readFile(join(dir, '.dsh', 'handoff', 'sess-a', 'full.md'), 'utf8')
   } catch {
     doc = undefined
   }

@@ -21,7 +21,8 @@
 import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import { claimsPath, readClaims, reserveClaim, settleClaim } from './claims.js'
+import { claimsPath, readClaims, reserveClaim, settleClaim, activeHops } from './claims.js'
+import { DOC_BEGIN, DOC_END, INDEX_SECTIONS, renderBriefMeta, renderFacts, renderIndex, stripBriefMeta } from './docs.js'
 import z from '@deepseek-ai/schemastery'
 
 /** Cordis 插件名（loader 诊断用）。 */
@@ -33,13 +34,19 @@ export const inject = ['commands', 'sessions']
 /** 默认选项。 */
 const DEFAULTS = {
   enabled: true,
-  tokenThreshold: 300000,
+  // 0 表示「没显式指定」，按 tokenThresholdRatio × 模型窗口换算。
+  // 旧版写死 300000：本机窗口实测 1,000,000，等于 30% 就满足，token 闸长期在 30% 抖动。
+  tokenThreshold: 0,
+  tokenThresholdRatio: 0.45,
   toolCallThreshold: 80,
   handoffDir: '.dsh/handoff',
   modelSummary: true,
-  chainLimit: 8,
+  maxAutoHops: 8,
+  maxConcurrentHops: 2,
+  concurrentWindowMs: 1800000,
   summaryMaxChars: 1600,
-  docMaxChars: 6000,
+  briefMaxChars: 6000,
+  briefTargetChars: 3000,
   goalMaxChars: 4000,
   summaryTimeoutMs: 45000,
   maxTrackedFiles: 40,
@@ -50,6 +57,9 @@ const DEFAULTS = {
   retryCooldownMs: 600000,
   maxAttempts: 3,
   cancelParentAfterHandoff: true,
+  modelReview: false,
+  reviewBlockOn: ['no-goal', 'no-next-step', 'chain-limit'],
+  toolErrorWarnRatio: 0.2,
 }
 
 const STATE_FILE = 'state.json'
@@ -60,10 +70,17 @@ export const Config = z.object({
   enabled: z.boolean().default(DEFAULTS.enabled).description('总开关。关闭后不注册任何监听与命令。'),
   tokenThreshold: z
     .number()
-    .step(1)
-    .min(1000)
+    .step(1000)
+    .min(0)
     .default(DEFAULTS.tokenThreshold)
-    .description('会话累计 token 压力达到该值即交接。'),
+    .description('会话累计 token 压力的绝对阈值；填 0 表示不设绝对值，改用下面的比例换算（默认）。'),
+  tokenThresholdRatio: z
+    .number()
+    .step(0.01)
+    .min(0.1)
+    .max(0.95)
+    .default(DEFAULTS.tokenThresholdRatio)
+    .description('按模型上下文窗口的比例触发交接（0.45 = 窗口用到 45%）。实测窗口 1,000,000，写死绝对值会在窗口变化后失效。'),
   toolCallThreshold: z
     .number()
     .step(1)
@@ -78,24 +95,42 @@ export const Config = z.object({
     .boolean()
     .default(DEFAULTS.modelSummary)
     .description('是否用模型生成本轮摘要；关闭后使用本地兜底摘要（零额外 token）。'),
-  chainLimit: z
+  maxAutoHops: z
     .number()
     .step(1)
     .min(1)
-    .default(DEFAULTS.chainLimit)
-    .description('自动续作链的深度上限，超过后只写文档不再自动开新会话。'),
+    .default(DEFAULTS.maxAutoHops)
+    .description('自动续作链最多几棒（chainLimit 是它的旧名，仍然认）。到顶后只写文档、不再自动开新会话，并在会话标题标出。'),
+  maxConcurrentHops: z
+    .number()
+    .step(1)
+    .min(1)
+    .default(DEFAULTS.maxConcurrentHops)
+    .description('同一工作目录同时最多有几棒在跑（genesis/inflight 计数）。超限落 deferred 排队，不判失败。'),
+  concurrentWindowMs: z
+    .number()
+    .step(60000)
+    .min(60000)
+    .default(DEFAULTS.concurrentWindowMs)
+    .description('排队多久后自动重试（毫秒）。这是 deferred 的等待窗口，不是超时。'),
   summaryMaxChars: z
     .number()
     .step(100)
     .min(400)
     .default(DEFAULTS.summaryMaxChars)
     .description('模型摘要写入文档前的字符上限。'),
-  docMaxChars: z
+  briefMaxChars: z
     .number()
     .step(100)
     .min(1000)
-    .default(DEFAULTS.docMaxChars)
-    .description('交接文档总字符上限。'),
+    .default(DEFAULTS.briefMaxChars)
+    .description('注入新会话的 index.md 硬上限（字符）。必留两节超了也按行截断，但不丢整节。'),
+  briefTargetChars: z
+    .number()
+    .step(100)
+    .min(500)
+    .default(DEFAULTS.briefTargetChars)
+    .description('index.md 的目标长度；超过就从最末一个非必留小节往前丢，直到落进目标。'),
   goalMaxChars: z
     .number()
     .step(100)
@@ -148,6 +183,21 @@ export const Config = z.object({
     .boolean()
     .default(DEFAULTS.cancelParentAfterHandoff)
     .description('交接成功后取消父会话的当前轮（保留未处理的队列）。关掉它，父会话会继续跑，和子会话同时烧 token。'),
+  modelReview: z
+    .boolean()
+    .default(DEFAULTS.modelReview)
+    .description('交接前 REVIEW 的 L2 模型审：多一次模型调用，只提醒不刹车。默认关——L1 确定性规则已经覆盖可枚举的事实。'),
+  reviewBlockOn: z
+    .array(z.string())
+    .default(DEFAULTS.reviewBlockOn)
+    .description('L1 里哪些项判 block（不建新会话、父会话落 failed 等人工 /handoff）。可选 no-goal / no-next-step / chain-limit。'),
+  toolErrorWarnRatio: z
+    .number()
+    .step(0.05)
+    .min(0.05)
+    .max(1)
+    .default(DEFAULTS.toolErrorWarnRatio)
+    .description('工具报错占比超过它就 warn（报错数 / 工具调用数）。按比例而不是按次数，短会话不会因一两次失败被判 warn。'),
 })
 
 /**
@@ -206,6 +256,45 @@ function logInfo(message, detail) {
   appendLogLine('INFO', message, detail)
 }
 
+/** 结构化事件文件：一行一 JSON，只写决策点（票 #20 定稿）。 */
+const EVENTS_FILE = 'events.jsonl'
+const EVENTS_MAX_BYTES = 5 * 1024 * 1024
+const EVENTS_KEEP = 5
+
+/**
+ * 追加一条结构化事件。
+ *
+ * 为什么另开一个文件、而不是把 .log 改成 JSON：
+ *   · .log 是给人读的，handoff-check 之类脚本已经在按行匹配中文；
+ *   · events.jsonl 是给脚本断言的，字段固定、一行一个 JSON。
+ * 两者混在一起，任何一方改格式都会打断另一方。
+ */
+function appendEvent(event) {
+  try {
+    const dir = runtimeDir()
+    if (dir === undefined) return
+    mkdirSync(dir, { recursive: true })
+    const file = join(dir, EVENTS_FILE)
+    try {
+      if (statSync(file).size > EVENTS_MAX_BYTES) {
+        for (let index = EVENTS_KEEP - 1; index >= 1; index -= 1) {
+          try {
+            renameSync(join(dir, `events.${String(index)}.jsonl`), join(dir, `events.${String(index + 1)}.jsonl`))
+          } catch {
+            /* 该份还不存在 */
+          }
+        }
+        renameSync(file, join(dir, 'events.1.jsonl'))
+      }
+    } catch {
+      /* 首次写，正常 */
+    }
+    appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`, 'utf8')
+  } catch {
+    /* 事件失败即放弃 */
+  }
+}
+
 /** 受限的整数读取。 */
 function readInt(value, fallback) {
   const n = Number(value)
@@ -224,18 +313,40 @@ function readBool(value, fallback) {
   return typeof value === 'boolean' ? value : fallback
 }
 
+/** 读一个小数（比例用；0 也算有效值）。 */
+function readFloat(value, fallback) {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : fallback
+}
+
+/** 读一个字符串数组（reviewBlockOn 用）。 */
+function readList(value, fallback) {
+  if (!Array.isArray(value)) return fallback
+  const list = value.filter((item) => typeof item === 'string' && item.trim() !== '').map((item) => item.trim())
+  return list.length === 0 ? fallback : list
+}
+
 /** 把 patch 里的原始 config 归一化成完整选项。 */
 function resolveOptions(config) {
   const raw = config !== null && typeof config === 'object' ? config : {}
+  // chainLimit 是 maxAutoHops 的旧名：老配置、老文档、老测试都还在用，必须继续认。
+  const hops = readInt(raw.maxAutoHops, readInt(raw.chainLimit, DEFAULTS.maxAutoHops))
   return {
     enabled: readBool(raw.enabled, DEFAULTS.enabled),
+    // tokenThreshold 填 0（或不填）表示不设绝对值，走窗口比例。
     tokenThreshold: readInt(raw.tokenThreshold, DEFAULTS.tokenThreshold),
+    tokenThresholdRatio: readFloat(raw.tokenThresholdRatio, DEFAULTS.tokenThresholdRatio),
     toolCallThreshold: readInt(raw.toolCallThreshold, DEFAULTS.toolCallThreshold),
     handoffDir: readText(raw.handoffDir, DEFAULTS.handoffDir),
     modelSummary: readBool(raw.modelSummary, DEFAULTS.modelSummary),
-    chainLimit: readInt(raw.chainLimit, DEFAULTS.chainLimit),
+    maxAutoHops: hops,
+    // chainLimit 保留为别名，供旧代码路径与 /handoff 文案引用。
+    chainLimit: hops,
+    maxConcurrentHops: readInt(raw.maxConcurrentHops, DEFAULTS.maxConcurrentHops),
+    concurrentWindowMs: readInt(raw.concurrentWindowMs, DEFAULTS.concurrentWindowMs),
     summaryMaxChars: readInt(raw.summaryMaxChars, DEFAULTS.summaryMaxChars),
-    docMaxChars: readInt(raw.docMaxChars, DEFAULTS.docMaxChars),
+    briefMaxChars: readInt(raw.briefMaxChars, DEFAULTS.briefMaxChars),
+    briefTargetChars: readInt(raw.briefTargetChars, DEFAULTS.briefTargetChars),
     goalMaxChars: readInt(raw.goalMaxChars, DEFAULTS.goalMaxChars),
     summaryTimeoutMs: readInt(raw.summaryTimeoutMs, DEFAULTS.summaryTimeoutMs),
     maxTrackedFiles: readInt(raw.maxTrackedFiles, DEFAULTS.maxTrackedFiles),
@@ -246,6 +357,9 @@ function resolveOptions(config) {
     retryCooldownMs: readInt(raw.retryCooldownMs, DEFAULTS.retryCooldownMs),
     maxAttempts: readInt(raw.maxAttempts, DEFAULTS.maxAttempts),
     cancelParentAfterHandoff: readBool(raw.cancelParentAfterHandoff, DEFAULTS.cancelParentAfterHandoff),
+    modelReview: readBool(raw.modelReview, DEFAULTS.modelReview),
+    reviewBlockOn: readList(raw.reviewBlockOn, DEFAULTS.reviewBlockOn),
+    toolErrorWarnRatio: readFloat(raw.toolErrorWarnRatio, DEFAULTS.toolErrorWarnRatio),
   }
 }
 
@@ -260,11 +374,9 @@ function clampText(text, maxChars) {
 /** 交接简报的首行前缀：出现它说明这条 user/message 是上一棒塞进来的整份简报。 */
 const HANDOFF_PREFIX = '[自动交接]'
 
-/** 交接简报里包裹文档正文的两个分隔行。 */
-const DOC_END = '===== 交接文档结束 ====='
-
 /** 文档正文里可能出现的二级小节标题（用于判断「原始目标」到哪为止）。 */
 const DOC_SECTION_TITLES = new Set([
+  // full.md（人看）的八节
   '进度与下一步',
   '交接前 REVIEW',
   '原始目标',
@@ -272,6 +384,12 @@ const DOC_SECTION_TITLES = new Set([
   '最近的助手输出',
   '触及的文件',
   '工具轨迹',
+  // index.md（注入）的六节
+  '目标',
+  '下一步',
+  '约束与禁区',
+  '未决问题',
+  '档案索引',
 ])
 
 /**
@@ -284,9 +402,12 @@ const DOC_SECTION_TITLES = new Set([
 function goalSection(text) {
   if (typeof text !== 'string' || text === '') return ''
   const lines = text.split('\n')
+  // 两种标题都认：v1.2 起 index.md 的第一节叫「## 目标」（短），
+  // full.md 里的第五节仍叫「## 原始目标」（全）。两者取到的都是用户原话。
   let start = -1
   for (let index = 0; index < lines.length; index += 1) {
-    if (lines[index].trim() === '## 原始目标') {
+    const trimmed = lines[index].trim()
+    if (trimmed === '## 原始目标' || trimmed === '## 目标') {
       start = index + 1
       break
     }
@@ -347,7 +468,10 @@ function goalFromDocPath(docPath) {
  * 两条都拿不到新内容就停，最多 10 层；末尾按 `goalMaxChars` 截断。
  */
 function unwrapGoal(text, maxChars) {
-  let current = typeof text === 'string' ? text.trim() : ''
+  // v1.2 的简报在第一行插了「链：第 N 棒 / 上限 M …」元信息，它在「[自动交接]」之前。
+  // 不先剥掉，startsWith(HANDOFF_PREFIX) 会判成「这不是交接简报」，于是整份嵌套简报
+  // 被当成用户原话写进「原始目标」——I-14 刚修完的同类事故会立刻复发。
+  let current = typeof text === 'string' ? stripBriefMeta(text).trim() : ''
   const limit = Number.isFinite(maxChars) && maxChars > 0 ? maxChars : DEFAULTS.goalMaxChars
   // 防环靠「读过哪些文档路径」，不是靠文本指纹：链上相邻两棒的「原始目标」经常
   // 长度相同、尾 64 字也相同（都是被同一处截断的嵌套开头），用指纹会把正常下钻误判成环。
@@ -396,6 +520,22 @@ function splitSummarySections(summary) {
 /** 模型摘要里是否已经有「下一步」这一节。 */
 function hasNextStep(summary) {
   return splitSummarySections(summary).some((section) => section.title.includes('下一步'))
+}
+
+/**
+ * 「下一步」这一节有多少实质内容。
+ * 去掉列表符号（- * 1. 2)）、勾选框、行内空白后数剩下的字数：
+ * 空壳写法（「（待定）」「TODO」「…」）会被算成 0–4 个字。
+ */
+function nextStepSubstance(text) {
+  if (typeof text !== 'string') return 0
+  const stripped = text
+    .split('\n')
+    .map((line) => line.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, '').replace(/\[.?\]|\s+/gu, ''))
+    .join('')
+  // 空壳占位写法单独判：它们字数不多不少，纯数长度会被当成有效内容。
+  if (/^(?:待定|暂无|无|todo|tbd|n\/a|…|\.{2,})$/iu.test(stripped)) return 0
+  return stripped.length
 }
 
 /**
@@ -613,6 +753,22 @@ function isInjectedUserText(text) {
 }
 
 /**
+ * 这条 user/message 的**来源**（票 #29 定稿的主判据）。
+ *
+ * 前缀白名单是猜的，source.kind 是宿主自己标的。实测扫最近 60 个会话：
+ *   真用户轮 68 条，前缀白名单误杀 0；
+ *   注入轮 1038 条，前缀白名单漏 42 条（ptc-mode 11 / agent-message-relay 10 /
+ *   subagent-settled 9 / model-selection 8 / repeat-tool-reminder 2 / user-approval 2）。
+ * 漏掉的那些会被当成「最近的用户指令」写进交接文档，新会话读到的是宿主噪声。
+ */
+function userSourceKind(data) {
+  if (data === null || typeof data !== 'object') return undefined
+  const source = data.source
+  if (source === null || typeof source !== 'object') return undefined
+  return typeof source.kind === 'string' && source.kind !== '' ? source.kind : undefined
+}
+
+/**
  * 只保留「真的存在」的路径，并且文件排在目录前面。
  *
  * 从工具参数正文里抽出来的东西天然带噪声（正则会把散文、URL 片段截成路径）。
@@ -658,7 +814,11 @@ function collectFacts(session, maxTrackedFiles, goalMaxChars) {
       const text = messageText(data)
       if (text === '') continue
       // system-reminder 之类是宿主注入，不是用户指令；写进交接文档只会误导新会话。
-      if (isInjectedUserText(text)) {
+      // 判据顺序：宿主标的 source.kind 优先（真值），前缀白名单只做兜底
+      // （老会话日志没有 source 字段，那时候只能靠前缀猜）。
+      const kind = userSourceKind(data)
+      const injected = kind === undefined ? isInjectedUserText(text) : kind !== 'user'
+      if (injected) {
         if (injectedCount === 0) logInfo('已跳过注入型 user/message（system-reminder 等）')
         injectedCount += 1
         continue
@@ -930,15 +1090,47 @@ function reviewHandoff(facts, meta, options) {
   const items = []
   const add = (level, title, detail) => items.push({ level, title, detail })
 
+  /**
+   * block 必须在 reviewBlockOn 里点名才生效。
+   *
+   * 旧实现 `const blocking = items.filter(i => i.level === 'block')` 恒为空——
+   * 全仓 grep "add('block'" 命中 0 处，日志里 REVIEW block 也是 0 次，
+   * 于是「判不通过怎么办」根本没有触发路径（票 #17 的证据）。
+   */
+  const blockOn = Array.isArray(options.reviewBlockOn) ? options.reviewBlockOn : []
+  const blocks = (key) => blockOn.includes(key)
+  const bad = (key, title, detail) => add(blocks(key) ? 'block' : 'warn', title, detail)
+
+  // ① 没有原始目标：新会话不知道自己在为谁干活，交出去等于交出一份无主文档。
+  if (facts.firstUser === '' || facts.firstUser.trim() === '') {
+    bad('no-goal', '没有捕获到原始目标', '链上第一句话不是用户指令，新会话无法判断自己在做什么；先人工确认目标再交棒。')
+  }
+  // ② 摘要里没有「## 下一步」：实测 4 份简报有 3 份被模型漏写（票 #29 的证据）。
+  // 兜底生成失败时不能硬交——新会话第一句读到的是「接着做」，但接着做什么没人说。
+  const summaryText = typeof meta.summaryText === 'string' ? meta.summaryText : ''
+  // 只判「有没有这一节」不够：模型很爱写「## 下一步\n（待定）」这种空壳，
+  // 标题在、正文是废话，新会话照样无路可走。
+  // 判据取「去掉列表符号与空白之后还剩多少字」，外加一份空壳占位词表
+  // （待定 / 暂无 / TODO / …）：「1. 跑一遍测试」「继续」都算有效，
+  // 「## 下一步\n（待定）」不算。
+  const nextStepText = hasNextStep(summaryText) ? summarySectionText(summaryText, '下一步') : ''
+  if (nextStepSubstance(nextStepText) < 2) {
+    bad('no-next-step', '摘要里没有可执行的「下一步」', '模型摘要漏了下一步（或只写了空壳），兜底也没生成出来；新会话打开简报的第一件事会是重新摸索，先补一句再交棒。')
+  }
   if (facts.files.length === 0) {
     add('warn', '没有识别到任何触及的文件', '新会话没有锚点，只能靠文字复述找现场；检查工具参数里是不是把路径藏在正文里。')
   }
-  if (facts.toolErrors > 0) {
-    add('warn', `本轮有 ${String(facts.toolErrors)} 次工具报错`, '先确认这些报错是已解决还是被绕过；没解决的不要当成已完成。')
+  // ② 工具报错改成按比例：短会话一两次失败不该被判 warn，长会话 20% 才算真的不稳。
+  const errorRatio = facts.toolCalls > 0 ? facts.toolErrors / facts.toolCalls : 0
+  const warnRatio = Number.isFinite(options.toolErrorWarnRatio) ? options.toolErrorWarnRatio : 0.2
+  if (errorRatio > warnRatio) {
+    add(
+      'warn',
+      `工具报错占比 ${String(Math.round(errorRatio * 100))}%`,
+      `本轮 ${String(facts.toolCalls)} 次工具调用里 ${String(facts.toolErrors)} 次报错，超过 ${String(Math.round(warnRatio * 100))}% 的阈值；先确认这些报错是已解决还是被绕过。`,
+    )
   }
-  if (facts.injectedCount > 0) {
-    add('info', `已滤除 ${String(facts.injectedCount)} 条宿主注入消息`, 'system-reminder / 时间戳 / 压缩段不是用户指令，不写进交接文档。')
-  }
+  // ③ 注入消息是每次 48–177 条的常态，原来按 info 也刷了 6 行，降成 debug（不进 items）。
   const openTasks = countOpenChecklist(facts)
   if (openTasks > 0) {
     add('warn', `待办清单还有 ${String(openTasks)} 项未勾选`, '新会话必须先核对这些项的真实状态，不要直接当成已完成。')
@@ -946,14 +1138,18 @@ function reviewHandoff(facts, meta, options) {
   if (facts.files.length > 0 && facts.toolCalls > 0 && facts.recentAssistant.length === 0) {
     add('warn', '没有捕获到助手输出', '交接文档会缺少「已经做到哪」的判断依据。')
   }
-  const remaining = options.chainLimit - meta.chainDepth
-  if (remaining <= 1) {
-    add('warn', `交接链只剩 ${String(Math.max(0, remaining))} 棒`, `chainLimit=${String(options.chainLimit)}；再往下就会停在只写文档、不开新会话。`)
+  // ④ 链到顶：这一棒交不出去任何后续，交出去只会让人以为还在自动推进。
+  const limit = Number.isFinite(options.maxAutoHops) ? options.maxAutoHops : options.chainLimit
+  const remaining = limit - meta.chainDepth
+  if (remaining < 0) {
+    bad('chain-limit', `自动续作已到第 ${String(meta.chainDepth)}/${String(limit)} 棒`, '这一棒不会再自动开新会话，需要人工 /handoff 才能继续。')
+  } else if (remaining <= 1) {
+    add('warn', `交接链只剩 ${String(Math.max(0, remaining))} 棒`, `maxAutoHops=${String(limit)}；再往下就会停在只写文档、不开新会话。`)
   }
 
   const blocking = items.filter((item) => item.level === 'block')
   const verdict = blocking.length > 0 ? 'block' : items.some((item) => item.level === 'warn') ? 'warn' : 'ok'
-  return { verdict, items, openTasks }
+  return { verdict, items, openTasks, blocked: blocking.length > 0 }
 }
 
 /** 统计「- [ ]」形式的未完成项（只数用户自己列的清单）。 */
@@ -1051,6 +1247,72 @@ function renderDoc(meta, facts, summary) {
   ].join('\n')
 }
 
+/** 从摘要里取某一节的正文（按标题关键字，没有就返回空串）。 */
+function summarySectionText(summary, keyword) {
+  for (const section of splitSummarySections(summary)) {
+    if (section.title.includes(keyword)) return section.body.join('\n').trim()
+  }
+  return ''
+}
+
+/**
+ * 组装 index.md 的六节（票 #29 定稿）。
+ *
+ * 六节的**顺序即裁剪优先级**：前两节 required，预算不够时从最后一节往前丢。
+ * 「目标」和「下一步」是必留——新会话缺了前者不知道为谁干活，缺了后者不知道做什么。
+ */
+function indexSections(facts, summary, review, paths, pendingLine) {
+  const nextStep = summarySectionText(summary, '下一步')
+  const decision = summarySectionText(summary, '决定') || summarySectionText(summary, '关键')
+  const open = []
+  if (typeof pendingLine === 'string' && pendingLine !== '') open.push(pendingLine)
+  if (review !== undefined && review !== null && review.openTasks > 0) {
+    open.push('- 交接时待办清单还有 ' + String(review.openTasks) + ' 项未勾选，新会话必须先核对真实状态。')
+  }
+  for (const item of review === undefined || review === null ? [] : review.items) {
+    if (item.level === 'block' || item.level === 'warn') open.push('- ' + item.title + '：' + item.detail)
+  }
+  const reviewText = review === undefined || review === null ? '' : renderReview(review).join('\n')
+  const indexLines = facts.files.slice(0, 20).map((file) => '- ' + file)
+  if (paths !== undefined && paths !== null) {
+    indexLines.push('- 完整档案（人看）：' + paths.fullPath)
+    indexLines.push('- 事实档案（机读，不注入）：' + paths.factsPath)
+  }
+  return {
+    '目标': facts.firstUser,
+    '下一步': nextStep,
+    '约束与禁区': decision,
+    '未决问题': open.join('\n'),
+    '交接前 REVIEW': reviewText,
+    '档案索引': indexLines.join('\n'),
+  }
+}
+
+/**
+ * 把事实摊平成 facts.jsonl 的条目（票 #29 定稿的六类 type）。
+ *
+ * 为什么单独存一份：这些内容**不注入**新会话（注入只花 token 不给收益），
+ * 但人复盘、脚本断言、以及以后要「按需查」时需要一个可 parse 的底座。
+ */
+function factsEntries(facts, review, meta) {
+  const entries = []
+  let seq = 0
+  const push = (type, text, ref) => {
+    seq += 1
+    entries.push({ id: 'f' + String(seq), type, text, ref: ref === undefined ? '' : ref, at: meta.createdAt })
+  }
+  if (facts.firstUser !== '') push('user', facts.firstUser, 'first')
+  for (const text of facts.recentUsers) push('user', text, 'recent')
+  for (const text of facts.recentAssistant) push('assistant', text, '')
+  for (const file of facts.files) push('file', file, '')
+  for (const pair of facts.toolCounts.slice(0, 20)) push('tool', pair[0] + ' × ' + String(pair[1]), '')
+  if (facts.toolErrors > 0) push('error', '本轮工具报错 ' + String(facts.toolErrors) + ' 次', '')
+  if (review !== undefined && review !== null) {
+    const titles = review.items.map((item) => item.title).join('；')
+    push('decision', '交接前 REVIEW ' + review.verdict + (titles === '' ? '' : '：' + titles), 'review')
+  }
+  return entries
+}
 /** 解析交接目录相对路径，兼容 `/` 与 `\\`。 */
 function handoffDirectory(cwd, relativeDir) {
   const segments = relativeDir.split(/[\\/]+/).filter((segment) => segment !== '' && segment !== '.' && segment !== '..')
@@ -1132,17 +1394,145 @@ function resolveTitle(ctx, session) {
   return `会话 ${String(session.id).slice(0, 8)}`
 }
 
-/** 读取 token 压力；拿不到就返回 0（此时只靠工具调用计数触发）。 */
+/**
+ * 读取 token 压力。
+ *
+ * 返回 { tokens, reason }，reason 为空表示读数可信；否则说明**为什么**是 0。
+ * 旧实现一律 return 0 且零留痕，于是 tokenMeter 服务缺失时 token 闸静默归零，
+ * 表面上插件「在跑」，实际只剩工具调用闸在工作（票 #15 的第二类现网故障）。
+ */
 function measureTokens(ctx, session) {
+  let tokenMeter
   try {
-    const tokenMeter = typeof ctx.get === 'function' ? ctx.get('tokenMeter') : undefined
-    if (tokenMeter === undefined || tokenMeter === null || typeof tokenMeter.measure !== 'function') return 0
+    tokenMeter = typeof ctx.get === 'function' ? ctx.get('tokenMeter') : undefined
+  } catch (error) {
+    return { tokens: 0, reason: 'tokenMeter-unavailable: ' + (error instanceof Error ? error.message : String(error)) }
+  }
+  if (tokenMeter === undefined || tokenMeter === null) return { tokens: 0, reason: 'no-tokenMeter' }
+  if (typeof tokenMeter.measure !== 'function') return { tokens: 0, reason: 'no-measure' }
+  try {
     const measurement = tokenMeter.measure(session)
-    if (measurement === null || typeof measurement !== 'object') return 0
+    if (measurement === null || typeof measurement !== 'object') return { tokens: 0, reason: 'empty-measurement' }
     const total = Number(measurement.totalTokens)
-    return Number.isFinite(total) && total > 0 ? Math.floor(total) : 0
+    if (!Number.isFinite(total)) return { tokens: 0, reason: 'non-numeric-total' }
+    return { tokens: total > 0 ? Math.floor(total) : 0, reason: total > 0 ? '' : 'zero' }
+  } catch (error) {
+    return { tokens: 0, reason: 'measure-threw: ' + (error instanceof Error ? error.message : String(error)) }
+  }
+}
+
+/**
+ * 会话当前路由的上下文窗口。
+ *
+ * 宿主（app.asar 类型表）里 RequestContext = { provider, model, contextWindow?, ... }，
+ * session.requestContext() 拿的就是它。contextWindow 缺席说明 adapter 没有声明容量，
+ * 这时不能猜，只能退回保守默认值。
+ */
+function contextWindowOf(session) {
+  try {
+    if (typeof session.requestContext !== 'function') return 0
+    const rc = session.requestContext()
+    if (rc === null || typeof rc !== 'object') return 0
+    const window = Number(rc.contextWindow)
+    return Number.isFinite(window) && window > 0 ? Math.floor(window) : 0
   } catch {
     return 0
+  }
+}
+
+/** 窗口读不到时的保守默认值：本机实测所有路由都是 1,000,000。 */
+const FALLBACK_CONTEXT_WINDOW = 1000000
+
+/**
+ * token 闸的生效阈值（票 #20 定稿）。
+ *
+ * 写死 300000 等于「不管什么模型都按 30% 切」，而实测窗口 1,000,000、
+ * 真实交接发生在 45%–84%——真正的限制是「轮末才检查」这个时机，不是阈值。
+ * 所以默认走比例，绝对值只用来显式覆盖。
+ */
+function effectiveTokenThreshold(session, options) {
+  const ratio = Number.isFinite(options.tokenThresholdRatio) ? options.tokenThresholdRatio : 0.45
+  if (Number.isFinite(options.tokenThreshold) && options.tokenThreshold > 0) {
+    return { threshold: options.tokenThreshold, source: 'absolute', window: contextWindowOf(session), ratio }
+  }
+  const window = contextWindowOf(session)
+  if (window > 0) {
+    return { threshold: Math.max(1000, Math.floor(window * ratio)), source: 'ratio', window, ratio }
+  }
+  return { threshold: Math.max(1000, Math.floor(FALLBACK_CONTEXT_WINDOW * ratio)), source: 'ratio-fallback', window: 0, ratio }
+}
+
+/**
+ * 一条链的可读账本：`~/.dsh/auto-handoff/chains/<root>.json`（票 #18 定稿）。
+ *
+ * 为什么与 claims.json 分开：claims 是每个会话一行的**热路径**（每轮闸门都要同步读），
+ * chain.json 是每条链一份的**冷数据**（人看、脚本查「这条链走了几棒、谁变孤儿」）。
+ * 混在一张表里，热路径每次都要扫全链。
+ */
+function chainJsonPath(root) {
+  const dir = runtimeDir()
+  if (dir === undefined || typeof root !== 'string' || root === '') return undefined
+  return join(dir, 'chains', `${root}.json`)
+}
+
+/** 读一条链的账本；没有或坏了都返回一个空壳（不能让观测数据阻断交接）。 */
+function readChainJson(root) {
+  const path = chainJsonPath(root)
+  const empty = { root, cwd: '', startedAt: new Date().toISOString(), limit: 0, hops: [], orphans: [], stopped: false }
+  if (path === undefined) return empty
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8'))
+    if (parsed === null || typeof parsed !== 'object') return empty
+    return {
+      root: typeof parsed.root === 'string' && parsed.root !== '' ? parsed.root : root,
+      cwd: typeof parsed.cwd === 'string' ? parsed.cwd : '',
+      startedAt: typeof parsed.startedAt === 'string' ? parsed.startedAt : empty.startedAt,
+      limit: Number.isFinite(Number(parsed.limit)) ? Number(parsed.limit) : 0,
+      hops: Array.isArray(parsed.hops) ? parsed.hops : [],
+      orphans: Array.isArray(parsed.orphans) ? parsed.orphans : [],
+      stopped: parsed.stopped === true,
+    }
+  } catch {
+    return empty
+  }
+}
+
+/** 写一条链的账本；失败只记日志，不影响交接。 */
+function writeChainJson(root, data) {
+  const path = chainJsonPath(root)
+  if (path === undefined || data === null || typeof data !== 'object') return
+  try {
+    mkdirSync(join(path, '..'), { recursive: true })
+    const payload = { ...data, updatedAt: new Date().toISOString() }
+    const tmp = path + '.tmp'
+    writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8')
+    renameSync(tmp, path)
+  } catch (error) {
+    logWarn('写入链账本失败（不影响本次交接）', error)
+  }
+}
+
+/**
+ * 给会话改名，让它在 GUI 侧栏里能被人认出来（票 #18）。
+ *
+ * 实测重启后 7 个 root 会话 header 的 title 全为 null，人在侧栏看到一排
+ * 一模一样的「新会话」——链到顶、REVIEW 未通过、排队中、孤儿这四类人工停点
+ * 如果只写在日志里，等于没写。rename 是宿主给的正式 API，失败不影响主流程。
+ */
+function renameSession(ctx, sessionId, title) {
+  try {
+    const controller = optionalService(ctx, 'sessionController')
+    if (controller === null || controller === undefined || typeof controller.rename !== 'function') return false
+    const result = controller.rename({ sessionId, title })
+    if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
+      result.then(undefined, (error) => {
+        logInfo(`会话改名被拒绝（${error instanceof Error ? error.message : String(error)}）`)
+      })
+    }
+    return true
+  } catch (error) {
+    logInfo(`会话改名失败（${error instanceof Error ? error.message : String(error)}）`)
+    return false
   }
 }
 
@@ -1196,12 +1586,63 @@ export function apply(ctx, config) {
    */
   const blockedNoted = new Set()
 
+  /**
+   * 同一 cwd 里还活着（genesis / inflight）的其它棒有几个。
+   *
+   * 实测重启后 19 分钟里同一目录发生了 6 次交接、合计 376 万 token，
+   * 6 个父会话全都还活着——并发不是理论风险，是现状（票 #18）。
+   */
+  function countActiveHops(cwd, sessionId, now) {
+    try {
+      return activeHops(readClaims(claimsFile), cwd, sessionId, now).length
+    } catch {
+      return 0
+    }
+  }
   /** 把某个会话的占位状态说成人话（/handoff-status 用）。 */
   function describeClaim(sessionId) {
     const entry = readClaims(claimsFile).get(sessionId)
     if (entry === undefined) return '否'
     const at = entry.at === 0 ? '未知时间' : new Date(entry.at).toISOString()
     return `是（${entry.state}，${at}，第 ${String(entry.attempts)} 次）`
+  }
+
+  /**
+   * /handoff-status 的正文。
+   *
+   * 两个注册点（enabled=false 与正常路径）共用一份实现：旧实现各写一份，
+   * 停用态那份还在用 options.tokenThreshold 做除法，改成比例阈值后必然除零。
+   */
+  function describeStatus(ctx, session, sessionId) {
+    const tokenInfo = measureTokens(ctx, session)
+    const tokens = tokenInfo.tokens
+    const window = effectiveTokenThreshold(session, options)
+    const toolCalls = toolCallCounts.get(sessionId) ?? 0
+    const facts = collectFacts(session, options.maxTrackedFiles, options.goalMaxChars)
+    const tokenPct = window.threshold > 0 ? Math.min(100, Math.round((tokens / window.threshold) * 100)) : 0
+    const toolPct = options.toolCallThreshold > 0 ? Math.min(100, Math.round((toolCalls / options.toolCallThreshold) * 100)) : 0
+    const nearest = Math.max(tokenPct, toolPct)
+    const claim = readClaims(claimsFile).get(sessionId)
+    const siblings = countActiveHops(resolveSessionCwd(ctx, session), sessionId, Date.now())
+    const lines = [
+      '会话 ' + sessionId,
+      '- token 压力：' + String(tokens) + ' / ' + String(window.threshold) + '（' + String(tokenPct) + '%，' +
+        window.source + '；窗口 ' + String(window.window === 0 ? '未知' : window.window) + '）',
+      '- 工具调用：' + String(toolCalls) + ' / ' + String(options.toolCallThreshold) + '（' + String(toolPct) + '%）',
+      '- 日志事件数：' + String(facts.eventCount) + '，工具报错 ' + String(facts.toolErrors) + ' 次',
+      '- 距最近阈值：还剩 ' + String(Math.max(0, 100 - nearest)) + '%',
+      '- 已交接：' + describeClaim(sessionId),
+      '- 同目录同伴棒：' + String(siblings) + ' 个（上限 ' + String(options.maxConcurrentHops) + '）',
+      '- 交接目录：' + handoffDirectory(resolveSessionCwd(ctx, session), options.handoffDir),
+    ]
+    if (tokenInfo.reason !== '' && tokenInfo.reason !== 'zero') {
+      lines.push('- ⚠️ token 读数不可信：' + tokenInfo.reason + '（token 闸已按比例兜底）')
+    }
+    if (claim !== undefined && Number.isFinite(claim.chainDepth)) {
+      lines.push('- 链：第 ' + String(claim.chainDepth) + ' 棒 / 上限 ' + String(options.maxAutoHops) + ' ｜ 根 ' + String(claim.chainRoot ?? sessionId))
+    }
+    lines.push('任一阈值到 100% 的下一轮结束时自动交接；也可随时用 /handoff 手动触发。')
+    return lines.join('\n')
   }
 
   if (options.enabled !== true) {
@@ -1216,25 +1657,8 @@ export function apply(ctx, config) {
         if (session === undefined || session === null) {
           return { kind: 'error', text: '找不到当前会话的日志。' }
         }
-        const tokens = measureTokens(ctx, session)
-        const toolCalls = toolCallCounts.get(sessionId) ?? 0
-        const facts = collectFacts(session, options.maxTrackedFiles, options.goalMaxChars)
-        const tokenPct = Math.min(100, Math.round((tokens / options.tokenThreshold) * 100))
-        const toolPct = Math.min(100, Math.round((toolCalls / options.toolCallThreshold) * 100))
-        const nearest = Math.max(tokenPct, toolPct)
-        return {
-          kind: 'success',
-          text: [
-            `会话 ${sessionId}`,
-            `- token 压力：${String(tokens)} / ${String(options.tokenThreshold)}（${String(tokenPct)}%）`,
-            `- 工具调用：${String(toolCalls)} / ${String(options.toolCallThreshold)}（${String(toolPct)}%）`,
-            `- 日志事件数：${String(facts.eventCount)}，工具报错 ${String(facts.toolErrors)} 次`,
-            `- 累计工具调用（含未入账）：${String(facts.toolCalls)}`,
-            `- 距最近阈值：还剩 ${String(Math.max(0, 100 - nearest))}%`,
-            `- 已交接：${describeClaim(sessionId)}；交接目录 ${handoffDirectory(resolveSessionCwd(ctx, session), options.handoffDir)}`,
-            '任一阈值到 100% 的下一轮结束时自动交接；也可随时用 /handoff 手动触发。',
-          ].join('\n'),
-        }
+        const statusText = describeStatus(ctx, session, sessionId)
+        return { kind: 'success', text: statusText }
       } catch (error) {
         return { kind: 'error', text: `读取状态失败：${error instanceof Error ? error.message : String(error)}` }
       }
@@ -1334,11 +1758,22 @@ export function apply(ctx, config) {
     const sessionId = String(session.id)
     const cwd = resolveSessionCwd(ctx, session)
     const dir = handoffDirectory(cwd, options.handoffDir)
-    const tokens = measureTokens(ctx, session)
+    const tokenInfo = measureTokens(ctx, session)
+    const tokens = tokenInfo.tokens
+    const windowInfo = effectiveTokenThreshold(session, options)
+    // 闸门判定用的是这个累计计数，日志里也必须记它。
+    // 旧实现日志写的是 facts.toolCalls（collectFacts 数的历史总数），
+    // 与判定用的 toolCallCounts 是两个数，复盘时永远对不上（票 #20）。
+    const gateToolCalls = toolCallCounts.get(sessionId) ?? 0
     const facts = collectFacts(session, options.maxTrackedFiles, options.goalMaxChars)
     const title = resolveTitle(ctx, session)
     const chain = await chainFor(sessionId)
     const nextDepth = chain.depth + 1
+    const now0 = Date.now()
+    const siblings = countActiveHops(cwd, sessionId, now0)
+    if (tokenInfo.reason !== '' && tokenInfo.reason !== 'zero') {
+      appendEvent({ event: 'gate/skip', sessionId, cwd, reason: 'token-unavailable: ' + tokenInfo.reason })
+    }
 
     let summary
     try {
@@ -1348,68 +1783,197 @@ export function apply(ctx, config) {
       summary = undefined
     }
     const summaryUsed = typeof summary === 'string' && summary !== ''
-    if (!summaryUsed) summary = fallbackSummary(facts)
+    // 兜底摘要必须自带「## 下一步」这一节：
+    // REVIEW 的 no-next-step 规则看的是**有没有这一节且有正文**，而 fallbackSummary
+    // 返回的是若干条项目符号、没有节标题，直接塞进去会让「模型不可用」被判成
+    // 「交接内容缺东西」，于是无模型时整条链一次都交不出去。
+    if (!summaryUsed) summary = '## 下一步' + String.fromCharCode(10) + fallbackSummary(facts)
 
     const createdAt = new Date().toISOString()
+    const maxHops = Number.isFinite(options.maxAutoHops) ? options.maxAutoHops : options.chainLimit
+    const overLimit = nextDepth > maxHops
     // REVIEW 必须在渲染之前：它要能把「这一棒交出去会缺什么」写进文档，
     // 也让「接下来会卡在哪里」对上一棒可见，而不是等新会话撞墙才发现。
-    const review = reviewHandoff(facts, { chainDepth: nextDepth }, options)
-    if (review.verdict !== 'ok') {
-      logInfo(`交接前 REVIEW ${review.verdict}：${review.items.map((item) => item.title).join('；')}`)
-    }
-    const docBody = renderDoc(
-      {
+    const review = reviewHandoff(facts, { chainDepth: nextDepth, summaryText: summary }, options)
+    const reviewTitles = review.items.map((item) => item.title).join('；')
+    appendEvent({
+      event: 'review/verdict',
+      sessionId,
+      cwd,
+      verdict: review.verdict,
+      itemCount: review.items.length,
+      blocked: review.blocked,
+      openTasks: review.openTasks,
+      items: reviewTitles,
+    })
+    if (review.verdict !== 'ok') logInfo('交接前 REVIEW ' + review.verdict + '：' + reviewTitles)
+
+    // 三份文件（票 #29 定稿）：index.md 注入、facts.jsonl 不注入、full.md 人看。
+    // 旧实现只有一份被 6000 字截断的文档，最贵的两节排在末尾，实测 8 份里 4 份整节丢「下一步」。
+    const docsDir = join(dir, sessionId)
+    const docPath = join(docsDir, 'index.md')
+    const factsPath = join(docsDir, 'facts.jsonl')
+    const fullPath = join(docsDir, 'full.md')
+
+    // 到顶那一棒必须把「为什么停了」写进文档本身（票 #18 三件事之一）。
+    const pendingLine = overLimit
+      ? '- 自动续作已到第 ' + String(nextDepth) + '/' + String(maxHops) + ' 棒，这一棒之后不会再自动开新会话；要继续请人工 /handoff。'
+      : ''
+    const indexText = renderIndex({
+      meta: {
         sessionId,
-        previousSessionId: chain.depth === 0 ? '' : chain.root,
+        title,
         chainRoot: chain.root,
         chainDepth: nextDepth,
+        hopLimit: maxHops,
         tokens,
+        toolCalls: gateToolCalls,
+        trigger,
+        reviewVerdict: review.verdict,
         createdAt,
-        title,
-        review,
       },
-      facts,
-      summary,
+      sections: indexSections(facts, summary, review, { fullPath, factsPath }, pendingLine),
+      options,
+    })
+    const fullText = clampText(
+      renderDoc(
+        {
+          sessionId,
+          previousSessionId: chain.depth === 0 ? '' : chain.root,
+          chainRoot: chain.root,
+          chainDepth: nextDepth,
+          tokens,
+          createdAt,
+          title,
+          review,
+        },
+        facts,
+        summary,
+      ),
+      Math.max(options.briefMaxChars * 4, 40000),
     )
-    // 盘上写全文，只把注入新会话的那一份裁到 docMaxChars。
-    // 旧实现把整篇裁到 6000 字再落盘，结果「进度与下一步」这一节（全篇最有用的部分）
-    // 因为排在最后被整段砍掉——实测 10780 字的文档只剩 6006 字，下一步一个字没留。
-    const docText = clampText(docBody, Math.max(options.docMaxChars * 4, 40000))
-    const injectedText = clampText(docBody, options.docMaxChars)
-    const docPath = join(dir, `${sessionId}.md`)
+    const factsText = renderFacts(factsEntries(facts, review, { createdAt }))
 
-    await mkdir(dir, { recursive: true })
-    await writeFile(docPath, docText, 'utf8')
+    await mkdir(docsDir, { recursive: true })
+    await writeFile(docPath, indexText, 'utf8')
+    await writeFile(factsPath, factsText === '' ? '' : factsText + '\n', 'utf8')
+    await writeFile(fullPath, fullText, 'utf8')
+    appendEvent({
+      event: 'doc/write',
+      sessionId,
+      cwd,
+      docPath,
+      chars: indexText.length,
+      factsChars: factsText.length,
+      fullChars: fullText.length,
+      reviewVerdict: review.verdict,
+    })
 
     const base = {
       sessionId,
       docPath,
       tokens,
-      toolCalls: facts.toolCalls,
+      toolCalls: gateToolCalls,
       trigger,
       summaryUsed,
       chainRoot: chain.root,
       chainDepth: nextDepth,
+      reviewVerdict: review.verdict,
     }
 
-    if (nextDepth > options.chainLimit) {
+    // ── 链到顶：只写文档 + 三件可见的事（票 #18） ──
+    if (overLimit) {
       // 到顶之后必须把占位落成 stopped（终态），否则它会停在 inflight，
-      // TTL 一过又能再交接一次——实测探针里同一棒被反复续作 35 次，chainLimit 形同废纸。
+      // TTL 一过又能再交接一次——实测探针里同一棒被反复续作 35 次，上限形同废纸。
       // 落 stopped 的含义是：这条链到此为止，要再往前走请人工 /handoff。
       settleClaim(
         claimsFile,
         sessionId,
-        { state: 'stopped', docPath, chainRoot: chain.root, chainDepth: chain.depth, note: 'chain-limit' },
+        {
+          state: 'stopped',
+          docPath,
+          chainRoot: chain.root,
+          chainDepth: chain.depth,
+          note: 'chain-limit',
+          stoppedReason: 'chain-limit',
+          stoppedAt: new Date().toISOString(),
+          reviewVerdict: review.verdict,
+          tokens,
+          toolCalls: gateToolCalls,
+        },
         Date.now(),
       )
-      logWarn(`交接链深度已达上限 ${String(options.chainLimit)}，本次只写文档不自动续作：${docPath}`)
+      renameSession(ctx, sessionId, '[链到顶 ' + String(nextDepth) + '/' + String(maxHops) + '] ' + title)
+      const chainData = readChainJson(chain.root)
+      writeChainJson(chain.root, { ...chainData, root: chain.root, cwd, limit: maxHops, stopped: true })
+      appendEvent({ event: 'chain/limit', sessionId, cwd, depth: nextDepth, limit: maxHops, docPath })
+      logWarn('交接链已达上限 ' + String(maxHops) + '，本次只写文档不自动续作：' + docPath)
       return { ...base, newSessionId: undefined, stoppedByChainLimit: true }
+    }
+
+    // ── REVIEW 不通过：这一棒根本不建新会话（票 #17 定稿） ──
+    // 旧实现里 block 规则一条都没有，verdict 只可能是 ok/warn，所以「判不通过怎么办」
+    // 从来没被触发过。现在 block 的三种情形都是「交出去必然坏事」：没目标、没下一步、链到顶。
+    if (review.blocked === true) {
+      settleClaim(
+        claimsFile,
+        sessionId,
+        {
+          state: 'failed',
+          docPath,
+          chainRoot: chain.root,
+          chainDepth: chain.depth,
+          note: 'review-block',
+          reviewVerdict: review.verdict,
+          tokens,
+          toolCalls: gateToolCalls,
+        },
+        Date.now(),
+      )
+      renameSession(ctx, sessionId, '[REVIEW 未通过] ' + title)
+      appendEvent({ event: 'claim/settle', sessionId, cwd, state: 'failed', reason: 'review-block', reviewVerdict: review.verdict })
+      logWarn('交接前 REVIEW 未通过，本次不建新会话：' + reviewTitles + '；文档已写入 ' + docPath)
+      return { ...base, newSessionId: undefined, stoppedByChainLimit: false, blockedByReview: true }
+    }
+
+    // ── 同目录并发超限：不判失败，排队（deferred 是非终态，下一轮自动重试） ──
+    if (siblings >= options.maxConcurrentHops) {
+      const deferredUntil = now0 + options.concurrentWindowMs
+      settleClaim(
+        claimsFile,
+        sessionId,
+        {
+          state: 'deferred',
+          docPath,
+          chainRoot: chain.root,
+          chainDepth: chain.depth,
+          note: 'concurrent-limit',
+          deferredUntil,
+          reviewVerdict: review.verdict,
+          tokens,
+          toolCalls: gateToolCalls,
+        },
+        Date.now(),
+      )
+      renameSession(ctx, sessionId, '[排队交接 ' + String(siblings + 1) + '/' + String(options.maxConcurrentHops) + '] ' + title)
+      appendEvent({
+        event: 'gate/skip',
+        sessionId,
+        cwd,
+        reason: 'concurrent-limit',
+        siblings,
+        deferredUntil: new Date(deferredUntil).toISOString(),
+      })
+      logInfo('[' + sessionId + '] 同目录已有 ' + String(siblings) + ' 棒在跑，超过上限 ' + String(options.maxConcurrentHops) + '，本次排队到 ' + new Date(deferredUntil).toISOString())
+      return { ...base, newSessionId: undefined, stoppedByChainLimit: false, deferred: true }
     }
 
     const controller = optionalService(ctx, 'sessionController')
     if (controller === undefined || controller === null || typeof controller.create !== 'function') {
-      logWarn(`缺少 sessionController，无法自动开新会话；交接文档已写入 ${docPath}`)
+      logWarn('缺少 sessionController，无法自动开新会话；交接文档已写入 ' + docPath)
       settleClaim(claimsFile, sessionId, { state: 'stopped', docPath, note: 'no-session-controller' }, Date.now())
+      const chainData = readChainJson(chain.root)
+      writeChainJson(chain.root, { ...chainData, root: chain.root, cwd, limit: maxHops, stopped: true })
       return { ...base, newSessionId: undefined, stoppedByChainLimit: false }
     }
 
@@ -1427,12 +1991,14 @@ export function apply(ctx, config) {
       { state: 'inflight', docPath, chainRoot: chain.root, chainDepth: chain.depth },
       Date.now(),
     )
+    appendEvent({ event: 'session/create', sessionId, cwd, depth: nextDepth, preset: preset === undefined ? '' : preset })
 
     let created
     try {
       created = await controller.create(preset === undefined ? { cwd } : { cwd, agentPreset: preset })
     } catch (error) {
       settleClaim(claimsFile, sessionId, { state: 'failed', docPath, note: 'create-failed' }, Date.now())
+      appendEvent({ event: 'error', sessionId, cwd, stage: 'create', message: error instanceof Error ? error.message : String(error) })
       throw error
     }
     const newSessionId = created !== null && typeof created === 'object' ? String(created.sessionId) : ''
@@ -1442,17 +2008,28 @@ export function apply(ctx, config) {
       return { ...base, newSessionId: undefined, stoppedByChainLimit: false }
     }
 
+    // 简报首行永远是元信息（票 #18）：链第几棒、上限、根、触发点、同伴数。
+    // 人在侧栏只能看到标题（实测 7/7 为 null），模型看的第一行就是这行。
+    const reviewLabel = { ok: '通过', warn: '有需要新会话注意的地方', block: '未通过' }[review.verdict] ?? review.verdict
     const reviewLine =
-      review.verdict === 'ok'
-        ? ''
-        : `\n交接前 REVIEW 结论：${review.verdict}。${review.items.map((item) => item.title).join('；')}。开工前先核对这几条，别当成已完成。\n`
+      '交接前 REVIEW 结论：' + reviewLabel + (reviewTitles === '' ? '。' : '。' + reviewTitles + '。开工前先核对这几条，别当成已完成。')
     const promptText = [
-      `[自动交接] 上一会话 ${sessionId} 达到阈值（${String(tokens)} tokens / ${String(facts.toolCalls)} 次工具调用），` +
-        `已把进度写入 \`${docPath}\`。下面是同一份交接文档的全文，直接据此继续，不要重复已完成的工作。`,
+      renderBriefMeta({
+        hop: nextDepth,
+        limit: maxHops,
+        root: chain.root,
+        trigger,
+        tokens,
+        toolCalls: gateToolCalls,
+        siblings,
+      }),
+      '[自动交接] 上一会话 ' + sessionId + ' 达到阈值（' + String(tokens) + ' tokens / ' + String(gateToolCalls) + ' 次工具调用），' +
+        '已把进度写入 ' + docPath + '（全文 ' + fullPath + '，事实档案 ' + factsPath + '）。' +
+        '下面是交接简报，直接据此继续，不要重复已完成的工作。',
       reviewLine,
-      '===== 交接文档开始 =====',
-      injectedText,
-      '===== 交接文档结束 =====',
+      DOC_BEGIN,
+      indexText,
+      DOC_END,
       '',
       '请立刻从「下一步」开始推进；如果发现文档与工作区实际不一致，以工作区实际为准并说明差异。',
     ].join('\n')
@@ -1461,12 +2038,11 @@ export function apply(ctx, config) {
     // 而旧实现把账本写在 prompt 之后，于是账本一次都没被写过（实测停在 197 字节 / 2026-11-05）。
     // 新会话登记的只是「链上第几棒」，不是「已经交接过」——
     // 用 inflight/done 会让它 24 小时内（或永远）没法再交接，链条就停在第二棒。
-    // 未知状态在 canAutoHandoff 里等价于「可以交接」，正好是这里要的语义。
     reserveClaim(claimsFile, newSessionId, options, Date.now(), true)
     settleClaim(
       claimsFile,
       newSessionId,
-      { state: 'genesis', docPath, chainRoot: chain.root, newSessionId, chainDepth: depthForNew },
+      { state: 'genesis', docPath, chainRoot: chain.root, newSessionId, chainDepth: depthForNew, cwd, trigger, tokens, toolCalls: gateToolCalls, reviewVerdict: review.verdict },
       Date.now(),
     )
 
@@ -1475,7 +2051,7 @@ export function apply(ctx, config) {
       // 旧代码只传一个参数 → TypeError → 简报永远送不出去（实测 86 个会话 0 送达）。
       await controller.prompt(
         {
-          requestId: `auto-handoff-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+          requestId: 'auto-handoff-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
           sessionId: newSessionId,
           mode: 'queue',
           content: [{ type: 'text', text: promptText }],
@@ -1483,32 +2059,69 @@ export function apply(ctx, config) {
         promptSignal(signal),
       )
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
       settleClaim(
         claimsFile,
         sessionId,
-        { state: 'failed', docPath, newSessionId, note: 'prompt-failed: ' + (error instanceof Error ? error.message : String(error)) },
+        { state: 'failed', docPath, newSessionId, note: 'prompt-failed: ' + message },
         Date.now(),
       )
       settleClaim(claimsFile, newSessionId, { state: 'failed', docPath, note: 'prompt-failed' }, Date.now())
-      logWarn(`交接简报投递失败：${sessionId} → ${newSessionId}；文档已写入 ${docPath}`, error)
+      // 孤儿会话：建出来了但没收到简报。不 cancel（可能已开始干活），只改名让人能认出来。
+      renameSession(ctx, newSessionId, '[孤儿·无简报] ' + title)
+      appendEvent({ event: 'error', sessionId, cwd, stage: 'prompt', newSessionId, message })
+      logWarn('交接简报投递失败：' + sessionId + ' → ' + newSessionId + '；文档已写入 ' + docPath, error)
       return { ...base, newSessionId, stoppedByChainLimit: false, promptFailed: true }
     }
 
+    appendEvent({
+      event: 'prompt/deliver',
+      sessionId,
+      cwd,
+      newSessionId,
+      depth: nextDepth,
+      chars: promptText.length,
+      reviewVerdict: review.verdict,
+    })
     settleClaim(
       claimsFile,
       sessionId,
-      { state: 'done', docPath, newSessionId, chainRoot: chain.root, chainDepth: chain.depth },
+      { state: 'done', docPath, newSessionId, chainRoot: chain.root, chainDepth: chain.depth, reviewVerdict: review.verdict, tokens, toolCalls: gateToolCalls },
       Date.now(),
     )
     // 新会话这一条不能写 done：done 是终态，canAutoHandoff 会一直拦它，
-    // 于是链条永远停在第二棒、chainLimit 形同废纸。
+    // 于是链条永远停在第二棒、上限形同废纸。
     // 写 genesis 表示「这一棒刚开出来，链深已登记，随时可以再交接」。
     settleClaim(
       claimsFile,
       newSessionId,
-      { state: 'genesis', docPath, chainRoot: chain.root, newSessionId, chainDepth: depthForNew },
+      { state: 'genesis', docPath, chainRoot: chain.root, newSessionId, chainDepth: depthForNew, cwd, trigger, tokens, toolCalls: gateToolCalls, reviewVerdict: review.verdict },
       Date.now(),
     )
+
+    const durationMs = Date.now() - now0
+    // 这一条是复盘的主锚：谁交出去的、交给谁、凭什么被推过线、花了多久、结果如何。
+    // tokens / toolCalls 都要记**闸门当时用的那两个数**，不能记 facts 里的历史累计，
+    // 否则「到底哪个闸把它推过线」永远对不上（票 #20 的第三条验收）。
+    appendEvent({
+      event: 'claim/settle',
+      sessionId,
+      cwd,
+      state: 'done',
+      trigger,
+      tokens,
+      contextWindow: windowInfo.window,
+      windowRatio: windowInfo.window > 0 ? tokens / windowInfo.window : 0,
+      toolCalls: gateToolCalls,
+      docPath,
+      newSessionId,
+      depth: nextDepth,
+      chainRoot: chain.root,
+      durationMs,
+      summaryUsed,
+      reviewVerdict: review.verdict,
+      outcome: 'handoff',
+    })
 
     // 简报已经送达，子会话开始接棒。父会话此刻还活着——它不会因为交接而停下，
     // 实测会继续跑 70 分钟、和子会话一起烧 token（用户抱怨的正是这个）。
@@ -1527,12 +2140,12 @@ export function apply(ctx, config) {
           parentCancelled = true
           if (accepted !== null && typeof accepted === 'object' && typeof accepted.then === 'function') {
             accepted.then(undefined, (error) => {
-              logInfo(`父会话取消请求被拒绝（${error instanceof Error ? error.message : String(error)}）`)
+              logInfo('父会话取消请求被拒绝（' + (error instanceof Error ? error.message : String(error)) + '）')
             })
           }
         } catch (error) {
           // 旧会话已经 detach（跑完自然结束）时会抛 session/not-found —— 这是正常情况。
-          logInfo(`父会话无需取消或已结束（${error instanceof Error ? error.message : String(error)}）`)
+          logInfo('父会话无需取消或已结束（' + (error instanceof Error ? error.message : String(error)) + '）')
         }
       }
     }
@@ -1548,8 +2161,30 @@ export function apply(ctx, config) {
       }
     }
 
+    // 链账本（冷数据）：这一棒走了几跳、每跳多少 token、谁是孤儿，全部记在人能直接看的地方。
+    const chainData = readChainJson(chain.root)
+    const hops = Array.isArray(chainData.hops) ? chainData.hops.slice() : []
+    hops.push({
+      sessionId,
+      nextSessionId: newSessionId,
+      depth: nextDepth,
+      at: new Date().toISOString(),
+      tokens,
+      toolCalls: gateToolCalls,
+      reviewVerdict: review.verdict,
+    })
+    writeChainJson(chain.root, {
+      ...chainData,
+      root: chain.root,
+      cwd,
+      limit: maxHops,
+      startedAt: chainData.startedAt === '' ? createdAt : chainData.startedAt,
+      hops,
+    })
+
     logInfo(
-      `已交接：${sessionId} → ${newSessionId}（${String(tokens)} tokens / ${String(facts.toolCalls)} 次工具调用）` +
+      // 带 [sessionId] 前缀：手上有十几条链同时跑时，没有前缀的「已交接」行根本认不出是谁。
+      '[' + sessionId + '] 已交接：' + sessionId + ' → ' + newSessionId + '（' + String(tokens) + ' tokens / ' + String(gateToolCalls) + ' 次工具调用）' +
         (parentCancelled ? '，父会话当前轮已取消' : ''),
       docPath,
     )
@@ -1569,9 +2204,42 @@ export function apply(ctx, config) {
       const header = session.header
       if (header !== null && typeof header === 'object' && header.origin === 'subagent') return
 
-      const tokens = measureTokens(ctx, session)
+      const tokenInfo = measureTokens(ctx, session)
+      const tokens = tokenInfo.tokens
+      const window = effectiveTokenThreshold(session, options)
       const toolCalls = toolCallCounts.get(sessionId) ?? 0
-      if (tokens < options.tokenThreshold && toolCalls < options.toolCallThreshold) return
+      if (tokens < window.threshold && toolCalls < options.toolCallThreshold) {
+        // 被拦下也要留一条证据，但**每个会话只留一次**（票 #20）：
+        // 旧实现 893 行日志里 852 条是同一句「被占位拦下」，真触发只有 3 次。
+        // token 读数不可信时更要留痕——否则 token 闸静默归零，看上去一切正常。
+        if (!blockedNoted.has(sessionId + '|gate')) {
+          blockedNoted.add(sessionId + '|gate')
+          appendEvent({
+            event: 'gate/skip',
+            sessionId,
+            cwd: resolveSessionCwd(ctx, session),
+            reason: tokenInfo.reason === '' ? 'below-threshold' : 'token-unavailable: ' + tokenInfo.reason,
+            tokens,
+            tokenThreshold: window.threshold,
+            thresholdSource: window.source,
+            contextWindow: window.window,
+            toolCalls,
+          })
+        }
+        return
+      }
+      appendEvent({
+        event: 'gate/fire',
+        sessionId,
+        cwd: resolveSessionCwd(ctx, session),
+        trigger: 'threshold',
+        tokens,
+        tokenThreshold: window.threshold,
+        thresholdSource: window.source,
+        contextWindow: window.window,
+        toolCalls,
+        toolCallThreshold: options.toolCallThreshold,
+      })
 
       // 同步占位（落盘），避免同一轮内与跨进程重复派发。
       const reserved = reserveClaim(claimsFile, sessionId, options, Date.now(), false)
@@ -1659,25 +2327,7 @@ export function apply(ctx, config) {
         if (session === undefined || session === null) {
           return { kind: 'error', text: '找不到当前会话的日志。' }
         }
-        const tokens = measureTokens(ctx, session)
-        const toolCalls = toolCallCounts.get(sessionId) ?? 0
-        const facts = collectFacts(session, options.maxTrackedFiles, options.goalMaxChars)
-        const tokenPct = Math.min(100, Math.round((tokens / options.tokenThreshold) * 100))
-        const toolPct = Math.min(100, Math.round((toolCalls / options.toolCallThreshold) * 100))
-        const nearest = Math.max(tokenPct, toolPct)
-        return {
-          kind: 'success',
-          text: [
-            `会话 ${sessionId}`,
-            `- token 压力：${String(tokens)} / ${String(options.tokenThreshold)}（${String(tokenPct)}%）`,
-            `- 工具调用：${String(toolCalls)} / ${String(options.toolCallThreshold)}（${String(toolPct)}%）`,
-            `- 日志事件数：${String(facts.eventCount)}，工具报错 ${String(facts.toolErrors)} 次`,
-            `- 距最近阈值：还剩 ${String(Math.max(0, 100 - nearest))}%`,
-            `- 已交接：${describeClaim(sessionId)}`,
-            `- 交接目录：${handoffDirectory(resolveSessionCwd(ctx, session), options.handoffDir)}`,
-            '任一阈值到 100% 的下一轮结束时自动交接；也可随时用 /handoff 手动触发。',
-          ].join('\n'),
-        }
+        return { kind: 'success', text: describeStatus(ctx, session, sessionId) }
       } catch (error) {
         return { kind: 'error', text: `读取状态失败：${error instanceof Error ? error.message : String(error)}` }
       }
@@ -1685,7 +2335,13 @@ export function apply(ctx, config) {
   })
 
   logInfo(
-    `已启用：token 阈值 ${String(options.tokenThreshold)} / 工具调用阈值 ${String(options.toolCallThreshold)}，` +
-      `交接目录 ${options.handoffDir}，模型摘要 ${options.modelSummary ? '开' : '关'}，链上限 ${String(options.chainLimit)}`,
+    `已启用：token 阈值 ${
+      options.tokenThreshold > 0
+        ? String(options.tokenThreshold) + '（绝对值）'
+        : String(Math.round(options.tokenThresholdRatio * 100)) + '% 窗口（窗口读不到时按 ' + String(FALLBACK_CONTEXT_WINDOW) + ' 算）'
+    } / 工具调用阈值 ${String(options.toolCallThreshold)}，` +
+      `交接目录 ${options.handoffDir}，模型摘要 ${options.modelSummary ? '开' : '关'}，` +
+      `链上限 ${String(options.maxAutoHops)} 棒 / 同目录并发 ${String(options.maxConcurrentHops)}，` +
+      `REVIEW block 规则 ${options.reviewBlockOn.join(',')}`,
   )
 }

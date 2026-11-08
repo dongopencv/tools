@@ -63,10 +63,14 @@ function makeServices(options) {
   const created = []
   const prompts = []
   const cancelled = []
+  // v1.2 的人工停点靠 sessionController.rename 落到 GUI 标题上（票 #18）：
+  // 链到顶、REVIEW 未通过、排队中、孤儿这四类如果只写日志，人在侧栏认不出来。
+  const renamed = []
   return {
     created,
     prompts,
     cancelled,
+    renamed,
     services: {
       sessions: {
         get: (id) => options.sessions.get(String(id)),
@@ -91,8 +95,15 @@ function makeServices(options) {
             throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')")
           }
           signal.throwIfAborted()
+          // 宿主在会话已被关掉时会拒收；用来验证「孤儿会话」这条失败路径。
+          if (options.promptFails === true) throw new Error('session/not-found')
           prompts.push(request)
           return { accepted: true }
+        },
+        // 宿主 rename({ sessionId, title }) → { title, seq }
+        rename: async (request) => {
+          renamed.push({ sessionId: request.sessionId, title: request.title })
+          return { title: request.title, seq: renamed.length }
         },
         // 宿主 cancel({ sessionId }) → { accepted: true }；会话已 detach 时抛 session/not-found。
         cancel: async (request) => {
@@ -113,8 +124,13 @@ function toolCallEvent(turn, step, index, name, args) {
   }
 }
 
-function userEvent(text, seq) {
-  return { type: 'user/message', seq, time: 0, data: { role: 'user', content: [{ type: 'text', text }], id: 'm' + String(seq) } }
+function userEvent(text, seq, kind) {
+  const data = { role: 'user', content: [{ type: 'text', text }], id: 'm' + String(seq) }
+  // 真实宿主给每条 user/message 带 data.source.kind：人打的 是 'user'，
+  // 其余（system-reminder / runtime-context / skill-catalog …）都是注入。
+  // 不传 kind 时故意不写 source，用来覆盖「没有 source 字段时走前缀白名单兜底」这条旧路径。
+  if (kind !== undefined) data.source = { kind }
+  return { type: 'user/message', seq, time: 0, data }
 }
 
 function assistantEvent(text, seq) {
@@ -156,6 +172,8 @@ async function loadPluginUnderTest() {
     boolean: chainable,
     number: chainable,
     string: chainable,
+    // v1.2 的 reviewBlockOn 是字符串数组；链式桩同样返回自身。
+    array: () => chainable(),
   }
 
   const dir = await mkdtemp(join(tmpdir(), 'auto-handoff-module-'))
@@ -165,11 +183,16 @@ async function loadPluginUnderTest() {
   // 否则相对 import 解析失败，测试根本加载不起来。
   const claimsSource = await readFile(join(process.cwd(), 'lib', 'claims.js'), 'utf8')
   await writeFile(join(dir, 'claims.js'), claimsSource, 'utf8')
+  // v1.2 把文档渲染拆到了 ./docs.js（三份文件：index.md / facts.jsonl / full.md），
+  // 临时目录里没有它 import 直接失败。
+  const docsSource = await readFile(join(process.cwd(), 'lib', 'docs.js'), 'utf8')
+  await writeFile(join(dir, 'docs.js'), docsSource, 'utf8')
   const mod = await import(pathToFileURL(file).href)
   return mod
 }
 
-async function scenario({ plugin, name, tokens, toolCalls, chainDepth, modelText, expect, extra, injectUser, cancelParent, manual }) {
+async function scenario(options) {
+  const { plugin, name, tokens, toolCalls, chainDepth, modelText, extra, injectUser, cancelParent, manual, promptFails, claimSeed, maxConcurrentHops, noFirstUser } = options
   const dir = await mkdtemp(join(tmpdir(), 'auto-handoff-test-'))
   // 链账本住在 ~/.dsh/auto-handoff/state.json（用户主目录），不是工作区。
   // 测试必须把 USERPROFILE 指到临时目录，否则会读写真实账本并互相污染。
@@ -180,8 +203,21 @@ async function scenario({ plugin, name, tokens, toolCalls, chainDepth, modelText
     const map = { sessions: { 'sess-a': { root: 'sess-a', depth: chainDepth } }, updatedAt: 'now' }
     await writeFile(join(dir, '.dsh', 'auto-handoff', 'state.json'), JSON.stringify(map), 'utf8')
   }
+  // 有些场景必须先把占位表铺好（并发上限、deferred 到期重试），
+  // 否则测的就不是那条分支，而是「第一次交接」。
+  if (claimSeed !== undefined) {
+    const claims = typeof claimSeed === 'function' ? claimSeed(dir) : claimSeed
+    await mkdir(join(dir, '.dsh', 'auto-handoff'), { recursive: true })
+    await writeFile(
+      join(dir, '.dsh', 'auto-handoff', 'claims.json'),
+      JSON.stringify({ claims, updatedAt: 'now' }),
+      'utf8',
+    )
+  }
 
-  const events = [userEvent('把 F:\\proj 下的构建脚本改成跨平台', 1)]
+  // noFirstUser 用来构造「链上第一句话不是用户指令」这种脏现场，
+  // 它是 REVIEW no-goal 的唯一触发条件，也是最容易在真实链上传下去的病。
+  const events = noFirstUser === true ? [] : [userEvent('把 F:\\proj 下的构建脚本改成跨平台', 1)]
   if (injectUser !== undefined) events.push(userEvent(injectUser, 99))
   let seq = 2
   for (let i = 0; i < toolCalls; i += 1) {
@@ -214,6 +250,7 @@ async function scenario({ plugin, name, tokens, toolCalls, chainDepth, modelText
     sessions,
     tokensFor: () => tokens,
     llm,
+    promptFails: promptFails === true,
   })
 
   // 允许某个场景故意破坏依赖，验证降级路径。
@@ -226,11 +263,12 @@ async function scenario({ plugin, name, tokens, toolCalls, chainDepth, modelText
     toolCallThreshold: 80,
     handoffDir: '.dsh/handoff',
     modelSummary: modelText !== undefined,
-    chainLimit: 8,
+    maxAutoHops: 8,
     summaryMaxChars: 1600,
-    docMaxChars: 6000,
+    briefMaxChars: 6000,
     summaryTimeoutMs: 45000,
     maxTrackedFiles: 40,
+    maxConcurrentHops: maxConcurrentHops === undefined ? 2 : maxConcurrentHops,
     // 不传时走 DEFAULTS 的 readBool 兜底（= true），这样默认行为也被测到。
     cancelParentAfterHandoff: cancelParent,
   })
@@ -251,10 +289,19 @@ async function scenario({ plugin, name, tokens, toolCalls, chainDepth, modelText
   // 异步交接，等一下
   await new Promise((resolve) => setTimeout(resolve, 300))
 
-  const docPath = join(dir, '.dsh', 'handoff', 'sess-a.md')
+  // v1.2：一份交接变成三份文件，注入的是 <sessionId>/index.md，
+  // full.md 是人看的完整版，facts.jsonl 是机读档案。
+  const docsDir = join(dir, '.dsh', 'handoff', 'sess-a')
+  const docPath = join(docsDir, 'index.md')
+  const fullPath = join(docsDir, 'full.md')
+  const factsPath = join(docsDir, 'facts.jsonl')
   let doc
+  let full
+  let facts
   try {
     doc = await readFile(docPath, 'utf8')
+    full = await readFile(fullPath, 'utf8')
+    facts = await readFile(factsPath, 'utf8')
   } catch {
     doc = undefined
   }
@@ -268,7 +315,45 @@ async function scenario({ plugin, name, tokens, toolCalls, chainDepth, modelText
     claims = undefined
   }
 
-  const record = { name, dir, docPath, doc, created: harness.created, prompts: harness.prompts, cancelled: harness.cancelled, commands: ctx._commands, ctx, events, claims, llmRequests }
+  // 结构化事件也是产品的一部分（票 #20）：没有它，现网复盘只能靠人读 809 行中文日志。
+  let events_
+  try {
+    events_ = (await readFile(join(dir, '.dsh', 'auto-handoff', 'events.jsonl'), 'utf8'))
+      .trim()
+      .split('\n')
+      .filter((line) => line !== '')
+      .map((line) => JSON.parse(line))
+  } catch {
+    events_ = []
+  }
+
+  // chain.json 在临时目录里，scenario 一返回就删了，必须在这里读出来。
+  let chainJson
+  try {
+    chainJson = JSON.parse(await readFile(join(dir, '.dsh', 'auto-handoff', 'chains', 'sess-a.json'), 'utf8'))
+  } catch {
+    chainJson = undefined
+  }
+
+  const record = {
+    name,
+    dir,
+    docPath,
+    doc,
+    full,
+    facts,
+    created: harness.created,
+    prompts: harness.prompts,
+    cancelled: harness.cancelled,
+    renamed: harness.renamed,
+    commands: ctx._commands,
+    ctx,
+    events,
+    events_,
+    claims,
+    chainJson,
+    llmRequests,
+  }
   if (previousHome === undefined) delete process.env.USERPROFILE
   else process.env.USERPROFILE = previousHome
   await rm(dir, { recursive: true, force: true })
@@ -295,10 +380,18 @@ async function run() {
     assert.ok(r.doc !== undefined, '达工具阈值应写文档')
     assert.equal(r.created.length, 1, '应新建一个会话')
     assert.equal(r.prompts.length, 1, '应向新会话投递一条消息')
-    assert.match(r.doc, /原始目标/, '文档应有原始目标')
+    assert.match(r.doc, /# 交接简报/, 'index.md 应有标题行')
+    assert.match(r.doc, /## 目标/, 'index.md 第一节应是「目标」')
+    assert.match(r.doc, /## 下一步/, 'index.md 必须有「下一步」一节')
     assert.match(r.doc, /把 F:\\proj 下的构建脚本改成跨平台/, '文档应含原始用户指令')
-    assert.match(r.doc, /build\.ps1/, '文档应含触及文件')
     assert.match(r.doc, /跑一遍测试/, '文档应含模型摘要的下一步')
+    assert.match(r.facts, /build\.ps1/, 'facts.jsonl 应含触及文件')
+    // 六节顺序即裁剪优先级：「目标」「下一步」必须排在最前面的两节
+    const order = ['## 目标', '## 下一步'].map((title) => r.doc.indexOf(title))
+    assert.ok(order[0] >= 0 && order[0] < order[1], '「目标」必须排在「下一步」之前')
+    for (const line of r.facts.trim().split('\n')) {
+      assert.doesNotThrow(() => JSON.parse(line), 'facts.jsonl 每一行都必须是合法 JSON')
+    }
     assert.equal(r.prompts[0].sessionId, r.created[0].id, '消息应投给新会话')
     assert.match(r.prompts[0].content[0].text, /交接文档开始/, '消息里应内嵌交接文档')
     // 占位语义：父会话 done（不再自动交接），新会话 genesis（可继续交接，链条才走得下去）
@@ -351,8 +444,10 @@ async function run() {
     assert.ok(modelText.length > 1600, '构造的摘要必须超过 summaryMaxChars')
     const r = await scenario({ plugin, name: 'long-summary', tokens: 300000, toolCalls: 5, modelText })
     assert.ok(r.doc !== undefined, '应写文档')
-    assert.match(r.doc, /## 下一步/, '长摘要被裁剪后「下一步」这一节仍须存在')
-    assert.match(r.doc, /KEYWORD_NEXT_STEP/, '「下一步」的正文不能被裁掉')
+    assert.match(r.full, /## 下一步/, '长摘要被裁剪后 full.md 的「下一步」仍须存在')
+    assert.match(r.full, /KEYWORD_NEXT_STEP/, 'full.md 里「下一步」的正文不能被裁掉')
+    assert.match(r.doc, /## 下一步/, 'index.md 必须有「下一步」一节')
+    assert.match(r.doc, /KEYWORD_NEXT_STEP/, 'index.md 里「下一步」也要带上正文')
     // 注入给新会话的那一份（受 docMaxChars 限制）同样不能丢
     const injected = r.prompts[0].content[0].text
     assert.match(injected, /## 下一步/, '注入副本里也必须有「下一步」')
@@ -381,17 +476,206 @@ async function run() {
   {
     const r = await scenario({ plugin, name: 'fallback-summary', tokens: 300000, toolCalls: 3, modelText: undefined })
     assert.ok(r.doc !== undefined, '无模型也应写文档')
-    assert.match(r.doc, /最近一次用户要求|先读取上面列出的文件|未完成的部分/, '应出现兜底摘要的语句')
+    {
+      // facts.jsonl 是 JSONL：路径里的反斜杠被转义成 \\，不能再拿正则直接匹配原文，
+      // 解析后再断言才不会被转义层骗过去。
+      const entries = r.facts.trim().split('\n').map((line) => JSON.parse(line))
+      assert.ok(
+        entries.some((entry) => entry.type === 'user' && entry.text.includes('构建脚本改成跨平台')),
+        'facts.jsonl 应有 user 事实条目',
+      )
+    }
+    assert.match(r.doc, /## 下一步/, '没有模型时兜底摘要也必须自带「下一步」一节')
+    assert.match(r.doc, /最近一次用户要求|先读取上面列出的文件|未完成的部分/, 'index.md 的「下一步」应是兜底摘要')
     assert.equal(r.created.length, 1, '无模型仍应开新会话')
     results.push('PASS 无模型摘要时用兜底并照常交接')
   }
 
-  // 5) 链深度上限
+  // 5) 链深度上限：到顶不是「什么都没发生」，而是三件可见的事（票 #18）
   {
-    const r = await scenario({ plugin, name: 'chain-limit', tokens: 300000, toolCalls: 5, chainDepth: 8, modelText: '摘要' })
+    const r = await scenario({ plugin, name: 'chain-limit', tokens: 300000, toolCalls: 5, chainDepth: 8, modelText: '## 下一步\n继续' })
     assert.ok(r.doc !== undefined, '超链上限仍应写文档')
     assert.equal(r.created.length, 0, '超链上限不应再开新会话')
-    results.push('PASS 交接链深度上限生效（只写文档不续作）')
+    // ① 文档自己说清楚为什么停了：人读 index.md 就知道要人工 /handoff
+    assert.match(r.doc, /自动续作已到第 9\/8 棒/, 'index.md 的「未决问题」必须写死到顶原因')
+    // ② 占位落 stopped 终态。留 inflight 的话 TTL 一过又能再交接，上限形同废纸。
+    assert.equal(r.claims?.['sess-a']?.state, 'stopped', '到顶那一棒必须落 stopped 终态')
+    assert.equal(r.claims?.['sess-a']?.stoppedReason, 'chain-limit', '停止原因要能查')
+    // ③ 会话改名：GUI 侧栏里必须认得出「这一棒到顶了」
+    assert.ok(
+      r.renamed.some((item) => item.sessionId === 'sess-a' && item.title.startsWith('[链到顶 9/8]')),
+      '到顶那一棒必须被改名成 [链到顶 N/M]',
+    )
+    // ④ 冷数据账本 chain.json：几棒、停没停
+    assert.equal(r.chainJson?.stopped, true, 'chain.json 要记「这条链停了」')
+    assert.equal(r.chainJson?.limit, 8, 'chain.json 要记上限')
+    assert.ok(r.events_.some((e) => e.event === 'chain/limit'), '必须有 chain/limit 结构化事件')
+    results.push('PASS 交接链深度上限生效（文档写死原因 + 占位 stopped + 改名 + chain.json）')
+  }
+
+  // 5b) REVIEW block：链上第一句话不是用户指令 → 不建会话、父会话落 failed、改名叫人来看
+  //     这是 v1.1.5 里**数学上不可能发生**的一条路径（add('block') 命中 0 处），
+  //     所以必须专门测：它一旦回归成 warn，脏现场就会被静默递给下一棒。
+  {
+    const r = await scenario({ plugin, name: 'review-block', tokens: 300000, toolCalls: 5, modelText: '## 下一步\n继续', noFirstUser: true })
+    assert.ok(r.doc !== undefined, 'block 也要写文档（人得能看到为什么不交棒）')
+    assert.match(r.doc, /交接前 REVIEW/, 'index.md 要记录 REVIEW 结论')
+    assert.match(r.doc, /没有捕获到原始目标/, 'block 理由必须写进文档')
+    assert.equal(r.created.length, 0, 'REVIEW 未通过时绝不能建新会话')
+    assert.equal(r.prompts.length, 0, 'REVIEW 未通过时绝不能投递简报')
+    assert.equal(r.claims?.['sess-a']?.state, 'failed', '父会话应落 failed（可重试，不是终态）')
+    assert.equal(r.claims?.['sess-a']?.note, 'review-block', '失败原因要能查')
+    assert.ok(
+      r.renamed.some((item) => item.sessionId === 'sess-a' && item.title.startsWith('[REVIEW 未通过]')),
+      'REVIEW 未通过必须在 GUI 上可见',
+    )
+    assert.ok(r.events_.some((e) => e.event === 'review/verdict' && e.verdict === 'block' && e.blocked === true), '必须留 block 事件')
+    results.push('PASS REVIEW block 生效（不建会话 + 父落 failed + 改名可见）')
+  }
+
+  // 5c) 同目录并发超限：不是失败，是排队（deferred 非终态，下一轮自动重试）
+  {
+    const r = await scenario({
+      plugin,
+      name: 'concurrent-deferred',
+      tokens: 300000,
+      toolCalls: 5,
+      modelText: '## 下一步\n继续',
+      maxConcurrentHops: 1,
+      // 已有两棒活在同目录：一棒 genesis（随时能再交接）、一棒 inflight。
+      claimSeed: (dir) => ({
+        'sess-peer-1': { at: Date.now(), attempts: 1, state: 'genesis', cwd: dir, chainRoot: 'sess-peer-1', chainDepth: 1 },
+        'sess-peer-2': { at: Date.now(), attempts: 1, state: 'inflight', cwd: dir, chainRoot: 'sess-peer-2', chainDepth: 1 },
+      }),
+    })
+    assert.ok(r.doc !== undefined, '排队也要写文档')
+    assert.equal(r.created.length, 0, '并发超限不应再建会话')
+    assert.equal(r.claims?.['sess-a']?.state, 'deferred', '应落 deferred 而不是 failed')
+    assert.ok((r.claims?.['sess-a']?.deferredUntil ?? 0) > Date.now(), '排队必须有到期时间')
+    assert.ok(
+      r.renamed.some((item) => item.sessionId === 'sess-a' && item.title.startsWith('[排队交接')),
+      '排队状态必须在 GUI 上可见',
+    )
+    results.push('PASS 同目录并发超限落 deferred（排队 + 改名，不判失败）')
+  }
+
+  // 5d) 简报投递失败：新会话已经建出来了但没收到简报 → 孤儿，改名标记，绝不 cancel
+  {
+    const r = await scenario({ plugin, name: 'orphan', tokens: 300000, toolCalls: 5, modelText: '## 下一步\n继续', promptFails: true })
+    assert.equal(r.created.length, 1, '会话已经建出来了')
+    assert.equal(r.prompts.length, 0, '简报没投进去')
+    assert.equal(r.claims?.['sess-a']?.state, 'failed', '父会话落 failed 可重试')
+    const orphanTitle = r.renamed.find((item) => item.sessionId === r.created[0].id)
+    assert.ok(orphanTitle !== undefined && orphanTitle.title.startsWith('[孤儿·无简报]'), '孤儿会话必须改名让人认出来')
+    assert.deepEqual(r.cancelled, [], '孤儿不 cancel：它可能已经开始干活了')
+    results.push('PASS 简报投递失败留下孤儿（改名可见、不 cancel）')
+  }
+
+  // 5e) 简报第一行必须是链元信息（票 #18）：人在侧栏只看到标题，
+  //     模型看到的第一行就是这个。棒次 / 上限 / 根 / 触发 / 同伴棒五项决定还能不能接着干。
+  {
+    const r = await scenario({ plugin, name: 'brief-meta', tokens: 300000, toolCalls: 5, modelText: '## 下一步\n继续' })
+    const injected = r.prompts[0].content[0].text
+    const firstLine = injected.split(String.fromCharCode(10))[0]
+    assert.match(firstLine, /^链：第 1 棒 \/ 上限 8/, '简报第一行必须是链元信息，实际：' + firstLine)
+    assert.ok(firstLine.includes('同伴棒：'), '必须带上同目录同伴棒数量')
+    // 「[自动交接]」这一句也不能丢：下一棒靠它识别「这是交接简报」，
+    // 进而去读盘还原真正的原始目标（goal.test.mjs 的 6 层下钻依赖它）。
+    assert.ok(injected.includes('[自动交接] 上一会话'), '简报必须保留 [自动交接] 标识')
+    assert.ok(injected.indexOf('交接前 REVIEW 结论') > 0, '任何 verdict 都要把 REVIEW 结论写进简报')
+    results.push('PASS 简报第一行是链元信息，且保留 [自动交接] 标识与 REVIEW 结论')
+  }
+
+  // 5f) 阈值走比例：不传 tokenThreshold 时按 ratio × 窗口换算，
+  //     实测窗口 1000000、p25 交接点 45% —— 30% 的绝对值太保守（票 #20）。
+  {
+    const dir = await mkdtemp(join(tmpdir(), 'auto-handoff-ratio-'))
+    const previousHome = process.env.USERPROFILE
+    process.env.USERPROFILE = dir
+    const sessions = new Map()
+    sessions.set(
+      'sess-a',
+      buildSession('sess-a', dir, { requestContext: { provider: 'p', model: 'm', contextWindow: 1000000 } }, [
+        userEvent('目标', 1),
+        assistantEvent('做到一半。', 2),
+      ]),
+    )
+    // 40% 窗口：低于默认 45%，不该触发
+    const low = makeServices({ sessions, tokensFor: () => 400000, llm: undefined })
+    const ctxLow = makeCtx(low)
+    plugin.apply(ctxLow, { enabled: true, modelSummary: false, toolCallThreshold: 80 })
+    ctxLow.emit('agent/turn-stopping', { agent: { id: 'sess-a' }, turn: 1, signal: new AbortController().signal })
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    assert.equal(low.created.length, 0, '40% 窗口不应触发（默认 45%）')
+
+    // 50% 窗口：高于 45%，应当触发
+    const high = makeServices({ sessions, tokensFor: () => 500000, llm: undefined })
+    const ctxHigh = makeCtx(high)
+    plugin.apply(ctxHigh, { enabled: true, modelSummary: false, toolCallThreshold: 80 })
+    ctxHigh.emit('agent/turn-stopping', { agent: { id: 'sess-a' }, turn: 1, signal: new AbortController().signal })
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    assert.equal(high.created.length, 1, '50% 窗口应触发（默认 45%）')
+
+    if (previousHome === undefined) delete process.env.USERPROFILE
+    else process.env.USERPROFILE = previousHome
+    await rm(dir, { recursive: true, force: true })
+    results.push('PASS 阈值按窗口比例换算（40% 不触发 / 50% 触发）')
+  }
+
+  // 5g) tokenMeter 缺失：不能静默按 0 处理（那会让 token 闸永远不响），
+  //     必须留下可查的降级证据，并且仍靠工具调用闸工作。
+  {
+    const dir = await mkdtemp(join(tmpdir(), 'auto-handoff-notokens-'))
+    const previousHome = process.env.USERPROFILE
+    process.env.USERPROFILE = dir
+    const events = [userEvent('目标', 1), assistantEvent('做到一半。', 2)]
+    for (let i = 0; i < 5; i += 1) events.push(toolCallEvent(1, 1, i + 3, 'read', { file_path: 'D:\\a\\b.ts' }))
+    const sessions = new Map()
+    sessions.set('sess-a', buildSession('sess-a', dir, {}, events))
+    const harness = makeServices({ sessions, tokensFor: () => 300000, llm: undefined })
+    harness.services.tokenMeter = undefined
+    const ctx = makeCtx(harness)
+    plugin.apply(ctx, { enabled: true, modelSummary: false, toolCallThreshold: 80 })
+    ctx.emit('agent/turn-stopping', { agent: { id: 'sess-a' }, turn: 1, signal: new AbortController().signal })
+    await new Promise((resolve) => setTimeout(resolve, 250))
+
+    const statusHandler = ctx._commands.find((item) => item.name === 'handoff-status')
+    const statusText = (await statusHandler.handler({ agent: { id: 'sess-a' }, signal: new AbortController().signal })).text
+    assert.match(statusText, /token 读数不可信/, '/handoff-status 必须如实报告 token 读数不可信')
+
+    let events_
+    try {
+      events_ = (await readFile(join(dir, '.dsh', 'auto-handoff', 'events.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+    } catch {
+      events_ = []
+    }
+    assert.ok(
+      events_.some((e) => e.event === 'gate/skip' && String(e.reason).startsWith('token-unavailable')),
+      'tokenMeter 缺失必须落一条 gate/skip 事件，而不是静默',
+    )
+    if (previousHome === undefined) delete process.env.USERPROFILE
+    else process.env.USERPROFILE = previousHome
+    await rm(dir, { recursive: true, force: true })
+    results.push('PASS tokenMeter 缺失时显式降级留痕（事件 + /handoff-status）')
+  }
+
+  // 5h) 结构化事件：一次成功交接必须留下可复盘的九类决策点，
+  //     而不是 809 行中文日志里靠人 grep（票 #20）。
+  {
+    const r = await scenario({ plugin, name: 'events', tokens: 300000, toolCalls: 5, modelText: '## 下一步\n继续' })
+    const kinds = new Set(r.events_.map((e) => e.event))
+    for (const kind of ['review/verdict', 'doc/write', 'session/create', 'prompt/deliver', 'claim/settle']) {
+      assert.ok(kinds.has(kind), '缺少结构化事件 ' + kind)
+    }
+    const done = r.events_.find((e) => e.event === 'claim/settle' && e.state === 'done')
+    assert.ok(done !== undefined, '必须有一条 claim/settle done')
+    for (const key of ['at', 'sessionId', 'cwd', 'trigger', 'tokens', 'toolCalls', 'depth', 'docPath', 'newSessionId', 'reviewVerdict', 'outcome']) {
+      assert.ok(Object.prototype.hasOwnProperty.call(done, key), 'claim/settle 事件缺字段 ' + key)
+    }
+    // toolCalls 必须记闸门用的那个数（与本轮累计计数一致），不能记 facts.toolCalls——
+    // 两个数对不上，等于没法复盘「到底哪个闸把它推过线的」。
+    assert.equal(done.toolCalls, 5, '事件里的 toolCalls 应是闸门计数')
+    results.push('PASS 结构化事件覆盖五个决策点且字段齐全')
   }
 
   // 6) 同一会话只交接一次：连发两次 turn-stopping，只应新建一个会话
@@ -413,9 +697,9 @@ async function run() {
       toolCallThreshold: 80,
       handoffDir: '.dsh/handoff',
       modelSummary: false,
-      chainLimit: 8,
+      maxAutoHops: 8,
       summaryMaxChars: 1600,
-      docMaxChars: 6000,
+      briefMaxChars: 6000,
       summaryTimeoutMs: 45000,
       maxTrackedFiles: 40,
     })
@@ -481,7 +765,7 @@ async function run() {
     plugin.apply(ctx, { enabled: true, tokenThreshold: 300000, toolCallThreshold: 80, modelSummary: false })
     ctx.emit('agent/turn-stopping', { agent: { id: 'sess-a' }, turn: 1, signal: new AbortController().signal })
     await new Promise((resolve) => setTimeout(resolve, 300))
-    const doc = await readFile(join(dir, '.dsh', 'handoff', 'sess-a.md'), 'utf8')
+    const doc = await readFile(join(dir, '.dsh', 'handoff', 'sess-a', 'full.md'), 'utf8')
     assert.match(doc, /dsh-auto-handoff[\\/]lib[\\/]index\.js/, '应从 run_code 的 code 正文里抽出文件路径')
     if (previousHome === undefined) delete process.env.USERPROFILE
     else process.env.USERPROFILE = previousHome
@@ -524,7 +808,7 @@ async function run() {
     plugin.apply(ctx, { enabled: true, tokenThreshold: 300000, toolCallThreshold: 80, modelSummary: false })
     ctx.emit('agent/turn-stopping', { agent: { id: 'sess-a' }, turn: 1, signal: new AbortController().signal })
     await new Promise((resolve) => setTimeout(resolve, 300))
-    const doc = await readFile(join(dir, '.dsh', 'handoff', 'sess-a.md'), 'utf8')
+    const doc = await readFile(join(dir, '.dsh', 'handoff', 'sess-a', 'full.md'), 'utf8')
     assert.doesNotMatch(doc, /（未捕获）/, '纯工具轮不应再写「（未捕获）」')
     assert.match(doc, /先读源码，确认 messageText 只认 text 块/, '应从上一条 assistant 的 reasoning 块取到助手输出')
     assert.match(doc, /调用工具：run_code/, '应带上这一条消息发出的工具调用名')

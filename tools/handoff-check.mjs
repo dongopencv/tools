@@ -245,22 +245,38 @@ async function checkLog() {
 }
 
 // 4) 最新交接文档里有没有 REVIEW 小节
+//
+// v1.2 起产物从「<sessionId>.md 一份」变成「<sessionId>/ 三份」：
+//   index.md    注入给新会话的简报（六节，顺序即裁剪优先级）
+//   facts.jsonl 机读事实档案（不注入）
+//   full.md     人看的完整文档（旧七节）
+// 所以这里必须认目录形态；旧的平铺 .md 仍当历史产物读（不判 FAIL），否则升级后
+// 这条检查会对着新目录报「交接目录里没有 md」。
 async function checkDoc() {
-  let names
+  let entries
   try {
-    names = (await readdir(HANDOFF_DIR)).filter((n) => n.endsWith('.md'))
+    entries = await readdir(HANDOFF_DIR, { withFileTypes: true })
   } catch {
     record('WARN', '交接文档', '交接目录不存在', HANDOFF_DIR)
     return
   }
-  if (names.length === 0) {
-    record('WARN', '交接文档', '交接目录里没有 md', HANDOFF_DIR)
-    return
-  }
   const withStat = []
-  for (const n of names) {
-    const s = await statOr(join(HANDOFF_DIR, n))
-    if (s !== null) withStat.push({ n, s })
+  for (const e of entries) {
+    if (e.isDirectory()) {
+      // v1.2：一个会话一个目录，以 index.md 为主文件
+      const p = join(HANDOFF_DIR, e.name, 'index.md')
+      const s = await statOr(p)
+      if (s !== null) withStat.push({ n: join(e.name, 'index.md'), dir: e.name, s })
+      continue
+    }
+    if (e.name.endsWith('.md')) {
+      const s = await statOr(join(HANDOFF_DIR, e.name))
+      if (s !== null) withStat.push({ n: e.name, dir: null, s })
+    }
+  }
+  if (withStat.length === 0) {
+    record('WARN', '交接文档', '交接目录里既没有 <sessionId>/index.md 也没有平铺 md', HANDOFF_DIR)
+    return
   }
   withStat.sort((a, b) => b.s.mtimeMs - a.s.mtimeMs)
   // 只判本次加载之后写的文档：旧模块写的那 4 份没有「下一步」是既定历史，
@@ -284,8 +300,52 @@ async function checkDoc() {
   // 旧模块在 requestModelSummary 里先砍到 1600 字，「下一步」作为第三节必被砍掉（实测 8 份里 4 份）。
   const hasNext = body.includes('## 下一步')
   record(hasNext ? 'PASS' : 'FAIL', '交接文档有「下一步」',
-    hasNext ? '最新一份含「## 下一步」' : '最新一份没有「## 下一步」——新会话拿到的是没有方向的进度报告',
-    '摘要按节裁剪（orderSummary）是 v1.1.1 才有的；旧模块必砍第三节')
+    hasNext ? '最新一份含「## 下一步」' : '最新一份没有「## 下一步」——新会话拿到的是没有方向的报告',
+    'v1.2 起 index.md 的「## 下一步」是必留节：预算再紧也不整节丢')
+
+  // v1.2 三件套：简报注入 / 事实档案机读 / 完整文档给人。
+  // 缺 facts.jsonl 只影响复盘（WARN），缺 full.md 则人没法核对简报裁掉了什么。
+  if (newest.dir === null) {
+    record('WARN', '交接文档三件套', '最新一份是旧的平铺 md，没有 v1.2 的 index/facts/full 三件套',
+      newest.n + '（升级后应出现 <sessionId>/ 目录）')
+    return
+  }
+  const trio = []
+  for (const [file, level] of [['index.md', 'FAIL'], ['facts.jsonl', 'WARN'], ['full.md', 'WARN']]) {
+    const s = await statOr(join(HANDOFF_DIR, newest.dir, file))
+    trio.push({ file, s })
+    if (s === null) {
+      record(level, '交接文档三件套', newest.dir + ' 缺 ' + file, join(HANDOFF_DIR, newest.dir, file))
+    }
+  }
+  if (trio.every((t) => t.s !== null)) {
+    record('PASS', '交接文档三件套', 'index.md / facts.jsonl / full.md 齐全',
+      trio.map((t) => t.file + ' ' + t.s.size + 'B').join(' · '))
+  }
+
+  // facts.jsonl 每行必须能 parse：它是 #20 验收的机读证据，坏一行就等于丢一条事实。
+  const facts = trio.find((t) => t.file === 'facts.jsonl')
+  if (facts.s === null) return
+  const lines = (await readFile(join(HANDOFF_DIR, newest.dir, 'facts.jsonl'), 'utf8'))
+    .split('\n').filter((l) => l.trim() !== '')
+  let bad = 0
+  for (const l of lines) {
+    try {
+      JSON.parse(l)
+    } catch {
+      bad += 1
+    }
+  }
+  record(bad === 0 ? 'PASS' : 'FAIL', 'facts.jsonl 可机读',
+    bad === 0 ? lines.length + ' 行全部可 JSON.parse' : bad + ' / ' + lines.length + ' 行不是合法 JSON',
+    join(HANDOFF_DIR, newest.dir, 'facts.jsonl'))
+
+  // 简报首行是 v1.2 的链可见性：人在新会话里第一眼应看到「第几棒 / 上限几」。
+  const firstLine = body.split('\n').find((l) => l.trim() !== '') ?? ''
+  const hasMeta = /^链：第 \d+ 棒 \/ 上限 \d+/.test(firstLine.replace(/^---$/, ''))
+  record(hasMeta ? 'PASS' : 'WARN', '简报首行链可见',
+    hasMeta ? '首行是链元信息' : '首行不是「链：第 N 棒 / 上限 M」（可能是旧版简报）',
+    firstLine.slice(0, 160))
 }
 
 // 5) 新会话到底收到简报没有（只认 user/message 里的正文，助手贴源码会假阳性）

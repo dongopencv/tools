@@ -22,11 +22,13 @@ async function loadPlugin() {
   const source = await readFile(join(process.cwd(), 'lib', 'index.js'), 'utf8')
   const rewritten = source.replace("import z from '@deepseek-ai/schemastery'", 'const z = globalThis.__SCHEMASTERY_STUB__')
   const chainable = () => { const n = {}; n.step = () => n; n.min = () => n; n.max = () => n; n.default = () => n; n.description = () => n; n.role = () => n; return n }
-  globalThis.__SCHEMASTERY_STUB__ = { object: (f) => f, boolean: chainable, number: chainable, string: chainable }
+  // array 是 v1.2 新增的（reviewBlockOn 是字符串数组），链式桩同样返回自身。
+globalThis.__SCHEMASTERY_STUB__ = { object: (f) => f, boolean: chainable, number: chainable, string: chainable, array: () => chainable() }
   const dir = await mkdtemp(join(tmpdir(), 'auto-handoff-chain-mod-'))
   const file = join(dir, 'index.mjs')
   await writeFile(file, rewritten, 'utf8')
   await writeFile(join(dir, 'claims.js'), await readFile(join(process.cwd(), 'lib', 'claims.js'), 'utf8'), 'utf8')
+  await writeFile(join(dir, 'docs.js'), await readFile(join(process.cwd(), 'lib', 'docs.js'), 'utf8'), 'utf8')
   return import(pathToFileURL(file).href)
 }
 

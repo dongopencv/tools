@@ -1,8 +1,8 @@
 {
   "name": "dsh-auto-handoff",
   "displayName": "长会话自动交接",
-  "description": "会话达到 token 或工具调用阈值时，自动写交接文档并开新会话续作，避免单个长会话把上下文和额度吃光。",
-  "version": "1.1.5",
+  "description": "会话达到阈值时，先 REVIEW 这一棒能不能用，再写三段式交接产物（index.md / facts.jsonl / full.md）并开新会话续作——改会话边界，不压缩历史。",
+  "version": "1.2.0",
   "license": "MIT",
   "keywords": [
     "dsh-plugin",

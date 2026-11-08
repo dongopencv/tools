@@ -5,22 +5,27 @@
       config:
         # 总开关
         enabled: true
-        # 会话累计 token 压力达到该值即交接
-        tokenThreshold: 300000
+        # token 阈值改成「按模型窗口比例」：写死绝对值会在窗口变化后失效
+        # （本机实测窗口 1,000,000，0.45 → 450,000）。填非 0 则绝对值优先并打 warn。
+        tokenThreshold: 0
+        tokenThresholdRatio: 0.45
         # 会话工具调用次数达到该值即交接（任一命中即可）
         toolCallThreshold: 80
-        # 交接文档目录（相对会话工作目录）
+        # 交接产物目录（相对会话工作目录）：<sessionId>/{index.md,facts.jsonl,full.md}
         handoffDir: .dsh/handoff
         # 是否用模型生成本轮摘要；关闭则用本地兜底摘要
         modelSummary: true
-        # 自动续作链的深度上限，防止无限自我续作
-        chainLimit: 8
+        # 自动续作链最多几棒（chainLimit 是旧名，仍然认）
+        maxAutoHops: 8
+        # 同一工作目录同时最多几棒在跑，超限落 deferred 排队而不是失败
+        maxConcurrentHops: 2
+        concurrentWindowMs: 1800000
         # 模型摘要的字符上限。
-        # 注意：输出的 token 预算由 summaryTokenBudget() 按本值折算（默认 1600 字 → 3600 token），
-        # 不要单独写死 maxTokens——中文 1.5~2 token/字，预算不足会让「下一步」在句中就被截断。
+        # 注意：输出的 token 预算由 summaryTokenBudget() 按本值折算，不要单独写死 maxTokens。
         summaryMaxChars: 1600
-        # 交接文档总字符上限
-        docMaxChars: 6000
+        # 注入新会话的 index.md：硬顶 6000，目标 3000（超了从最末非必留节往前丢）
+        briefMaxChars: 6000
+        briefTargetChars: 3000
         # 单次摘要请求的超时（毫秒）
         summaryTimeoutMs: 45000
         # 交接文档里最多列多少个文件
@@ -33,3 +38,10 @@
         # 交接成功后取消父会话的当前轮（保留未处理的队列）。
         # 父会话不会因为交接自己停下——实测它能继续跑 70 分钟，与子会话同时烧 token。
         cancelParentAfterHandoff: true
+        # 交接前 REVIEW：L1 确定性规则里哪些判 block（不建新会话，等人工 /handoff）
+        modelReview: false
+        reviewBlockOn:
+          - no-goal
+          - no-next-step
+          - chain-limit
+        toolErrorWarnRatio: 0.2

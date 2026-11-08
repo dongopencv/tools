@@ -37,7 +37,8 @@ async function loadPlugin() {
     n.role = () => n
     return n
   }
-  globalThis.__SCHEMASTERY_STUB__ = { object: (f) => f, boolean: chainable, number: chainable, string: chainable }
+  // array 是 v1.2 新增的（reviewBlockOn 是字符串数组），链式桩同样返回自身。
+globalThis.__SCHEMASTERY_STUB__ = { object: (f) => f, boolean: chainable, number: chainable, string: chainable, array: () => chainable() }
   // 默认只导出 name/inject/Config/apply；测试要直接调内部函数，
   // 追加一行 export 即可（都是顶层函数声明，改写后仍在同一模块作用域里）。
   rewritten +=
@@ -46,6 +47,7 @@ async function loadPlugin() {
   const file = join(dir, 'index.mjs')
   await writeFile(file, rewritten, 'utf8')
   await writeFile(join(dir, 'claims.js'), await readFile(join(process.cwd(), 'lib', 'claims.js'), 'utf8'), 'utf8')
+  await writeFile(join(dir, 'docs.js'), await readFile(join(process.cwd(), 'lib', 'docs.js'), 'utf8'), 'utf8')
   return import(pathToFileURL(file).href)
 }
 
@@ -265,7 +267,7 @@ async function run() {
       ctx.emit('agent/turn-stopping', { agent: { id: 'sess-a' }, turn: 1, signal: new AbortController().signal })
       await new Promise((resolve) => setTimeout(resolve, 300))
 
-      const doc = await readFile(join(work, '.dsh', 'handoff', 'sess-a.md'), 'utf8')
+      const doc = await readFile(join(work, '.dsh', 'handoff', 'sess-a', 'full.md'), 'utf8')
       const goal = mod.goalSection(doc)
       assert.equal(goal, ROOT_GOAL, '文档里的原始目标必须是链根那句用户话')
       assert.ok(!goal.startsWith('[自动交接]'), '不能把交接简报当成用户目标')
