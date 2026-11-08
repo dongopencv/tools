@@ -322,3 +322,52 @@ node tools/handoff-check.mjs --deep     # 额外扫 40 个会话 + 跑四套离�
 - 环境变量可覆盖路径：`HANDOFF_PLUGIN_DIR`（插件源码目录）、`HANDOFF_OUT_DIR`（交接文档目录）。
 - 退出码 0 = 没有 FAIL，1 = 有 FAIL，可直接进 `&&` 链。
 
+
+## handoff-metrics.mjs
+
+`handoff-check.mjs` 回答「它坏了没有」，这个脚本回答**「阈值该设多少、验收够不够」**。
+
+2026-11-08 的处境：默认阈值 `tokenThreshold: 300000` / `toolCallThreshold: 80` 是拍的，没人知道
+真实交接发生在多少 token 上；日志里 99% 是同一句刷屏；`chainLimit = 8` 从来没被跑到过。
+这些都得用**真实运行数据**回答，不能拍脑袋。脚本只读现有证据，不跑插件、不改配置。
+
+```bash
+node tools/handoff-metrics.mjs            # 人读报告
+node tools/handoff-metrics.mjs --json     # 机读（喂给别的脚本/看板）
+node tools/handoff-metrics.mjs --verify   # 有 FAIL 就 exit 1，进 && 链
+```
+
+四处证据（缺哪处就降级，不报错）：
+
+| 证据 | 路径 | 用来算什么 |
+|---|---|---|
+| 插件日志（含 `.1` 轮转） | `~/.dsh/auto-handoff/auto-handoff.log` | 交接次数、触发/拦下比例、噪声比、配置代数 |
+| 结构化事件 | 同目录 `events.jsonl`（还没有） | 有就用，没有就退回正则解析中文日志 |
+| 占位台账 | 同目录 `claims.json` | 链深分布、终态分布、`chainLimit` 有没有被跑到 |
+| 会话窗口 | `~/.dsh/sessions/*/session-*/session.v4.jsonl.zstd` 的 `request/context` | 模型 `contextWindow`，把绝对 token 换算成窗口占比 |
+
+八条可观测验收（✅ PASS / ◐ WARN / ❌ FAIL）：
+
+| 验收项 | 判据 | 不满足说明什么 |
+|---|---|---|
+| 日志行带 sessionId | 有 `[session-…]` 前缀 | 多会话并发时日志无法归属，等于没法查 |
+| 有结构化事件通道 | 存在 `events.jsonl` | 只能正则解析中文日志，字段靠猜，改文案就崩 |
+| 触发与拦下能分开统计 | 真触发与「被占位拦下」两类可区分 | 无法判断「不重复交接」是真生效还是闸门卡死 |
+| 日志噪声比 < 20% | 拦下行 / 总行数 | 刷屏会把真正的一次交接埋掉，且日志 1 MiB 就滚掉 |
+| 交接点能对上模型窗口 | 能拿到 `contextWindow` 并算出占比 | 绝对阈值无法跨模型迁移 |
+| `chainLimit` 被真实跑到过 | `claims.json` 最大 `chainDepth` 达到过上限 | 「到顶就停」只在离线测试里成立，现网没验过 |
+| 样本量够改默认阈值 | 真实交接 ≥ 20 次 | 6 次就改默认值 = 换个数继续拍 |
+| 日志只含一个 profile 的配置 | 只出现一代 `已启用：` | e2e / 离线测试与桌面宿主共用 `USERPROFILE`，会互相污染 |
+
+设计要点：
+
+- **只拿真实交接算统计**：面板里的 `sess-a` / `sess-new-1` 是离线假件，e2e 压测代阈值是
+  `1000/5`，混进来会把分位数彻底带偏。过滤条件是「发起方是 `session-<uuid>`」且「代数不含 e2e」。
+- **分位数不在统计层取整**：窗口占比是 0–1 的比例，先 `Math.round` 会全变成 0 或 1；
+  比值保留原精度，绝对量在输出层取整。
+- **按「配置代数」切分日志**：同一份日志跨了多代配置（`300000/80` → `1000/5`），
+  每条 `已启用：` 开一代，给每次 `已交接` 打上代数标签，否则等于把不同实验的数据混在一起平均。
+- **建议只给比例，不给绝对值**：`tokenThresholdRatio = p25(窗口占比)` 夹在 `[0.15, 0.45]`；
+  样本不足 20 次时明说「只给比例建议，别动默认绝对值」。
+- **只读**：不写插件状态、不改 `claims.json`、不发网络请求。
+- 环境变量可覆盖路径：`HANDOFF_RUNTIME_DIR`（`~/.dsh/auto-handoff`）、`HANDOFF_SESSIONS_DIR`（会话根）。
