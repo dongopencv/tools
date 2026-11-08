@@ -46,14 +46,15 @@ Used by `/wayfinder`. The **map** is a single issue with **child** issues as tic
 
 ## 本机网络限制
 
-这台机器（PC1）的 GitHub 通道只有两条：`api.github.com`（读）与 SSH（写）。`github.com:443` 时通时不通，但**不影响干活**，因为它既不是读路也不是写路。因此：
+这台机器（PC1）的 GitHub 通道只有两条：`api.github.com`（读）与 SSH（写）。`github.com:443` 在本机 TCP 层就连不上，但**不影响干活**，因为它既不是读路也不是写路。因此：
 
 - 上面所有 `gh` 命令在本机**可以直接用**——`gh` 走 `api.github.com`，token 在 `gh` 的 keyring 里。
 - **`git clone` / `git push` 一律用 SSH**：`git@github.com:owner/repo.git`（22 不通就 `ssh://git@ssh.github.com:443/owner/repo.git`）。HTTPS 写路径在本机不稳定，不要用它兜底。
-- 下载 release 资产、raw 文件走网关脚本（SHA256 校验 + 断点续传）：
-  `bash tools/github.sh asset owner/repo v1.2.3 file.zip -s <sha256>`
+- 下载 release 资产、raw 文件走网关脚本（SHA256 校验 + 断点续传 + 钉子域名绕开冷 DNS）：
+  `bash tools/github.sh asset owner/repo v1.2.3 file.zip -s <sha256>`。直链 `github.com/.../releases/download/...`
+  在本机必然失败，`download` 子命令会自动把它换成 API 资产端点。
 - `gh release download` **不是不能用**：它经 `api.github.com` 302 到 `release-assets.githubusercontent.com`，全程不经 `github.com`，本机实测可用（324 MB 资产 5.09 MiB/s）。网关的价值在校验与断点续传，不是替代它。
-- 详细原因与踩坑记录见 `tools/README.md`（本仓库权威副本）；`C:\Users\Admin\.skills-vault\download\SKILL.md` 是同一套做法的旧说明，命令仍可用但没跟上仓库里的修复。
+- 详细原因与踩坑记录见 `tools/README.md`（本仓库权威副本）。
 
 ### API 走网关单入口
 

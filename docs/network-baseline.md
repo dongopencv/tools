@@ -48,8 +48,8 @@ AGENTS.md 里那条「大于 50 MB 不要用 git push」的判据，来源就是
 | `codeload.github.com` | ✅ 通 | GitHub 归档下载域 |
 | `github.com:22` | ✅ 通（波动） | 03:53 复测 6/6 通；02:33 同一小时内测到 CLOSED，历史约 4/5 成功率。**push 主通道** |
 | `ssh.github.com:443` | ✅ 通 | 03:53 复测 5/6 通。`github.com:22` 不通时改这条 |
-| `github.com:443` | ⚠️ 时通时不通 | 2026-11-06 全断，2026-11-08 三次探测 000/000/200。**不通也不影响干活**：读走 api，写走 SSH |
-| `raw.githubusercontent.com` | ⚠️ 时通时不通 | 实测 8/8 失败、偶发成功。要稳就走 `api.github.com/repos/<o>/<r>/contents/<path>` |
+| `github.com:443` | ❌ 基本不通 | **TCP 层**就不通（`net.connect` 实测 6 s 超时 ×2、`curl` exit 28），不是 DNS 问题、也不是「时好时坏」。**不影响干活**：读走 api，写走 SSH，release 资产走 API 端点 |
+| `raw.githubusercontent.com` | ⚠️ 时通时不通 | 实测 8/8 失败、偶发成功。要稳就走 `api.github.com/repos/<o>/<r>/contents/<path>`（`github.sh raw` 就是这么做的） |
 
 > **坑（2026-11-07 23:2x 实测）**：`~/.ssh/config` 里只有 `Host github.com` 一段时，走 `ssh.github.com` **不会匹配**、等于不带密钥，直接 `git@ssh.github.com: Permission denied (publickey)`。必须单开一段 `Host ssh.github.com`（HostName ssh.github.com / Port 443 / User git / IdentityFile ~/.ssh/id_ed25519_gh / IdentitiesOnly yes）。
 >

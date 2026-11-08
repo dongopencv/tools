@@ -10,9 +10,9 @@
 
 ## github.sh
 
-本机对 github.com 的网络限制很拧巴（`github.com:443` 被墙、`api.github.com` 通、
-写操作只能走 SSH），再加上不同会话里的传输器可用性不一样，所以 GitHub 的访问
-统一收敛到这一个脚本，而不是各处裸写 `curl` / `gh` / `git`。
+本机到 GitHub 只有两条通道：`api.github.com`（读）与 SSH（写）。`github.com` 的 443
+在本机是 TCP 层连不上，加上冷缓存下 getaddrinfo 要 ~12 s、不同会话里的传输器可用性还不一样，
+所以 GitHub 的访问统一收敛到这一个脚本，而不是各处裸写 `curl` / `gh` / `git`。
 
 ### 用法
 
@@ -26,7 +26,7 @@ bash tools/github.sh <子命令> [参数…]
 | `api` | 调 GitHub API（自动在 gh → curl → node 之间选路） | `bash tools/github.sh api repos/owner/repo --jq .full_name` |
 | `release` | 列出 release 的 tag / 资产 | `bash tools/github.sh release owner/repo v1.2.3` |
 | `asset` | 下载 release 资产（走 api 资产端点 → release-assets，SHA256 校验） | `bash tools/github.sh asset owner/repo v1.2.3 file.zip -s <sha256>` |
-| `download` | 下载任意 URL（大文件才上 aria2） | `bash tools/github.sh download <url> -o out.bin -s <sha256>` |
+| `download` | 下载任意 URL；release 直链会自动换成 API 资产端点（大文件才上 aria2） | `bash tools/github.sh download <url> -o out.bin -s <sha256>` |
 | `raw` | 取文件正文（走 API contents，raw 域不稳时的兜底） | `bash tools/github.sh raw owner/repo master README.md` |
 | `clone` | 克隆仓库（SSH 优先，不通才 HTTPS 直连） | `bash tools/github.sh clone owner/repo` |
 | `push` | 推送（只走 SSH：22 不通自动改 ssh.github.com:443） | `bash tools/github.sh push owner/repo HEAD` |
@@ -44,7 +44,8 @@ bash tools/github.sh <子命令> [参数…]
 2. **`curl`** —— 本机某些会话里 curl 拿不到 TLS 句柄：
    `curl: (35) schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`。
    这是 curl 自身的问题，**不是网络也不是 token 的问题**。
-3. **`node` 的 `fetch`** —— 永远兜底，本机实测稳定可用。
+3. **`node`（`tools/ghfetch.cjs`）** —— 永远兜底。它不是 `fetch`：自己问 DNS（见下文「冷 DNS」），
+   并按目标选 `Accept`（资产端点必须 `application/octet-stream`，否则回 1470 字节元数据 JSON）。
 
 `status` 会分别报告「传输器」和「token 认证」两节，就是为了不把传输器故障误读成 token 故障。
 
@@ -61,12 +62,15 @@ bash tools/github.sh <子命令> [参数…]
 
 现在改成**按候选表顺序直接下，失败或大小不符就换下一条**，选路成本 ≈ 一次真实传输：
 
-1. `asset` 走 `api.github.com/…/releases/assets/<id>`（302 到 `release-assets.githubusercontent.com`，预签名、直连可达，**全场最快**：324 MB 资产实测 5.09 MiB/s）。
-2. 失败才回落到直链 `browser_download_url`。
-3. 每换一条通道都先删半截文件：不同通道未必都支持续传，`-C -` 接手别处残片会算出坏哈希。
+1. **一律先换 API 资产端点** `api.github.com/…/releases/assets/<id>`（302 到 `release-assets.githubusercontent.com`，预签名、直连可达）。这不是优化，是**唯一能通的路**：`github.com` 在本机是 TCP 层连不上（`net.connect` 实测 6 s 超时 ×2、`curl` exit 28）。
+2. `download` 收到 `https://github.com/O/R/releases/download/TAG/FILE` 这种直链时，会自动查 `releases/tags/TAG` 拿 asset id 再下 —— 你不用记两条命令。
+3. 每个步骤都先删半截文件：不同通道未必都支持续传，`-C -` 接手别处残片会算出坏哈希。
 4. aria2 只在文件 ≥ 8 MiB 时启用（实测 2.18 MiB 时它与 curl 打平，更小的文件反而慢 6–12 倍）。
 
-实测（同一 2.18 MiB 资产）：改造前 `download` **52.2 s**，改造后 **8.2 s**；`asset` 三轮 3.0 / 3.8 / 12.8 s（第三轮是当时链路自己慢）。
+实测（`ipconfig /flushdns` 之后跑，2.5 MB 资产）：`asset` **4.0 s** / `download`（直链自动改写）**4.1–4.9 s** / `raw`（10600 B 正文）**1.4 s**；17.7 MB 资产走 aria2 8 连接 **36.8 s**。
+改之前同一台机器冷缓存下 `download` 直链是直接失败、`asset` 的 node 兜底会把 1470 字节 JSON 当成品存盘并报「完成」。
+
+资产名写错时现在 **2 s 内**就失败并说清是 tag/文件名不对（`exit=1`），不再白等一轮 curl 超时。
 
 想回到「先测速再选」的旧行为：`GITHUB_PROBE=1 bash tools/github.sh download <url>`。
 
@@ -84,7 +88,7 @@ bash tools/github.sh <子命令> [参数…]
 bash tools/github.sh push owner/repo HEAD     # 只走 SSH；22 不通自动改 ssh.github.com:443
 ```
 
-`github.com:443` 时通时不通**不影响 push**：写走 SSH，读走 `api.github.com`。别为它加通道。
+`github.com:443` 连不上**不影响 push**：写走 SSH，读走 `api.github.com`。别为它加通道。
 
 SSH 报 `Permission denied (publickey)` = **账号上没有这把公钥**，既不是 config 问题也不是网络问题。
 自检：`ssh-keygen -l -f ~/.ssh/id_ed25519_gh.pub` 拿到指纹，再对照公开端点
@@ -106,7 +110,7 @@ fatal: unable to fork
 - `gh`（必需，MSI 装完要重开 shell 才进 PATH；脚本会自己去 `C:/Program Files/GitHub CLI/gh.exe` 找）
   - 本机实测版本：`gh version 2.103.3 (2026-10-26)`（release tag `v2.103.3`）
   - 已装二进制的 SHA256：`d303d8ac3f5e9438bf7c977b64dd6425513eae46218f8881d30694f28c1d0dfd`（`sha256sum '/c/Program Files/GitHub CLI/gh.exe'`）；核对官方 hash 以 `v2.103.3` release 的 `gh_2.103.3_checksums.txt` 为准
-- `node`（兜底传输器）
+- `node`（兜底传输器，实现在 `tools/ghfetch.cjs`；自己解析 DNS + 自动选 `Accept`）
 - `aria2c`（可选，多连接下载；没有就回退 curl 续传）
 - `ssh` + `~/.ssh/id_ed25519_gh`（push 的唯一通道）
 
@@ -141,18 +145,38 @@ fatal: unable to fork
 | `GITHUB_PROBE` | `0` | 设 `1` 回到「先逐通道测速再选」的旧策略 |
 | `GITHUB_PROBE_BYTES` | `131072` | 测速时每通道拉多少字节 |
 | `GITHUB_PROBE_TIMEOUT` | `6` | 测速时单通道超时（秒） |
+| `GITHUB_DNS_PIN_TTL` | `600` | 钉住的 IP 缓存多久（秒）；到点重解析一次，代价约 120 ms |
+| `GITHUB_PIN_HOSTS` | `api.github.com release-assets.githubusercontent.com` | 用 `--resolve` 钉 IP 的域名；**别把 `github.com` 加进来**，它的问题是 TCP 层 |
 
-### 冷 DNS：比带宽更常见的延迟来源
+### 冷 DNS：本机真正的延迟来源（2026-11-08 定位）
 
-同一个 2.2 MiB 资产连测四次：**15098 / 2187 / 2324 / 11143 ms**，stderr 全是
-`curl: (28) Resolving timed out after 5000 milliseconds`。
+`ipconfig /flushdns` 之后，用 getaddrinfo 解析**任何**域名都要 ~12 s：
 
-`release-assets.githubusercontent.com` 冷解析实测要 **11119 ms**，之后 0–1 ms（走 OS 缓存）；
-而 curl 的 `--connect-timeout` 把 DNS 也算在内，5 秒一到就报错重试 —— 慢的不是带宽，是解析。
+| 域名 | 冷解析 |
+|---|---|
+| `example.com` | 12013 ms |
+| `baidu.com` | 12025 ms |
+| `api.github.com` | 12048 ms |
+| `release-assets.githubusercontent.com` | 12040 ms |
 
-脚本因此在 `fetch_one` 的 `rest` 通道里先调 `dns_warm()`（`tools/github.sh` 第 113 行起）：
-用 node 的 `dns.lookup`（走 getaddrinfo，结果留在 OS 缓存）预热 `api.github.com` 与
-`release-assets.githubusercontent.com`。**不钉 IP**：DNS 变了能跟得上，只重付一次预热成本。
+不是 GitHub 的问题，是 **OS 解析栈**的问题：本机两块非物理网卡（「本地连接* 9 / * 10」）
+挂着 DHCP 下发的 IPv6 DNS（`fec0:0:0:ffff::1%1` 等 ISATAP/Teredo 伪地址），getaddrinfo 会先等它们超时。
+`Resolve-DnsName github.com -Type A -DnsOnly` 同样是 12161 ms —— 与 node、与 curl 都无关。
+而直接问 `192.168.0.1` / `119.29.29.29` / `223.5.5.5` 只要 **5–120 ms**。
+
+脚本的应对（两条路都用，各管一段）：
+
+1. **`fast_ip()`（`tools/github.sh`）** —— 问快解析器拿 IP，用 `curl --resolve host:443:IP` 钉住，
+   curl 就完全不碰 getaddrinfo。结果缓存在 `~/.cache/pc1-pin-*`，TTL `GITHUB_DNS_PIN_TTL`（默认 600 s）。
+2. **`tools/ghfetch.cjs`** —— node 那条兜底以前用 `fetch`/`undici`，而 undici 只能走 getaddrinfo，
+   冷缓存下实测 **12130 ms 后失败**。现在改成 `dns.Resolver` 直接问上面那几个服务器，
+   再把 IP 通过 `https.request` 的 `lookup` 选项钉住，同一个 2.12 MiB 资产冷缓存 **2731 ms 拿全**。
+
+被钉住的只有两个域：`api.github.com`、`release-assets.githubusercontent.com`。
+**`github.com` 不钉** —— 它的问题在 TCP 层（`net.connect` 6 s 超时 ×2），钉 IP 救不了，改走 API 端点。
+DNS 变了能跟得上：TTL 到点就重解析，最坏重付一次 ~120 ms（不是 12 s）。
+
+`curl -V` 显示本机 curl 没有 c-ares，所以 `--dns-servers` 会直接报不支持（exit 2），只能这样绕。
 
 ### 下载失败要能看出来
 

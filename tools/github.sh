@@ -3,12 +3,17 @@
 #
 # 铁律：本机所有 GitHub 操作（API / 下载 / clone / 发布 / 查仓库）都必须经过
 #       这个脚本，不允许各处手搓 curl/gh/git 直连。依据见 docs/network-baseline.md：
-#       github.com 的 443 被墙，api.github.com 通，release 资产要选路，
-#       token 只在网关里读取一次。
+#       api.github.com 通、github.com 连不上、token 只在网关里读取一次。
 #
-# 下载通道：只有一条 —— 直连 GitHub。
-#   github.com 的 443 在本机时通时不通，所以 release 资产先走 API 资产端点
-#   （api.github.com → 302 → release-assets.githubusercontent.com，本机稳定可达）。
+# 通道只有两条：读 API 走 api.github.com，读写 git 走 SSH。
+#   github.com 的 443 在本机是 TCP 层连不上（不是「时通时不通」），所以：
+#   - release 资产一律先换 API 资产端点（api.github.com → 302 →
+#     release-assets.githubusercontent.com），直链 github.com/... 在本机必然失败；
+#   - 本机 getaddrinfo 冷缓存要 ~12 s（任何域名都是），所以 api.github.com 与
+#     release-assets 两个域名会被 tools/ghfetch.cjs / fast_ip 用快解析器先解析、
+#     再用 --resolve 钉住 IP，绕过系统解析栈。
+#
+# 传输器顺序固定：gh → curl → node(tools/ghfetch.cjs)。失败时如实说是哪一层失败。
 #
 # 用法：
 #   github.sh status                       # 自检：gh / token / 身份 / 可达域 / SSH
@@ -86,26 +91,69 @@ curl_opts() {
 
 opts_of() { local -a a=(); while IFS= read -r v; do a+=("$v"); done < <(curl_opts); echo "${a[*]}"; }
 
-# 预热系统解析器缓存。
-# 为什么需要：4G 网络下首次解析 release-assets.githubusercontent.com 实测 11119 ms，
-# 之后 0–1 ms（走 OS 缓存）。而 curl 的 --connect-timeout 连 DNS 一起管，5 秒一到就报
-#   curl: (28) Resolving timed out after 5000 milliseconds
-# 于是同一个 2.2 MiB 文件有时 2.2 秒、有时 15 秒 —— 差的全是 DNS，不是带宽。
-# 实测四次：15098 / 2187 / 2324 / 11143 ms，冷缓存那次必挂。
-# 用 node 的 dns.lookup（走 getaddrinfo，结果会留在 OS 缓存里）先问一次。
-# 不钉 IP：DNS 变了也能跟得上，只是要重付一次预热成本。
+# ── 解析：本机 getaddrinfo 冷缓存要 ~12 s，绕开它 ──
+# 2026-11-08 实测：ipconfig /flushdns 之后，node dns.lookup（等价 getaddrinfo）解析
+#   github.com 8601 / example.com 12013 / baidu.com 12025 / api.github.com 12048 ms
+# —— 是 OS 解析栈的通病（本机非物理网卡上挂着 DHCP 下发的 IPv6 DNS），不是 GitHub 特有问题。
+# 而直接问 192.168.0.1 / 119.29.29.29 / 223.5.5.5 是 5–120 ms。
+# 拿到 IP 后用 curl --resolve 钉住，curl 就完全不碰 getaddrinfo。
+# 注意 curl -V 里没有 c-ares，--dns-servers 会直接报不支持，所以只能这样绕。
+DNS_PIN_TTL="${GITHUB_DNS_PIN_TTL:-600}"
+_PIN_DIR="${XDG_CACHE_HOME:-$HOME/.cache}"
+_pin_file() { echo "$_PIN_DIR/pc1-pin-$(printf '%s' "$1" | tr '.' '_')"; }
+
+fast_ip() { # $1=host → 一行 IP（空格分隔），失败非零
+  have_node || return 1
+  local f age ips; f=$(_pin_file "$1")
+  if [[ -s "$f" ]]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
+    if (( age < DNS_PIN_TTL )); then cat "$f"; return 0; fi
+  fi
+  ips=$(node -e '
+    const { Resolver } = require("dns");
+    const host = process.argv[1];
+    const servers = ["192.168.0.1", "119.29.29.29", "223.5.5.5", "8.8.8.8"];
+    (function next(i) {
+      if (i >= servers.length) process.exit(1);
+      const r = new Resolver({ timeout: 2000, tries: 1 });
+      r.setServers([servers[i]]);
+      r.resolve4(host, (e, a) => {
+        if (!e && a && a.length) process.stdout.write(a.join(" "));
+        else next(i + 1);
+      });
+    })(0);
+  ' "$1" 2>/dev/null)
+  [[ -n "$ips" ]] || return 1
+  mkdir -p "$_PIN_DIR" 2>/dev/null
+  printf '%s' "$ips" > "$f" 2>/dev/null
+  echo "$ips"
+}
+
+# 要钉的宿主：只钉真正会下载/取 JSON 的那两个域。github.com 不钉 ——
+# 它的问题是 TCP 层连不上（实测 net.connect 6 s 超时 ×2），钉 IP 也救不了，改走 API 端点。
+PIN_HOSTS="api.github.com release-assets.githubusercontent.com"
+pin_args() {
+  local -a a=()
+  local h ip
+  for h in $PIN_HOSTS; do
+    ip=$(fast_ip "$h" 2>/dev/null) || continue
+    [[ -n "$ip" ]] && a+=(--resolve "$h:443:${ip%% *}")
+  done
+  echo "${a[*]}"
+}
+
+# curl 的完整前置参数：TLS 开关 + 绕开 getaddrinfo 的钉 IP
+net_opts() { local a b; a=$(opts_of); b=$(pin_args); echo "$a $b"; }
+
+# 预热解析缓存：把 IP 抓进 --resolve 缓存里（fast_ip 落盘，后续 curl 直接钉住）。
+# 老实现是 node dns.lookup + 最多等 6 s 就 kill —— 实测冷解析要 12 s，
+# 等不到就把进程杀了，缓存根本没预热，紧接着的 curl 照样超时。现在改走 fast_ip（~120 ms）。
 DNS_WARMED=""
 dns_warm() {
   local host="$1"
   case " $DNS_WARMED " in *" $host "*) return 0 ;; esac
   DNS_WARMED="$DNS_WARMED $host"
-  have_node || return 0
-  node -e 'require("dns").lookup(process.argv[1],()=>{})' "$host" >/dev/null 2>&1 &
-  local pid=$!
-  local i=0
-  while (( i < 60 )); do kill -0 $pid 2>/dev/null || break; sleep 0.1; i=$((i+1)); done
-  kill $pid 2>/dev/null
-  wait $pid 2>/dev/null
+  fast_ip "$host" >/dev/null 2>&1 || true
   return 0
 }
 
@@ -120,58 +168,38 @@ dns_warm() {
 
 have_node() { command -v node >/dev/null 2>&1; }
 
-# node fetch 取 GET 正文；成功打印 body，失败非零
+# node 传输器统一走 tools/ghfetch.cjs（不是内联 node -e）：
+#   1) 自己问 DNS（dns.Resolver 打 192.168.0.1 等），绕开要 12 s 的 getaddrinfo；
+#   2) 按目标自动选 Accept —— 资产端点必须是 application/octet-stream，否则回 1470 字节元数据 JSON；
+#   3) 重定向到 release-assets 时自动摘掉 Authorization。
+# 老实现是三个内联 node -e：缺 Accept、走 undici（只能 getaddrinfo）、冷缓存必失败。
+GHFETCH="$SCRIPT_DIR/ghfetch.cjs"
+
+# node 取 GET 正文；成功打印 body，失败非零
 node_get() {
   local url="$1" tok="${2:-}"
   have_node || return 1
-  node -e '
-    const [u, tok] = process.argv.slice(1);
-    const h = { "User-Agent": "pc1-github-sh", "Accept": "application/vnd.github+json" };
-    if (tok) h["Authorization"] = "Bearer " + tok;
-    fetch(u, { headers: h })
-      .then(async r => {
-        const t = await r.text();
-        if (!r.ok) { process.stderr.write("http " + r.status + "\n"); process.exitCode = 1; return; }
-        process.stdout.write(t);
-      })
-      .catch(e => { process.stderr.write(String(e.message || e) + "\n"); process.exitCode = 1; });
-  ' "$url" "$tok"
+  [[ -f "$GHFETCH" ]] || return 1
+  node "$GHFETCH" GET "$url" "$tok"
 }
 
-# node 下载：curl 不可用时的兜底。
-#   node_download <url> <out>         —— 直连
-#   node_download <url> <out> <token> —— 带 Authorization（API 资产端点要用）
+# node 下载（curl 不可用时的兜底）
 node_download() {
   local url="$1" out="$2" tok="${3:-}"
   have_node || return 1
-  node -e '
-    const [u, o, tok] = process.argv.slice(1);
-    const fs = require("fs");
-    const h = { "User-Agent": "pc1-github-sh" };
-    if (tok) h["Authorization"] = "Bearer " + tok;
-    fetch(u, { headers: h, redirect: "follow" })
-      .then(async r => {
-        if (!r.ok) { process.stderr.write("http " + r.status + "\n"); process.exitCode = 1; return; }
-        fs.writeFileSync(o, Buffer.from(await r.arrayBuffer()));
-      })
-      .catch(e => { process.stderr.write(String(e.message || e) + "\n"); process.exitCode = 1; });
-  ' "$url" "$out" "$tok"
+  [[ -f "$GHFETCH" ]] || return 1
+  node "$GHFETCH" DL "$url" "$out" "$tok"
 }
 
-# node fetch 探测：输出 "<code> <bytes>"
+# node 探测：输出 "<code> <bytes>"
 node_probe() {
-  local url="$1"
+  local url="$1" o
   have_node || { echo "000 0"; return 1; }
-  node -e '
-    const ac = new AbortController();
-    const t = setTimeout(() => ac.abort(), 15000);
-    fetch(process.argv[1], { headers: { "User-Agent": "pc1-github-sh" }, redirect: "follow", signal: ac.signal })
-      .then(async r => { const b = await r.arrayBuffer(); process.stdout.write(r.status + " " + b.byteLength); })
-      .catch(() => process.stdout.write("000 0"))
-      .finally(() => clearTimeout(t));
-  ' "$url" 2>/dev/null || echo "000 0"
+  [[ -f "$GHFETCH" ]] || { echo "000 0"; return 1; }
+  o=$(node "$GHFETCH" PROBE "$url" 2>/dev/null) || o=""
+  [[ "$o" =~ ^[0-9]{3}[[:space:]][0-9]+$ ]] || o="000 0"
+  echo "$o"
 }
-
 # ── SSH 通道选路 ──
 # 文档一直写「默认 22，22 不通改 ssh.github.com:443」，但 2026-11-06 复核发现代码只拼
 # git@github.com:owner/repo.git，端口从不切换——文档承诺的兜底根本没实现。
@@ -273,12 +301,15 @@ PROBE="${GITHUB_PROBE:-0}"
 probe() {
   local kind="$1" url="$2" code size spd total hdr
   hdr=$(mktemp 2>/dev/null || echo "/tmp/probe.$$")
+  # 探针也要吃钉 IP：冷缓存下 getaddrinfo 要 12 s，--max-time 8 的探针会直接误报「不通」。
+  local prc=0
   read -r code size spd < <(
-    curl -sS $(opts_of) -D "$hdr" -o /dev/null \
+    curl -sS $(net_opts) -D "$hdr" -o /dev/null \
       -w '%{http_code} %{size_download} %{speed_download}' \
       --connect-timeout 3 --max-time "$PROBE_TIMEOUT" \
-      -L -r "0-$((PROBE_BYTES-1))" "$url" 2>/dev/null || echo "000 0 0"
+      -L -r "0-$((PROBE_BYTES-1))" "$url" 2>/dev/null || { prc=$?; echo "000 0 0"; }
   )
+  : "$prc"
   if [[ "$code" == 000 ]]; then
     read -r code size < <(node_probe "$url"); spd=0
   fi
@@ -345,10 +376,15 @@ fetch_one() {
   if [[ $okflag -eq 0 ]]; then
     # 必须校验 HTTP 状态码：错误页会回 200 + "Not Found" 正文，
     # 只看 curl 退出码会把 9 字节的 "Not Found" 当成下载成功（实测踩到）。
-    local code
-    code=$(curl -sS $(opts_of) -L --connect-timeout 5 --retry 2 --max-time 1800 \
-      -o "$out" -w '%{http_code}' "${auth[@]}" "$url" 2>/dev/null || echo 000)
-    [[ "$code" == 2* ]] && okflag=1 || info "  curl 拿到 http=$code"
+    # 状态码必须和退出码分开取：老写法 code=$(curl ... || echo 000) 在 curl 先打印 302、
+    # 再因跳转目标解析超时而退出非零时，会拼成 "302000"，于是传成功也被判失败（实测踩到）。
+    local code crc
+    code=$(curl -sS $(net_opts) -L --connect-timeout 5 --retry 2 --max-time 1800 \
+      -o "$out" -w '%{http_code}' "${auth[@]}" "$url" 2>/dev/null)
+    crc=$?
+    [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
+    if [[ "$code" == 2* ]]; then okflag=1
+    else info "  curl 拿到 http=$code（curl exit=$crc）"; fi
   fi
   if [[ $okflag -eq 0 ]] && have_node; then
     info "  curl 没成，改用 node fetch"
@@ -371,6 +407,38 @@ fetch_one() {
   return 0
 }
 
+# 把 https://github.com/O/R/releases/download/TAG/FILE 这种直链换成 API 资产端点。
+# 为什么必须换：github.com 的 443 在本机是 TCP 层连不上（net.connect 实测 6 s 超时 ×2），
+# 直链下载 100% 失败；而 api.github.com/repos/O/R/releases/assets/<id> 302 到
+# release-assets.githubusercontent.com，实测能拿满速。
+# 输出 "<asset_url> <size>"；认不出或查不到就输出空。
+gh_release_asset_api() {
+  local url="$1"
+  [[ "$url" =~ ^https://github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/([^/?]+) ]] || return 0
+  local owner="${BASH_REMATCH[1]}" repo="${BASH_REMATCH[2]}" tag="${BASH_REMATCH[3]}" name="${BASH_REMATCH[4]}"
+  local t; t=$(gh_token 2>/dev/null || true)
+  [[ -n "$t" ]] || return 0
+  local json meta id asize
+  # 先用 ghfetch（自己解析 DNS，冷缓存也只要几百 ms）；gh 走 getaddrinfo，
+  # flushdns 之后一次就要 ~12 s —— 冷启动那 12 s 全是它花的。
+  json=$(node_get "https://api.github.com/repos/$owner/$repo/releases/tags/$tag" "$t" 2>/dev/null || true)
+  [[ -n "$json" ]] || json=$(cmd_api "repos/$owner/$repo/releases/tags/$tag" 2>/dev/null || true)
+  [[ -n "$json" ]] || return 0
+  # 用 node 解析而不是 grep 正则：assets[] 的元素含嵌套对象（uploader），
+  # "{[^{}]*}" 这类非贪婪花括号匹配一个都匹配不到（实测 obj len = 0）。
+  meta=$(printf "%s" "$json" | node -e '
+    let s=""; process.stdin.on("data",d=>s+=d);
+    process.stdin.on("end",()=>{
+      try { const j=JSON.parse(s); const a=(j.assets||[]).find(x=>x.name===process.argv[1]);
+            if (a) process.stdout.write(a.id + " " + (a.size||0)); } catch(e){}
+    });
+  ' "$name" 2>/dev/null || true)
+  id="${meta%% *}"; asize="${meta#* }"
+  [[ "$id" =~ ^[0-9]+$ ]] || return 0
+  [[ "$asize" =~ ^[0-9]+$ ]] || asize=0
+  echo "https://api.github.com/repos/$owner/$repo/releases/assets/$id $asize"
+}
+
 cmd_download() {
   local url="" out="" sha=""
   while [[ $# -gt 0 ]]; do
@@ -386,6 +454,34 @@ cmd_download() {
   mkdir -p "$DL_DIR"
   if [[ -z "$out" ]]; then
     local base="${url%%\?*}"; out="$DL_DIR/$(basename "$base")"
+  fi
+
+  # 直链若是 github.com/O/R/releases/download/TAG/FILE，先换 API 资产端点再下。
+  # 这条不是「优化」而是「唯一能通的路」：github.com 在本机 TCP 层连不上。
+  local apispec aurl asize
+  apispec=$(gh_release_asset_api "$url" || true)
+  if [[ -n "$apispec" ]]; then
+    aurl="${apispec%% *}"; asize="${apispec#* }"
+    [[ "$asize" =~ ^[0-9]+$ ]] || asize=0
+    info "直链改走 API 资产端点（$(( asize / 1048576 )) MiB）"
+    if fetch_one rest "$aurl" "$out" "$asize"; then
+      verify_out "$out" ${sha:+-s "$sha"}; return 0
+    fi
+    if have_node; then
+      local at; at=$(gh_token 2>/dev/null || true)
+      if node_download "$aurl" "$out" "$at" && [[ -s "$out" ]] \
+         && { (( asize == 0 )) || (( $(stat -c %s "$out" 2>/dev/null || echo 0) == asize )); }; then
+        verify_out "$out" ${sha:+-s "$sha"}; return 0
+      fi
+    fi
+    warn "API 资产端点没拿到，回落直链（大概率还是不通）"
+  fi
+  # release 直链没有被改写成 API 端点 → 说明资产名/tag 对不上，或者没有 token。
+  # 这时候**不要再试直链**：github.com 在本机 TCP 层连不上（curl exit=28 / 5 s 超时），
+  # 试了也只是白等一轮再把同一件事报一遍。直接说清楚缺什么。
+  if [[ "$url" =~ ^https://github\.com/[^/]+/[^/]+/releases/download/ ]]; then
+    [[ -n "$(gh_token 2>/dev/null || true)" ]] || die "download: 这台机器下 release 直链必须走 API 资产端点，而 API 需要 token（见 github.sh env）" 2
+    die "download: 该 release 里找不到这个资产名（tag 或文件名不对）。用 github.sh release <owner/repo> <tag> 看资产清单" 1
   fi
 
   # 候选表现在只有直连一条（见 candidates），选路逻辑保留是为了将来加端点时不重写：
@@ -455,7 +551,9 @@ cmd_asset() {
   local t json obj id
   t=$(gh_token 2>/dev/null || true)
   if [[ -n "$t" ]]; then
-    json=$(cmd_api "repos/$repo/releases/tags/$tag" 2>/dev/null || true)
+    # 同 cmd_download：先走 ghfetch 的快速解析，gh 的冷启动要 12 s。
+    json=$(node_get "https://api.github.com/repos/$repo/releases/tags/$tag" "$t" 2>/dev/null || true)
+    [[ -n "$json" ]] || json=$(cmd_api "repos/$repo/releases/tags/$tag" 2>/dev/null || true)
     # 用 node 解析而不是 grep 正则：release JSON 里 assets[] 的元素含嵌套对象（uploader），
     # "{[^{}]*}" 这类非贪婪花括号匹配一个都匹配不到（实测 obj len = 0）。
     # 一次拿 id + size：size 直接来自 release JSON 的 assets[].size，
@@ -652,7 +750,7 @@ cmd_raw() {
   # 3) curl 直连
   local auth=()
   [[ -n "$t" ]] && auth=(-H "Authorization: token $t")
-  out=$(curl -sS $(opts_of) --max-time 25 "${auth[@]}" -L "$rawurl" 2>/dev/null)
+  out=$(curl -sS $(net_opts) --max-time 25 "${auth[@]}" -L "$rawurl" 2>/dev/null)
   if [[ -n "$out" ]] && ! grep -qi "<!DOCTYPE html" <<<"${out:0:200}"; then printf "%s\n" "$out"; return 0; fi
   die "raw 取不到: $repo/$ref/$path" 2
 }
@@ -666,7 +764,9 @@ cmd_env() {
     GITHUB_ARIA2_MIN    "$ARIA2_MIN" \
     GITHUB_PROBE        "$PROBE（1 = 先测速再选路）" \
     GITHUB_PROBE_BYTES  "$PROBE_BYTES" \
-    GITHUB_PROBE_TIMEOUT "$PROBE_TIMEOUT"
+    GITHUB_PROBE_TIMEOUT "$PROBE_TIMEOUT" \
+    GITHUB_DNS_PIN_TTL  "$DNS_PIN_TTL（秒；0 = 每次重解析）" \
+    GITHUB_PIN_HOSTS    "$PIN_HOSTS"
   return 0
 }
 
@@ -689,7 +789,9 @@ cmd_status() {
   if command -v curl >/dev/null 2>&1; then
     local cver cprobe
     cver=$(curl --version 2>/dev/null | head -1)
-    cprobe=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 8 --noproxy "*" https://api.github.com/ 2>&1 || true)
+    # 探针必须吃钉 IP：冷缓存下 getaddrinfo 要 ~12 s，--max-time 8 会把好 curl 判成坏 curl
+    # （实测误报「curl 不可用 / curl: (28) Resolving timed out after 8001 milliseconds」）。
+    cprobe=$(curl -sS -o /dev/null -w "%{http_code}" $(net_opts) --max-time 25 https://api.github.com/ 2>&1 || true)
     if [[ "$cprobe" == "200" ]]; then
       ok "curl 可用 ($cver)"
     else
@@ -719,7 +821,7 @@ cmd_status() {
     # 失败时如实说是哪个传输器失败，不把传输器问题栽给 token。
     if g=$(gh_bin) && who=$(GH_TOKEN="$t" "$g" api user --jq .login 2>/dev/null) && [[ -n "$who" ]]; then
       how="gh api"
-    elif raw=$(curl -sS $(opts_of rest) --max-time 15 -H "Authorization: token $t" -H "Accept: application/vnd.github+json" https://api.github.com/user 2>/dev/null) && [[ -n "$raw" ]]; then
+    elif raw=$(curl -sS $(net_opts) --max-time 15 -H "Authorization: token $t" -H "Accept: application/vnd.github+json" https://api.github.com/user 2>/dev/null) && [[ -n "$raw" ]]; then
       who=$(printf "%s" "$raw" | grep -o "\"login\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | cut -d"\"" -f4)
       how="curl"
     elif raw=$(node_get "https://api.github.com/user" "$t" 2>/dev/null) && [[ -n "$raw" ]]; then
@@ -738,7 +840,7 @@ cmd_status() {
   # 否则会把「本来能用」的通道误判成不通（2026-11-06 实测：root 失败，tar.gz 200）。
   local -a probes=(
     "api.github.com|https://api.github.com/|API 挂了就没法干活；重试或换时段"
-    "github.com|https://github.com/|443 时通时不通；不通不影响干活（写走 SSH，读走 api.github.com）"
+    "github.com|https://github.com/|本机 TCP 层大概率连不上（net.connect 实测 6 s 超时）；不影响干活：写走 SSH，读走 api.github.com"
     "codeload.github.com|https://codeload.github.com/octocat/Hello-World/tar.gz/refs/heads/master|归档域；根路径 403 是它自己的策略，不代表不通"
     "raw.githubusercontent.com|https://raw.githubusercontent.com/dongopencv/tools/master/AGENTS.md|raw 域时通时不通（实测 8/8 失败、偶发成功）；要稳就改走 api.github.com/repos/<o>/<r>/contents/<path>"
     "release-assets.githubusercontent.com|https://release-assets.githubusercontent.com/|release 资产域（根路径 404 属正常）"
@@ -849,7 +951,7 @@ cmd_api() {
     for x in "${fields[@]}"; do cargs+=(-d "$x"); done
   fi
   for ((i=1; i<=2; i++)); do
-    out=$(curl -sS $(opts_of rest) --max-time 30 -X "$method" -H "Authorization: token $t" \
+    out=$(curl -sS $(net_opts) --max-time 30 -X "$method" -H "Authorization: token $t" \
       -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
       "${cargs[@]}" "https://api.github.com$path" 2>/dev/null)
     rc=$?
