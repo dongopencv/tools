@@ -40,10 +40,13 @@ gh api graphql -f query='query { repository(owner:"dongopencv", name:"tools") {
   issue(number:47) { subIssues(first:20) { totalCount nodes { number } } } } }'
 ```
 
-> **2026-11-08 16:25 复测：`deck_map_link` 已恢复正常**，`deck_map_link({key:"64", parentKey:"47"})` 返回「这次要补 1 条边，建成 1 条」，幂等无副作用。
-> 当年会失败是因为 `repo.refId` 落成了 cwd 目录名 `pc1`；现在 `deck_context` 直接给出 `dongopencv/tools`。
-> **根因仍未查明**（是代码改了还是 `~/.dsh/mattskillsdeck/choices.json` 绑定变干净了），所以缺陷票 `deck-refid-bug.md`（= #63）保持 open，不关。
-> 上面那套 `gh api` 手搓落边仍保留，作为后端不支持原生边时的兜底。
+> **2026-11-08 16:55 根因已查明（订正上一版）：不是「不复现已修好」，是 8000ms 补全上限被真实延迟打穿。**
+> `shared/deck-tools/shell.js:224` 的 `capMs` 默认 **8000ms**；`:230-233` 的 `Promise.race` 超时后静默返回 null
+> → `repoOf()`（`:257-267`）拿到空 refId → `describe()`（`repo.js:39`）用 cwd basename 顶替成 `pc1`
+> → `graph.js:19-25` 的 `parseRepo()` 判 null → `graph.js:55`/`:242` 报 `repo.refId missing: pc1`。
+> 日志 `repo.resolve.tier` 的 `latencyMs`：11-07 有 **11/160** 条 >8s（最大 **126745ms**）、11-08 有 **4/302** 条 >8s（最大 105952ms）；
+> 而本机正常时 `git remote get-url origin` 只要 30ms——**延迟一过 8s 就必然复现**。缺陷票 #63 已按这份证据重写正文，保持 open。
+> 上面那套 `gh api` 手搓落边保留，作为「工具报说不清时先读回现状」的对照手段。
 
 ## 清单
 
