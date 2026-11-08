@@ -48,6 +48,7 @@ const DEFAULTS = {
   claimTtlMs: 86400000,
   retryCooldownMs: 600000,
   maxAttempts: 3,
+  cancelParentAfterHandoff: true,
 }
 
 const STATE_FILE = 'state.json'
@@ -136,6 +137,10 @@ export const Config = z.object({
     .min(1)
     .default(DEFAULTS.maxAttempts)
     .description('同一会话最多尝试交接几次；超过后不再自动重试，只留日志。'),
+  cancelParentAfterHandoff: z
+    .boolean()
+    .default(DEFAULTS.cancelParentAfterHandoff)
+    .description('交接成功后取消父会话的当前轮（保留未处理的队列）。关掉它，父会话会继续跑，和子会话同时烧 token。'),
 })
 
 /**
@@ -232,6 +237,7 @@ function resolveOptions(config) {
     claimTtlMs: readInt(raw.claimTtlMs, DEFAULTS.claimTtlMs),
     retryCooldownMs: readInt(raw.retryCooldownMs, DEFAULTS.retryCooldownMs),
     maxAttempts: readInt(raw.maxAttempts, DEFAULTS.maxAttempts),
+    cancelParentAfterHandoff: readBool(raw.cancelParentAfterHandoff, DEFAULTS.cancelParentAfterHandoff),
   }
 }
 
@@ -241,6 +247,62 @@ function clampText(text, maxChars) {
   const normalized = text.trim()
   if (normalized.length <= maxChars) return normalized
   return normalized.slice(0, maxChars) + '…（已截断）'
+}
+
+/**
+ * 把摘要按 `## 小节` 切开。模型未按格式输出时整段作为一节（title 为空）。
+ * 这样截断可以按节做，而不是把整段字符串一刀切——旧实现正是切掉了「下一步」。
+ */
+function splitSummarySections(summary) {
+  const sections = []
+  let current = { title: '', body: [] }
+  for (const line of String(summary).split('\n')) {
+    const match = /^##\s+(.+?)\s*$/.exec(line)
+    if (match !== null) {
+      if (current.title !== '' || current.body.join('').trim() !== '') sections.push(current)
+      current = { title: match[1], body: [] }
+      continue
+    }
+    current.body.push(line)
+  }
+  sections.push(current)
+  return sections
+}
+
+/** 模型摘要里是否已经有「下一步」这一节。 */
+function hasNextStep(summary) {
+  return splitSummarySections(summary).some((section) => section.title.includes('下一步'))
+}
+
+/**
+ * 保证摘要一定带「下一步」：模型漏写时用本地兜底补一节。
+ * 用户明确的验收口径是「新会话第一条 assistant 输出必须引用下一步」，
+ * 所以这一节不能被模型自觉决定。
+ */
+function ensureNextStep(summary, facts) {
+  if (summary === '') return summary
+  if (hasNextStep(summary)) return summary
+  return summary.trimEnd() + '\n\n## 下一步\n' + fallbackSummary(facts)
+}
+
+/**
+ * 把「下一步」这一节提到摘要最前面，再整体裁剪。
+ * 裁剪仍然会发生，但被裁掉的只会是「进度概述」「关键决定与坑」的尾巴——
+ * 实测 8 份交接文档里 4 份因为按原始顺序切 1600 字而整节丢掉「下一步」。
+ */
+function orderSummary(summary, maxChars) {
+  const sections = splitSummarySections(summary)
+  const next = sections.filter((section) => section.title.includes('下一步'))
+  const rest = sections.filter((section) => !section.title.includes('下一步'))
+  const rebuilt = [...next, ...rest]
+    .map((section) => {
+      const body = section.body.join('\n').trim()
+      if (section.title === '') return body
+      return body === '' ? `## ${section.title}` : `## ${section.title}\n${body}`
+    })
+    .filter((text) => text !== '')
+  if (rebuilt.length === 0) return ''
+  return clampText(rebuilt.join('\n\n'), maxChars)
 }
 
 /** 从一条 message 的 content 里拼出纯文本。 */
@@ -645,8 +707,12 @@ async function requestModelSummary(ctx, session, facts, options, signal) {
     if (chunk.type === 'text-delta' && typeof chunk.text === 'string') parts.push(chunk.text)
     if (chunk.type === 'finish') break
   }
-  const text = clampText(parts.join(''), options.summaryMaxChars)
-  return text === '' ? undefined : text
+  const raw = parts.join('').trim()
+  if (raw === '') return undefined
+  // 按节裁剪，而不是把整段字符串一刀切：
+  // 旧实现直接 clamp(1600) 砍尾巴，而「## 下一步」是模型的第三节，
+  // 于是 8 份交接文档里 4 份整节丢掉「下一步」——新会话据此开工，却无路可走。
+  return orderSummary(ensureNextStep(raw, facts), options.summaryMaxChars)
 }
 
 /** 兜底摘要：不调模型，只按事实给出一段可执行的下一步。 */
@@ -767,6 +833,17 @@ function renderDoc(meta, facts, summary) {
     '> 本文件由 DSH 自动交接插件在上一会话达到阈值时生成。新会话请把它当作开工简报，' +
       '按「下一步」继续，不要重做已完成的部分。',
     '',
+    // 顺序是刻意的：「进度与下一步」和「交接前 REVIEW」必须排在最前。
+    // 注入副本会被 docMaxChars 截断，排在后面的段落先被砍；而这两节恰恰是
+    // 新会话唯一必须读到的东西。实测旧顺序下 8 份文档有 4 份整节丢掉「下一步」。
+    '## 进度与下一步',
+    '',
+    summary,
+    '',
+    '## 交接前 REVIEW',
+    '',
+    ...renderReview(meta.review),
+    '',
     '## 原始目标',
     '',
     facts.firstUser === '' ? '（未捕获最早的用户指令）' : facts.firstUser,
@@ -786,14 +863,6 @@ function renderDoc(meta, facts, summary) {
     '## 工具轨迹',
     '',
     toolTrail,
-    '',
-    '## 交接前 REVIEW',
-    '',
-    ...renderReview(meta.review),
-    '',
-    '## 进度与下一步',
-    '',
-    summary,
     '',
   ].join('\n')
 }
@@ -929,6 +998,13 @@ export function apply(ctx, config) {
    */
   const midTurnFired = new Set()
 
+  /**
+   * 已经为「终态但仍在跑」这件事记过一次证据的会话。
+   * 交接不会关掉父会话（宿主有 cancel API，但直接 cancel 会打断用户正在做的事），
+   * 所以父会话继续烧 token 是当前的设计后果。每个会话只记一次，避免又变成刷屏。
+   */
+  const terminalSeen = new Set()
+
   /** 把某个会话的占位状态说成人话（/handoff-status 用）。 */
   function describeClaim(sessionId) {
     const entry = readClaims(claimsFile).get(sessionId)
@@ -1018,13 +1094,26 @@ export function apply(ctx, config) {
         const now = Date.now()
         const reserved = reserveClaim(claimsFile, id, options, now, false)
         if (!reserved.reserved) {
-          // 占位已拦下（多半是上一次交接的 inflight / done），记上闸门别再每个调用都喊一遍。
           midTurnFired.add(id)
-          logInfo(`轮中触发被占位拦下（${reserved.reason}），不重复交接`)
+          if (reserved.reason === 'done' || reserved.reason === 'stopped') {
+            // 这一棒已经交接过（终态），之后每一次工具调用都是「旧会话还在继续跑」，
+            // 不是重复触发，没有新信息。旧实现每次都记一行 INFO，实测刷出 926 行、
+            // 占整个日志的 95%，把真正的失败信息埋掉了。
+            // 但「父会话交接后还在烧 token」是真实成本，所以每个会话只留一条证据行，
+            // 然后清零计数（留着不清又要重新累加到阈值才再进这里，纯属浪费）。
+            if (!terminalSeen.has(id)) {
+              terminalSeen.add(id)
+              logInfo(`[${id}] 已交接（${reserved.reason}），但该会话仍在产生工具调用：交接不会关掉父会话。`)
+            }
+            toolCallCounts.delete(id)
+            return
+          }
+          // 剩下的（inflight / cooldown / 次数用尽）是真正的竞态，值得留痕。
+          logInfo(`[${id}] 轮中触发被占位拦下（${reserved.reason}），不重复交接`)
           return
         }
         midTurnFired.add(id)
-        logInfo(`轮中触发：工具调用已达 ${String(next)} 次（阈值 ${String(options.toolCallThreshold)}），立即交接`)
+        logInfo(`[${id}] 轮中触发：工具调用已达 ${String(next)} 次（阈值 ${String(options.toolCallThreshold)}），立即交接`)
         void (async () => {
           try {
             await performHandoff(live, 'mid-turn', undefined)
@@ -1222,6 +1311,33 @@ export function apply(ctx, config) {
       Date.now(),
     )
 
+    // 简报已经送达，子会话开始接棒。父会话此刻还活着——它不会因为交接而停下，
+    // 实测会继续跑 70 分钟、和子会话一起烧 token（用户抱怨的正是这个）。
+    // 宿主其实给了 cancel({ sessionId })：它会取消当前轮，但 keepInbox 保留未处理队列。
+    // 默认取消；cancelParentAfterHandoff=false 可退回「不打扰旧会话」的旧行为。
+    let parentCancelled = false
+    // 手动 /handoff 不取消：调用方就是那个会话自己，取消会把它正在执行的命令打断。
+    // 自动路径（轮中 / 轮末）才属于「接力棒已经递出去，旧的那一棒该停了」。
+    if (options.cancelParentAfterHandoff === true && trigger !== 'manual') {
+      const canceller = optionalService(ctx, 'sessionController')
+      if (canceller !== undefined && canceller !== null && typeof canceller.cancel === 'function') {
+        try {
+          // 宿主实现是同步返回 { accepted: true }，但远程壳层可能包成 Promise；
+          // 两种都要兜住，否则一次未捕获的 rejection 会冒到宿主的事件循环里。
+          const accepted = canceller.cancel({ sessionId })
+          parentCancelled = true
+          if (accepted !== null && typeof accepted === 'object' && typeof accepted.then === 'function') {
+            accepted.then(undefined, (error) => {
+              logInfo(`父会话取消请求被拒绝（${error instanceof Error ? error.message : String(error)}）`)
+            })
+          }
+        } catch (error) {
+          // 旧会话已经 detach（跑完自然结束）时会抛 session/not-found —— 这是正常情况。
+          logInfo(`父会话无需取消或已结束（${error instanceof Error ? error.message : String(error)}）`)
+        }
+      }
+    }
+
     if (statePath !== undefined) {
       if (chainState === null) chainState = new Map()
       chainState.set(newSessionId, { root: chain.root, depth: nextDepth })
@@ -1233,8 +1349,12 @@ export function apply(ctx, config) {
       }
     }
 
-    logInfo(`已交接：${sessionId} → ${newSessionId}（${String(tokens)} tokens / ${String(facts.toolCalls)} 次工具调用）`, docPath)
-    return { ...base, newSessionId, stoppedByChainLimit: false }
+    logInfo(
+      `已交接：${sessionId} → ${newSessionId}（${String(tokens)} tokens / ${String(facts.toolCalls)} 次工具调用）` +
+        (parentCancelled ? '，父会话当前轮已取消' : ''),
+      docPath,
+    )
+    return { ...base, newSessionId, stoppedByChainLimit: false, parentCancelled }
   }
 
   // 每轮结束（工具调用全部收尾）时检查阈值。这里同步判定、异步执行：
@@ -1257,7 +1377,15 @@ export function apply(ctx, config) {
       // 同步占位（落盘），避免同一轮内与跨进程重复派发。
       const reserved = reserveClaim(claimsFile, sessionId, options, Date.now(), false)
       if (!reserved.reserved) {
-        logInfo(`阈值已过但占位拦下（${reserved.reason}），不重复交接`)
+        // 终态说明这一棒早就交接过，父会话只是还在跑——每个会话只留一条证据行。
+        if (reserved.reason === 'done' || reserved.reason === 'stopped') {
+          if (!terminalSeen.has(sessionId)) {
+            terminalSeen.add(sessionId)
+            logInfo(`[${sessionId}] 已交接（${reserved.reason}），但该会话仍在产生工具调用：交接不会关掉父会话。`)
+          }
+          return
+        }
+        logInfo(`[${sessionId}] 阈值已过但占位拦下（${reserved.reason}），不重复交接`)
         return
       }
       void (async () => {

@@ -86,7 +86,7 @@ function toolCall(seq, name, args) {
   return { type: 'tool/call', seq, time: 0, data: { turn: 1, step: 1, callId: 'c' + String(seq), name, arguments: JSON.stringify(args) } }
 }
 
-async function scenario({ plugin, toolCalls, enforce, fireTurnStopping }) {
+async function scenario({ plugin, toolCalls, enforce, fireTurnStopping, extraAfter, preDone }) {
   const dir = await mkdtemp(join(tmpdir(), 'auto-handoff-midturn-'))
   const previousHome = process.env.USERPROFILE
   process.env.USERPROFILE = dir
@@ -123,6 +123,17 @@ async function scenario({ plugin, toolCalls, enforce, fireTurnStopping }) {
     },
   }
 
+  // 预置一条终态占位：模拟「上一棒已经交接完、父会话还在跑」的真实局面。
+  if (preDone === true) {
+    const claimsFile = join(dir, '.dsh', 'auto-handoff', 'claims.json')
+    await mkdir(join(dir, '.dsh', 'auto-handoff'), { recursive: true })
+    await writeFile(
+      claimsFile,
+      JSON.stringify({ claims: { 'sess-a': { state: 'done', at: Date.now(), attempts: 1, chainRoot: 'sess-a', chainDepth: 0 } }, updatedAt: new Date().toISOString() }),
+      'utf8',
+    )
+  }
+
   const ctx = makeCtx({ services })
   plugin.apply(ctx, {
     enabled: true,
@@ -147,6 +158,23 @@ async function scenario({ plugin, toolCalls, enforce, fireTurnStopping }) {
     await new Promise((r) => setTimeout(r, 200))
   }
 
+  // 交接已经发生之后，父会话往往还在继续跑（宿主不会自动关它）。
+  // 这段就是在模拟那段时间里继续冒出来的工具调用。
+  if (typeof extraAfter === 'number' && extraAfter > 0) {
+    for (let i = 0; i < extraAfter; i += 1) {
+      events.push(toolCall(10000 + i, 'read', { file_path: 'D:/bulk/after.ts' }))
+      ctx.emit('session/event', session, events[events.length - 1])
+    }
+    await new Promise((r) => setTimeout(r, 100))
+  }
+
+  let log = ''
+  try {
+    log = await readFile(join(dir, '.dsh', 'auto-handoff', 'auto-handoff.log'), 'utf8')
+  } catch {
+    log = ''
+  }
+
   let doc
   try {
     doc = await readFile(join(dir, '.dsh', 'handoff', 'sess-a.md'), 'utf8')
@@ -158,7 +186,7 @@ async function scenario({ plugin, toolCalls, enforce, fireTurnStopping }) {
   else process.env.USERPROFILE = previousHome
   await rm(dir, { recursive: true, force: true })
 
-  return { doc, created, prompts }
+  return { doc, created, prompts, log }
 }
 
 async function run() {
@@ -197,6 +225,20 @@ async function run() {
     assert.equal(r.created.length, 1, '两条路径共存时应只交接一次')
     assert.equal(r.prompts.length, 1, '不应重复投递')
     results.push('PASS 硬兜底与轮末触达共存时不重复交接')
+  }
+
+  // 5) 占位已是终态（done）的会话还在继续跑工具：这是生产里刷屏 926 行的真实形态。
+  //    旧实现每个会话只喊一次，但进程一重启 midTurnFired 就清空，于是「一棒一个会话」地重复喊。
+  //    现在要求：每个会话只留一条证据行，之后彻底静默。
+  {
+    const r = await scenario({ plugin, toolCalls: 85, enforce: true, fireTurnStopping: false, preDone: true, extraAfter: 300 })
+    assert.equal(r.created.length, 0, '占位已是终态时不应再开新会话')
+    const lines = r.log.split('\n')
+    const spam = lines.filter((line) => line.includes('轮中触发被占位拦下')).length
+    assert.equal(spam, 0, '终态会话继续产生的工具调用不应再刷「被占位拦下」，实测旧实现 926 行占 95%')
+    const evidence = lines.filter((line) => line.includes('但该会话仍在产生工具调用')).length
+    assert.equal(evidence, 1, '每个会话只留一条「父会话仍在烧 token」的证据行，不能又刷起来')
+    results.push('PASS 已交接会话继续跑工具时只留一条证据行，不再刷屏')
   }
 
   console.log(['', ...results, '', 'ALL MID-TURN TESTS PASSED'].join('\n'))

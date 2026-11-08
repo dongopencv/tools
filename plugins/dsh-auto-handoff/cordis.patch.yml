@@ -28,3 +28,6 @@
         summaryModel: ''
         # 轮中硬兜底：工具调用一超阈值立刻交接，不等本轮结束
         enforceMidTurn: true
+        # 交接成功后取消父会话的当前轮（保留未处理的队列）。
+        # 父会话不会因为交接自己停下——实测它能继续跑 70 分钟，与子会话同时烧 token。
+        cancelParentAfterHandoff: true

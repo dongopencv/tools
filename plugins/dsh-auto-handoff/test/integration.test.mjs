@@ -62,9 +62,11 @@ function buildSession(id, cwd, header, events) {
 function makeServices(options) {
   const created = []
   const prompts = []
+  const cancelled = []
   return {
     created,
     prompts,
+    cancelled,
     services: {
       sessions: {
         get: (id) => options.sessions.get(String(id)),
@@ -90,6 +92,11 @@ function makeServices(options) {
           }
           signal.throwIfAborted()
           prompts.push(request)
+          return { accepted: true }
+        },
+        // 宿主 cancel({ sessionId }) → { accepted: true }；会话已 detach 时抛 session/not-found。
+        cancel: async (request) => {
+          cancelled.push(request.sessionId)
           return { accepted: true }
         },
       },
@@ -162,7 +169,7 @@ async function loadPluginUnderTest() {
   return mod
 }
 
-async function scenario({ plugin, name, tokens, toolCalls, chainDepth, modelText, expect, extra, injectUser }) {
+async function scenario({ plugin, name, tokens, toolCalls, chainDepth, modelText, expect, extra, injectUser, cancelParent, manual }) {
   const dir = await mkdtemp(join(tmpdir(), 'auto-handoff-test-'))
   // 链账本住在 ~/.dsh/auto-handoff/state.json（用户主目录），不是工作区。
   // 测试必须把 USERPROFILE 指到临时目录，否则会读写真实账本并互相污染。
@@ -220,6 +227,8 @@ async function scenario({ plugin, name, tokens, toolCalls, chainDepth, modelText
     docMaxChars: 6000,
     summaryTimeoutMs: 45000,
     maxTrackedFiles: 40,
+    // 不传时走 DEFAULTS 的 readBool 兜底（= true），这样默认行为也被测到。
+    cancelParentAfterHandoff: cancelParent,
   })
 
   // 灌入工具调用事件（插件靠 session/event 计数）
@@ -227,8 +236,14 @@ async function scenario({ plugin, name, tokens, toolCalls, chainDepth, modelText
     if (event.type === 'tool/call') ctx.emit('session/event', sessions.get('sess-a'), event)
   }
 
-  // 触发一轮结束
-  ctx.emit('agent/turn-stopping', { agent: { id: 'sess-a' }, turn: 1, signal: new AbortController().signal })
+  if (manual === true) {
+    // 手动路径：直接调 /handoff 的 handler（与用户敲命令等价）。
+    const command = ctx._commands.find((item) => item.name === 'handoff')
+    await command.handler({ agent: { id: 'sess-a' }, signal: new AbortController().signal })
+  } else {
+    // 触发一轮结束
+    ctx.emit('agent/turn-stopping', { agent: { id: 'sess-a' }, turn: 1, signal: new AbortController().signal })
+  }
   // 异步交接，等一下
   await new Promise((resolve) => setTimeout(resolve, 300))
 
@@ -249,7 +264,7 @@ async function scenario({ plugin, name, tokens, toolCalls, chainDepth, modelText
     claims = undefined
   }
 
-  const record = { name, dir, docPath, doc, created: harness.created, prompts: harness.prompts, commands: ctx._commands, ctx, events, claims }
+  const record = { name, dir, docPath, doc, created: harness.created, prompts: harness.prompts, cancelled: harness.cancelled, commands: ctx._commands, ctx, events, claims }
   if (previousHome === undefined) delete process.env.USERPROFILE
   else process.env.USERPROFILE = previousHome
   await rm(dir, { recursive: true, force: true })
@@ -287,7 +302,32 @@ async function run() {
     assert.equal(r.claims?.[r.created[0].id]?.state, 'genesis', '新会话应记为 genesis 而不是 done')
     assert.equal(r.claims?.[r.created[0].id]?.chainDepth, 1, '新会话链深应为 1')
     assert.equal(r.claims?.['sess-a']?.chainDepth, 0, '父会话链深应为 0')
-    results.push('PASS 工具调用阈值触发交接（占位：父 done / 新 genesis、链深 +1）')
+    // 接力棒交出去之后，父会话必须停：它不会自己停，实测会继续跑 70 分钟、和子会话同时烧 token。
+    assert.deepEqual(r.cancelled, ['sess-a'], '自动交接后应取消父会话当前轮')
+    results.push('PASS 工具调用阈值触发交接（占位：父 done / 新 genesis、链深 +1、父会话被取消）')
+  }
+
+  // 2b) 关掉 cancelParentAfterHandoff：退回「不打扰旧会话」的旧行为
+  {
+    const r = await scenario({
+      plugin,
+      name: 'no-cancel-parent',
+      tokens: 300000,
+      toolCalls: 5,
+      modelText: '摘要',
+      cancelParent: false,
+    })
+    assert.equal(r.created.length, 1, '仍应新建会话')
+    assert.deepEqual(r.cancelled, [], 'cancelParentAfterHandoff=false 时不应取消父会话')
+    results.push('PASS cancelParentAfterHandoff=false 时不取消父会话')
+  }
+
+  // 2c) 手动 /handoff 不能取消父会话：调用方就是它自己，取消会打断用户正在执行的命令
+  {
+    const r = await scenario({ plugin, name: 'manual', tokens: 300000, toolCalls: 5, modelText: '摘要', manual: true })
+    assert.equal(r.created.length, 1, '手动交接应新建会话')
+    assert.deepEqual(r.cancelled, [], '手动 /handoff 不应取消父会话')
+    results.push('PASS 手动 /handoff 不取消父会话')
   }
 
   // 3) token 阈值触发
@@ -296,6 +336,34 @@ async function run() {
     assert.ok(r.doc !== undefined, '达 token 阈值应写文档')
     assert.equal(r.created.length, 1, '应新建一个会话')
     results.push('PASS token 阈值触发交接')
+  }
+
+  // 3b) 长摘要：模型把「下一步」写在第三节，超过 summaryMaxChars 后也不能丢
+  //     旧实现 clamp(1600) 一刀切，实测 8 份真实交接文档里 4 份整节丢掉「下一步」，
+  //     新会话据此开工却无路可走。这里固定住修法：按节重排 + 只在末尾裁剪。
+  {
+    const filler = '已完成若干阶段的排查与修复。'.repeat(180) // ≈ 1800 字
+    const modelText = '## 进度概述\n' + filler + '\n\n## 关键决定与坑\n' + filler + '\n\n## 下一步\n先跑 KEYWORD_NEXT_STEP 再收尾'
+    assert.ok(modelText.length > 1600, '构造的摘要必须超过 summaryMaxChars')
+    const r = await scenario({ plugin, name: 'long-summary', tokens: 300000, toolCalls: 5, modelText })
+    assert.ok(r.doc !== undefined, '应写文档')
+    assert.match(r.doc, /## 下一步/, '长摘要被裁剪后「下一步」这一节仍须存在')
+    assert.match(r.doc, /KEYWORD_NEXT_STEP/, '「下一步」的正文不能被裁掉')
+    // 注入给新会话的那一份（受 docMaxChars 限制）同样不能丢
+    const injected = r.prompts[0].content[0].text
+    assert.match(injected, /## 下一步/, '注入副本里也必须有「下一步」')
+    assert.match(injected, /KEYWORD_NEXT_STEP/, '注入副本里「下一步」的正文也必须完整')
+    results.push('PASS 超长摘要裁剪后仍保留「下一步」')
+  }
+
+  // 3c) 模型漏写「下一步」：必须用本地兜底补一节，不能交给模型自觉
+  {
+    const r = await scenario({ plugin, name: 'no-next-step', tokens: 300000, toolCalls: 5, modelText: '## 进度概述\n做了一半。' })
+    assert.ok(r.doc !== undefined, '应写文档')
+    assert.match(r.doc, /## 下一步/, '模型漏写时应由本地兜底补上「下一步」')
+    const injected = r.prompts[0].content[0].text
+    assert.match(injected, /## 下一步/, '注入副本同样要有兜底「下一步」')
+    results.push('PASS 模型漏写「下一步」时本地兜底补一节')
   }
 
   // 4) 模型摘要不可用时走兜底

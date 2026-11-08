@@ -110,6 +110,7 @@
 | `claimTtlMs` | `86400000` | 占位有效期，超时视为上一次交接已死 |
 | `retryCooldownMs` | `600000` | 失败后多久才允许重试 |
 | `maxAttempts` | `3` | 同一会话最多自动尝试几次，用尽后停止自动重试 |
+| `cancelParentAfterHandoff` | `true` | 交接成功后取消父会话当前轮（保留未处理队列）。关掉它就退回「不打扰旧会话」，但父会话会和子会话同时烧 token。手动 `/handoff` 永远不取消 |
 
 ## 依赖的宿主服务
 
@@ -130,7 +131,10 @@
 5. `chainFor` 读链深 → 超 `chainLimit` 就停在这里。
 6. `controller.create` 建同 cwd 新会话（preset 取会话事件里最后一次 `agent-preset/selected`）。
 7. `controller.prompt(request, signal)` 投递简报（**必须传 AbortSignal**，宿主第一行就是 `signal.throwIfAborted()`）。
-8. 记账：父会话写 `done`（终态，保证这一棒只交一次），新开的一棒写 `genesis`（链深已登记、还能再交接）；失败写 `failed` + 原因，等冷却后重试；到 `chainLimit` 那一棒写 `stopped`。
+8. 取消父会话当前轮：`sessionController.cancel({ sessionId })`。宿主实现是 `agent.cancel({kind:'user'},{keepInbox:true})`，
+   只停当前那一轮、不丢队列；父会话已经自然结束时会抛 `session/not-found`，按正常情况处理。
+   **父会话不会因为交接自己停下**——实测它能继续跑 70 分钟，和子会话一起烧 token，这一步就是治它的。
+9. 记账：父会话写 `done`（终态，保证这一棒只交一次），新开的一棒写 `genesis`（链深已登记、还能再交接）；失败写 `failed` + 原因，等冷却后重试；到 `chainLimit` 那一棒写 `stopped`。
 
 ## 已知边界
 
@@ -138,6 +142,12 @@
   判断方法：看新生成的交接文档里有没有「## 交接前 REVIEW」一节。
 - `tokenMeter.measure()` 返回的是估算值，阈值 300000 是经验值，不是模型窗口的精确比例。
 - 「进度与下一步」与「最近的用户指令」在信息上有重叠，属于 #29 待定稿的结构问题。
+- **摘要按节裁剪，不是一刀切。** 模型把「下一步」写在第三节，旧实现 `clamp(1600)` 直接从尾部砍，
+  实测 8 份真实文档里 4 份整节丢掉「下一步」。现在 `orderSummary` 先把含「下一步」的那节提到最前再裁剪，
+  模型漏写时 `ensureNextStep` 用本地兜底补一节；文档里「进度与下一步」也移到了注入副本靠前的位置
+  （注入副本按 `docMaxChars` 截断，排最后的最先被砍）。
+- 已交接（`done`/`stopped`）的会话若继续产生工具调用，只记**一条**证据行并清掉它的内存计数，
+  不再逐个调用刷「占位拦下」。这行日志本身就是证据：父会话仍在跑。
 - 只支持 root 会话；`header.origin === 'subagent'` 一律跳过。
 
 ## 测试
