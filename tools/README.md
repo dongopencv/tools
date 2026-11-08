@@ -29,7 +29,7 @@ bash tools/github.sh <子命令> [参数…]
 | `download` | 下载任意 URL（顺序试通道，大文件才上 aria2） | `bash tools/github.sh download <url> -o out.bin -s <sha256>` |
 | `raw` | 取文件正文（走 API contents，raw 域不稳时的兜底） | `bash tools/github.sh raw owner/repo master README.md` |
 | `clone` | 克隆仓库（SSH 优先，回退镜像） | `bash tools/github.sh clone owner/repo` |
-| `push` | 推送（只走 SSH） | `bash tools/github.sh push owner/repo HEAD` |
+| `push` | 推送（SSH 优先，失败自动回落中转站 HTTPS） | `bash tools/github.sh push owner/repo HEAD [--via ssh\|relay\|auto]` |
 | `ghdl` | 委派官方 `gh release download` | `bash tools/github.sh ghdl owner/repo v1.2.3 -p '*.zip'` |
 | `sshcheck` | 只测 SSH 密钥认证 | `bash tools/github.sh sshcheck` |
 | `env` | 打印可直接 eval 的代理 export（中转站在跑才有）；`--config` 打印全部配置变量的当前值 | `eval "$(bash tools/github.sh env)"` / `bash tools/github.sh env --config` |
@@ -84,26 +84,49 @@ bash tools/github.sh <子命令> [参数…]
 
 `release` 在仓库没有 `latest` release 时会自动回退成列出全部 release。
 
-### 写操作的通道与前提（2026-11-08 更正）
+### 写操作的通道与前提（2026-11-08 二次更正，实测）
 
-首选 SSH：`git push` 走 `git@github.com:owner/repo.git`。
-
-**但「HTTPS 写三条路全死」这句是错的，2026-11-08 实测已被推翻。**
-git over HTTPS 经 8899 中转站是活的，缺的只是 token 的 `Contents: Read and write`：
+`push` 有**两条**通道，默认 `--via auto`：SSH 先，失败自动回落中转站 HTTPS。
 
 ```bash
-git -c http.proxy=http://127.0.0.1:8899 -c http.sslVerify=false \
-    -c http.extraheader="Authorization: Basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)" \
-    ls-remote https://github.com/dongopencv/tools.git HEAD
-# → 返回真实 SHA（通）
+bash tools/github.sh push owner/repo HEAD              # auto：SSH → 失败回落 relay
+bash tools/github.sh push owner/repo HEAD --via ssh    # 只走 SSH（22 不通自动改 ssh.github.com:443）
+bash tools/github.sh push owner/repo HEAD --via relay  # 只走 8899 中转站（HTTPS）
 ```
 
-同形态 `push` 若返回 `403 The requested URL returned error: 403` 且远端提示
-`Permission to <owner>/<repo>.git denied`，**那是授权问题不是链路问题**：
+**「HTTPS 写三条路全死」这句是错的，2026-11-08 已实测推翻。** 证据：
+
+| 请求 | 直连 | 经 8899 relay |
+|---|---|---|
+| `GET …/tools.git/info/refs?service=git-receive-pack` | ❌ 21.09 s，http 000 | ✅ 200 / 413 B / 1.40 s，返回真实 ref |
+| `POST …/tools.git/git-receive-pack`（body `0000`） | ❌ 21.05 s，http 000 | ✅ 200 / 0 B / 1.74 s |
+| 真推临时分支 `probe-relay-push` | — | ✅ `* [new branch]`，随后 `push --delete` 删净 |
+| `github.sh push … --via relay` | — | ✅ 5 s，`[ok] push 成功（relay）` |
+| `github.sh push … --via ssh` | ✅ 4 s | — |
+
+原因：`tryUpstream` 把 `ctx.method` 与 `ctx.body` **原样转发**（`tools/relay/server.mjs:113,156`），
+不区分读写；`github.com` 经 relay 是真转发到 GitHub，不是让镜像站代劳。
+
+**两个容易搞错的前提**：
+
+1. **不需要 `http.sslVerify=false`，也不需要 `http.sslCAInfo`**。本机 git 默认
+   `http.sslBackend=schannel`，信任来自 **Windows 证书存储**（relay 的 CA 已装在里面）。
+   实测：给一个**不存在**的 `http.sslCAInfo` 路径照样成功（schannel 静默忽略它）；
+   只有显式 `http.sslBackend=openssl` 且不给 CA 才报
+   `SSL certificate problem: unable to get local issuer certificate (20)`，那时才需
+   `http.sslCAInfo=C:/Users/Admin/dsh-mirror-proxy/certs/ca.crt.pem`。
+   **关校验是多余且不必要的安全损失。**
+2. **token 不进命令行**：用 `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`
+   环境变量注入 `http.extraheader`；`git -c http.extraheader=…` 会出现在 `ps` /
+   `Get-CimInstance Win32_Process` 里。`push_relay()` 已按这个写法实现。
+
+若 `push` 返回 `403` 且远端提示 `Permission to <owner>/<repo>.git denied`，
+**那是授权问题不是链路问题**：看响应头 `X-Accepted-Github-Permissions` 点了哪一项，
 细粒度 PAT 缺 `Contents: Read and write`。判据见 `docs/pending-issues/pat-permission-fix.md`。
 
-2026-11-08 同时确认：账号上 `GET /users/dongopencv/keys` 数量为 **0**，
-所以 SSH 通道失效不是配置问题而是**公钥被移除**，只能在网页加回。
+SSH 报 `Permission denied (publickey)` 时**先查账号上有没有公钥**
+（`github.sh api users/dongopencv/keys`）：2026-11-08 曾测得 **0 个**（公钥被移除，
+改 `~/.ssh/config` 无用），当天 02:38 补回 1 个（id 169145688，ssh-ed25519），之后 SSH 恢复。
 
 **在受限会话（agent 沙箱）里，git 连传输进程都 fork 不出来**：
 
@@ -123,7 +146,7 @@ fatal: unable to fork
   - 已装二进制的 SHA256：`d303d8ac3f5e9438bf7c977b64dd6425513eae46218f8881d30694f28c1d0dfd`（`sha256sum '/c/Program Files/GitHub CLI/gh.exe'`）；核对官方 hash 以 `v2.103.3` release 的 `gh_2.103.3_checksums.txt` 为准
 - `node`（兜底传输器 + 中转站）
 - `aria2c`（可选，多连接下载；没有就回退 curl 续传）
-- `ssh` + `~/.ssh/id_ed25519_gh`（push 通道）
+- `ssh` + `~/.ssh/id_ed25519_gh`（push 的 SSH 通道；SSH 不可用时 push 仍可走中转站）
 
 实测（本机）：`aria2c` 在 workspace-write 沙箱里会以
 `Failed to initialize WinTLS context handle` 失败，脚本会自动回退 curl，
@@ -137,7 +160,7 @@ fatal: unable to fork
 | 码 | 含义 | 典型场景 |
 |---|---|---|
 | `0` | 成功 | 下载完成并通过 SHA256、API 返回 JSON、push 成功 |
-| `1` | 参数或环境错误 | 缺 `owner/repo`、未知选项、缺 SSH 密钥、push 被服务端拒绝 |
+| `1` | 参数或环境错误 | 缺 `owner/repo`、未知选项、`--via` 取值非法、两条 push 通道都被服务端拒绝 |
 | `2` | 网络全通道失败 | 候选通道全试过仍失败；`api` 三个传输器全挂 |
 | `3` | 校验失败 / API 明确拒绝 | SHA256 不符、下到 HTML 错误页；GitHub 返回 4xx/5xx（**传输是通的**，别去查网） |
 | `4` | 受限会话 | git 无法 fork 传输进程（沙箱），clone/push/fetch 注定失败，需普通终端 |

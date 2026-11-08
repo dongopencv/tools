@@ -13,23 +13,33 @@
 | `docs/agents/` | 工程技能（matt pocock skills deck）需要的配置 |
 | `docs/network-baseline.md` | 本机出网带宽与选路规则（#4 落地） |
 | `docs/log/` | 每日状态记录：一天一行，推进了什么 / 卡在哪 / 明天第一件事 |
-| `docs/pending-issues/` | 写好但发不出去的东西：待建票草稿、待发评论、待做的收尾写操作（等身份恢复） |
+| `docs/pending-issues/` | 写好但发不出去的东西：待建票草稿、待发评论、待做的收尾写操作 |
 
 ## 本机网络限制（重要）
 
 **`github.com` 的 HTTPS（443）被墙**，直连 100% 超时。可达的只有：
 
 - `api.github.com` — `gh` CLI 走这条，不受影响
-- SSH `github.com:22` 与 `ssh.github.com:443`（2026-11-06 03:53 复测：22 端口 6/6 通、443 端口 5/6 通；当天早些时候 22 曾整段不通、443 全通）— 这是唯一的 `git push` 通道。**脚本默认走 22**（`git@github.com:owner/repo.git`），22 不通时改走 `ssh://git@ssh.github.com:443/owner/repo.git`（2026-11-07 实测 22 端口 `Connection reset` 时 443 正常）。`~/.ssh/config` 必须同时有 `Host github.com` 与 `Host ssh.github.com`（后者带 `Port 443`），否则走 443 时不带密钥、报 `Permission denied (publickey)`
+- SSH `github.com:22` 与 `ssh.github.com:443`（2026-11-06 03:53 复测：22 端口 6/6 通、443 端口 5/6 通；当天早些时候 22 曾整段不通、443 全通）— `git push` 的**主**通道。**脚本默认走 22**（`git@github.com:owner/repo.git`），22 不通时改走 `ssh://git@ssh.github.com:443/owner/repo.git`（2026-11-07 实测 22 端口 `Connection reset` 时 443 正常）。`~/.ssh/config` 必须同时有 `Host github.com` 与 `Host ssh.github.com`（后者带 `Port 443`），否则走 443 时不带密钥、报 `Permission denied (publickey)`
 
 因此：
 
-- **`git clone` / `git push` 一律用 SSH**：`git@github.com:owner/repo.git`。HTTPS 写操作在本机三条路全死（直连被墙 / 本地 8899 MITM 反代只读 / 镜像不转发写）。
+- **`git clone` / `git push` 首选 SSH**：`git@github.com:owner/repo.git`。
+  **「HTTPS 写操作三条路全死」这句 2026-11-08 已被实测推翻**：git over HTTPS **经 8899 中转站可读也可写**，
+  当时缺的只是 token 的 `Contents: Read and write`。真推临时分支 `probe-relay-push` 成功、随后 `push --delete` 删净
+  （表格见 `docs/network-baseline.md` 第四节）。现成用法：`bash tools/github.sh push <owner/repo> [ref]`，
+  默认 `--via auto` = SSH 先、失败自动回落 relay；也可 `--via relay` 强制。
+  **不需要 `http.sslVerify=false`**：本机 git 默认 `sslBackend=schannel`，信任来自 Windows 证书存储（relay 的 CA 已在里面），
+  `http.sslCAInfo` 会被静默忽略——实测给一个**不存在**的 CA 路径照样成功。token 用 `GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n`
+  环境变量注入，别写成 `git -c http.extraheader=…`（后者在 `ps` / `Win32_Process` 里可见）。
+  push 报 `403` + `Permission to ... denied` 时那是**授权问题不是链路问题**——先看响应头有没有 `X-Accepted-Github-Permissions: ...=write`，
+  补权限见 `docs/pending-issues/pat-permission-fix.md`。SSH 报 `Permission denied (publickey)` 时**先查账号上有没有公钥**
+  （2026-11-08 那天 `GET /users/dongopencv/keys` 一度为 0 个，02:38 已补回 1 个 id 169145688），别在 `~/.ssh/config` 上耗时间。
 - 所有 GitHub 操作（API / 下载 / clone / push）优先走网关脚本 `tools/github.sh`，别各处手搓 `curl`/`gh`/`git`：
   `bash tools/github.sh asset owner/repo v1.2.3 file.zip -s <sha256>`
   用法见 `tools/README.md`（#5 落地）。**只有一份实现：本仓库的 `tools/github.sh`**；`skills-vault` 里那份已于 2026-11-07 收敛成转发器（29 行；逻辑只有定位 + `exec` 那 10 行）（`exec` 到本仓库，可用 `GITHUB_GATEWAY` 覆盖路径），不再是副本、也不会再分叉。vault 里保持独立的只有凭据相关的 `setup-gh.sh` 与 `.github-token`（后者也是真身的 token fallback）。
 - `gh release download` **本身是可用的**：它走 `api.github.com` 拿 302 跳到 `release-assets.githubusercontent.com`，全程不经 github.com（实测 2.3 MB 资产秒下）。网关的价值是镜像回退 + SHA256 校验 + 断点续传，不是「gh 不能用」。
-- **`github.com` 域名的兜底是 8899 中转站**（本地 MITM 反代 → `gh-proxy.com`）：`bash tools/github.sh relay up` 后加 `--via relay`，或给任意进程塞 `HTTPS_PROXY=http://127.0.0.1:8899`。实测 15,721,375 B 资产 25 s / 612 KiB/s（同域直连是 21 s 超时）。它只代理 GitHub 家族域名、只读；登录时由计划任务 `\dsh-gh-proxy` 自启（电池模式不启动），没起就 `relay up`；细节见 `docs/network-baseline.md` 第四节。
+- **`github.com` 域名的兜底是 8899 中转站**（本地 MITM 反代 → `gh-proxy.com`）：`bash tools/github.sh relay up` 后加 `--via relay`，或给任意进程塞 `HTTPS_PROXY=http://127.0.0.1:8899`。实测 15,721,375 B 资产 25 s / 612 KiB/s（同域直连是 21 s 超时）。它只代理 GitHub 家族域名（其它域名走普通 CONNECT 隧道、不解密）；**读写都转发**（`tryUpstream` 原样转发 method 与 body，所以 push 也通）；登录时由计划任务 `\dsh-gh-proxy` 自启（电池模式不启动），没起就 `relay up`；细节见 `docs/network-baseline.md` 第四节。
 
 ## 实测网络速度（2026-11-06）
 
@@ -71,19 +81,11 @@ gh issue view 3 --json number   # 成功 = 宽策略；报 pipe: Access is denie
 - 没有批量验证 → 不管它多合理，都不要当基础件；自己写更不该当基础件。
 - 自研只允许出现在"确实没人做过"的空白处，且必须先证明空白存在（搜过、比对过、留证据）。
 
-## 凭据纪律
+## token
 
-- token 只存在 `C:\Users\Admin\.skills-vault\download\scripts\.github-token`，**不进仓库、不进 issue 正文、不进任何被 git 跟踪的文件**。
-- `.workbuddy/` 整个目录不提交。它的 `memory/` 里天然会出现明文口令、PIN、token——这类文件只该留在本机。
-- 提交前自查（**只匹配真正的凭据形状，不是散文关键词**）：
-  ```bash
-  git diff --cached | grep -nE 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|(PIN|pin|password|passwd|token)[[:space:]]*[:=][[:space:]]*[^[:space:]'"'"']{6,}'
-  ```
-  命中即为闸门失败。旧版本写的是 `grep -iE 'ghp_|pin|password|token'`——这个词表会命中 55 行正常散文
-  （"token 文件"、"PIN 码"…），等于永远失败、于是没人看，**不能当校验用**。
-- 已经泄露过的口令，删文件不够（历史提交里还在）。处置顺序：先轮换口令，再评估是否改写历史。
-- 本仓库已知的泄露面与待办见 [docs/pending-issues/credential-rotation.md](docs/pending-issues/credential-rotation.md)
-  （那份文件**只记位置与动作、不记口令值**，别在里面补明文）。
+GitHub PAT 只有一份真身：`C:\Users\Admin\.skills-vault\download\scripts\.github-token`。
+同目录 `github.env` 存 `GITHUB_TOKEN=`，`gh` 的 keyring 里也有一份，三处同一个值。
+`tools/github.sh` 优先读文件，读不到回退 `gh auth token`。换 token 就改这三处。
 
 ## Agent skills
 
@@ -135,3 +137,5 @@ single-context. See `docs/agents/domain.md`.
 不需要每天看；每天需要看的只有「等我拍板」那一段，通常不超过 7 张，真正要动手的一般是 1–2 张。
 
 判据：如果连续一周 `attention.sh` 的第 1 段都没变短，说明问题不在票多，在于**不敢做决定**。
+
+> **规则还有很多需要修改的。** 凡是能用脚本卡的（凭据闸门、提交前自查、收尾写操作），一律改成脚本，不要留在文档里当规则。

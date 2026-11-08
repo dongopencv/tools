@@ -24,7 +24,7 @@
 #   github.sh asset <owner/repo> <tag> <file> [-o FILE] [-s SHA256] [--via ...]
 #   github.sh ghdl <owner/repo> [tag] [-p PATTERN] [-D DIR]  # 委派 gh release download
 #   github.sh clone <owner/repo> [DIR]     # SSH 优先 → relay(HTTPS) → 镜像
-#   github.sh push <owner/repo> [ref]      # 只能走 SSH（HTTPS 写操作本机全死）
+#   github.sh push <owner/repo> [ref] [--via ssh|relay|auto]  # auto=SSH 失败回落中转站
 #   github.sh sshcheck                     # 验证 SSH 密钥对 GitHub 的认证
 #   github.sh raw <owner/repo> <ref> <path>
 #
@@ -36,7 +36,7 @@ set -f
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOKEN_FILE="${GITHUB_TOKEN_FILE:-$SCRIPT_DIR/.github-token}"
-# 仓库内没有 token 时回落到技能目录（token 只该存在那里，见 AGENTS.md 凭据纪律）
+# 仓库内没有 token 时回落到技能目录（token 只存在那一处）
 if [[ ! -s "$TOKEN_FILE" && -s /c/Users/Admin/.skills-vault/download/scripts/.github-token ]]; then
   TOKEN_FILE=/c/Users/Admin/.skills-vault/download/scripts/.github-token
 fi
@@ -668,11 +668,80 @@ cmd_clone() {
   die "clone 全部通道失败" 2
 }
 
-# push 只能走 SSH：HTTPS 写操作本机三条路全死
-# （直连被墙 / 8899 上游不支持写 / 镜像不转发写）。见 docs/network-baseline.md。
+# push 两条通道：SSH 与 中转站(HTTPS)。默认 auto = SSH 先，失败自动回落 relay。
+#
+# 「HTTPS 写操作本机三条路全死」是 2026-11-08 之前的结论，**已被实测推翻**：
+#   GET  /dongopencv/tools.git/info/refs?service=git-receive-pack  经 relay → 200 (1.4s)，直连 21s 超时
+#   POST /dongopencv/tools.git/git-receive-pack                    经 relay → 200
+#   真推临时分支 probe-relay-push 成功，随后 push --delete 删净
+# 原因：relay 不区分方法，把 ctx.method 与 ctx.body 原样转发（tools/relay/server.mjs tryUpstream）。
+# 前提是 token 有 Contents: Read and write；403 时响应头 X-Accepted-Github-Permissions 会点名缺哪项。
+# 详见 docs/network-baseline.md 第四节。
+
+# 中转站通道：token 经 GIT_CONFIG_* 环境变量注入，不出现在进程命令行（ps 看不到）。
+# 不需要 http.sslVerify=false —— git 在本机默认 sslBackend=schannel，信任来自 Windows
+# 证书存储（relay 的 CA 已装进去），http.sslCAInfo 会被 schannel 静默忽略。
+# 实证：给一个不存在的 CA 路径照样成功；换成 openssl 后端且不给 CA 才报
+# "unable to get local issuer certificate (20)"。
+push_relay() {
+  local repo="$1" ref="$2"
+  relay_up || { warn "中转站没在跑（bash tools/github.sh relay up）"; return 1; }
+  local tok b64 url t0 t1 rc out
+  tok=$(require_token) || return 1
+  b64=$(printf 'x-access-token:%s' "$tok" | base64 | tr -d '\r\n')
+  url="https://github.com/$repo.git"
+  info "push(relay) → $url ($ref)"
+  t0=$(date +%s)
+  out=$(GIT_TERMINAL_PROMPT=0 \
+        GIT_CONFIG_COUNT=2 \
+        GIT_CONFIG_KEY_0=http.proxy       GIT_CONFIG_VALUE_0="$RELAY" \
+        GIT_CONFIG_KEY_1=http.extraheader GIT_CONFIG_VALUE_1="Authorization: Basic $b64" \
+        git push "$url" "$ref" 2>&1)
+  rc=$?
+  t1=$(date +%s)
+  (( t1 > t0 )) && info "耗时 $((t1-t0))s"
+  [[ $rc -eq 0 ]] && { ok "push 成功（relay）"; return 0; }
+  printf '%s\n' "$out" | sed 's/^/  /' >&2
+  case "$out" in
+    *"403"*|*"Permission to"*)
+      warn "这是授权问题不是链路问题：token 缺 Contents: Read and write"
+      warn "看响应头 X-Accepted-Github-Permissions 点了哪一项；补权限见 docs/pending-issues/pat-permission-fix.md" ;;
+  esac
+  return 1
+}
+
+push_ssh() {
+  local repo="$1" ref="$2"
+  [[ -f "$HOME/.ssh/id_ed25519_gh" ]] || {
+    warn "缺 SSH 密钥 ~/.ssh/id_ed25519_gh（skills-vault 里的 setup-gh.sh 生成）"; return 1; }
+  local ssh_url; ssh_url=$(ssh_url_of "$repo")
+  info "push(ssh) → $ssh_url ($ref)"
+  local t0 t1 rc out
+  t0=$(date +%s)
+  out=$(GIT_TERMINAL_PROMPT=0 git -c core.sshCommand="ssh -o ConnectTimeout=25 -o StrictHostKeyChecking=accept-new" push "$ssh_url" "$ref" 2>&1)
+  rc=$?
+  t1=$(date +%s)
+  (( t1 > t0 )) && info "耗时 $((t1-t0))s"
+  [[ $rc -eq 0 ]] && { ok "push 成功（ssh）"; return 0; }
+  printf '%s\n' "$out" | sed 's/^/  /' >&2
+  return 1
+}
+
 cmd_push() {
-  local repo="${1:?需要 owner/repo}" ref="${2:-HEAD}" remote="${3:-origin}"
+  local -a pos=()
+  local via="auto"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --via) via="$2"; shift 2 ;;
+      -*)    die "push: 未知选项 $1（可用 --via ssh|relay|auto）" ;;
+      *)     pos+=("$1"); shift ;;
+    esac
+  done
+  [[ ${#pos[@]} -ge 1 ]] || die "push: 需要 owner/repo [ref] [remote]"
+  local repo="${pos[0]}" ref="${pos[1]:-HEAD}" remote="${pos[2]:-origin}"
   [[ "$repo" == */* ]] || die "push: 需要 owner/repo"
+  case "$via" in ssh|relay|auto) ;; *) die "push: --via 只支持 ssh|relay|auto" ;; esac
+
   local fork fork_msg; { read -r fork; read -r fork_msg; } < <(git_fork_state)
   case "$fork" in
     blocked)
@@ -681,30 +750,23 @@ cmd_push() {
       warn "这不是仓库或网络的问题，是受限会话（沙箱）禁止 git fork 子进程。"
       warn "本地提交照常可用；推送要在一个普通终端里执行："
       warn ""
-      warn "  git push $(ssh_url_of "$repo") $ref"
+      warn "  bash tools/github.sh push $repo $ref"
+      warn "  （或 git push $(ssh_url_of "$repo") $ref）"
       warn ""
       warn "要在这个会话里确认推送成功，用：github.sh api repos/$repo/commits/<sha> 对照。"
       return 4 ;;
   esac
-  [[ -f "$HOME/.ssh/id_ed25519_gh" ]] || die "push: 缺 SSH 密钥 ~/.ssh/id_ed25519_gh（先跑 setup-gh.sh——它在 skills-vault 里，不在本仓库：C:/Users/Admin/.skills-vault/download/scripts/setup-gh.sh）" 1
-  local ssh_url; ssh_url=$(ssh_url_of "$repo")
-  info "push → $ssh_url ($ref @ $remote)"
-  local t0 t1 rc out
-  t0=$(date +%s)
-  out=$(GIT_TERMINAL_PROMPT=0 git -c core.sshCommand="ssh -o ConnectTimeout=25 -o StrictHostKeyChecking=accept-new" push "$ssh_url" "$ref" 2>&1)
-  rc=$?
-  t1=$(date +%s)
-  (( t1 > t0 )) && info "耗时 $((t1-t0))s"
-  [[ $rc -eq 0 ]] && { ok "push 成功"; return 0; }
-  # 即便检测漏掉了，也把 fork 拒绝翻译成人话
-  case "$out" in
-    *"cannot create standard input pipe"*|*"unable to fork"*)
-      warn "git 无法 fork 传输进程（受限会话）。请在普通终端执行：git push $(ssh_url_of "$repo") $ref"
-      warn "$out"
-      return 4 ;;
+
+  info "push $repo $ref → $remote（通道 $via）"
+  case "$via" in
+    ssh)   push_ssh   "$repo" "$ref" || die "push 失败（--via ssh）" 1 ;;
+    relay) push_relay "$repo" "$ref" || die "push 失败（--via relay）" 1 ;;
+    auto)
+      push_ssh "$repo" "$ref" && return 0
+      warn "SSH 通道失败 → 回落中转站(HTTPS)"
+      push_relay "$repo" "$ref" && return 0
+      die "push 全部通道失败（ssh + relay）。SSH 不通先查账号上有没有公钥：github.sh api users/<owner>/keys" 2 ;;
   esac
-  printf '%s\n' "$out" | sed 's/^/  /' >&2
-  die "push 失败 (git $rc)" 1
 }
 
 cmd_sshcheck() {
@@ -752,9 +814,7 @@ cmd_raw() {
 
   # 3) curl 走镜像/中转通道
   #
-  # 凭据只发给 GitHub 自己的域名：镜像是第三方（gh-proxy / ghfast / ghproxy.net），
-  # 把 PAT 塞进它们的请求头等于把 repo/workflow/delete_repo 权限交给别人；
-  # 实测镜像对公开内容根本不需要 Authorization（无 token 照样 200 / 206）。
+  # Authorization 只发给 direct / relay；镜像是第三方，公开内容不需要它（无 token 照样 200 / 206）。
   local ck cu auth=()
   while IFS='|' read -r ck cu; do
     [[ -z "$ck" ]] && continue

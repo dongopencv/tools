@@ -109,7 +109,18 @@ GitHub
 
 - **该用**：要碰 `github.com` 本体（release 直链、HTTPS clone）的兜底；某个镜像域名抽风时，换这条链往往立刻可用。
 - **别用**：`api.github.com` 直连本来通且更快——`gh` / `github.sh api` 塞代理是白绕一圈、多付一次 MITM。
-- **做不到**：写。上游镜像不转发 push，`git push` 仍只走 SSH（22 或 443，见第三节）。
+- **写：能，2026-11-08 实测推翻了旧结论。** 旧版这里写「做不到——上游镜像不转发 push」。错在把两个不同的东西混成一个：`git push` 经 relay 时，relay **不是**去求镜像站转发，而是自己把请求原样转给 `https://github.com`（`buildUpstreamUrl` 里 mirror 前缀只在配置了才拼）。实测：
+
+  | 请求 | 直连 | 经 8899 relay |
+  |---|---|---|
+  | `GET /dongopencv/tools.git/info/refs?service=git-receive-pack` | ❌ 21.09 s，http 000 | ✅ 200 / 413 B / 1.40 s，返回真实 ref `cc27875a…` |
+  | `POST /dongopencv/tools.git/git-receive-pack`（body `0000`） | ❌ 21.05 s，http 000 | ✅ 200 / 0 B / 1.74 s |
+  | 真推临时分支 `probe-relay-push` | — | ✅ `* [new branch]`，随后 `push --delete` 删净 |
+  | `bash tools/github.sh push … --via relay` | — | ✅ 5 s，`[ok] push 成功（relay）` |
+
+  前提是 token 有 **Contents: Read and write**；403 时响应头 `X-Accepted-Github-Permissions` 会点名缺哪项——**那是授权问题不是链路问题**，别再去调网络。
+- **只要 `http.proxy`，不要 `http.sslVerify=false`**：git 在本机默认 `http.sslBackend=schannel`，信任来自 Windows 证书存储（relay 的 CA 已装进去）。实测：给一个**不存在的** `http.sslCAInfo` 路径照样成功（schannel 静默忽略该配置）；只有显式 `http.sslBackend=openssl` 且不给 CA 时才报 `unable to get local issuer certificate (20)`，那时才需要 `http.sslCAInfo=C:/Users/Admin/dsh-mirror-proxy/certs/ca.crt.pem`。**关校验是多余的，也是不必要的安全损失。**
+- **token 不进命令行**：用 `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` 环境变量注入 `http.extraheader`，别用 `git -c http.extraheader=…`（后者会出现在进程命令行，`ps`/`Get-CimInstance Win32_Process` 可直接读到）。`cmd_push` 的 `push_relay()` 已按这个写法实现。
 
 ### 改这个服务时的两个坑（都踩过）
 
@@ -120,13 +131,13 @@ GitHub
 
 | 场景 | 走哪条 | 判据 |
 |---|---|---|
-| 代码 / 文档提交 | `git push` 走 SSH（默认 22 端口 `git@github.com:owner/repo.git`，22 不通改 `ssh.github.com:443`） | 单次 < 10 MB |
+| 代码 / 文档提交 | `bash tools/github.sh push <owner/repo> [ref]` —— 默认 `--via auto`：SSH 先（22 端口，不通自动改 `ssh.github.com:443`），失败回落中转站 HTTPS。也可强制 `--via ssh` / `--via relay` | 单次 < 10 MB。SSH 报 `Permission denied (publickey)` 时先查账号上有没有公钥（`github.sh api users/<owner>/keys`），别改 `~/.ssh/config`；relay 报 403 是 token 缺 Contents:write，别当网络问题 |
 | 仓库单次 push 总量 | 尽量 ≤ 20 MB | 上行 150 KB/s 时约 2.3 分钟；超过就该拆 |
 | **> 50 MB 的产物** | **release 资产，禁止 git push** | 50 MB ÷ 150 KB/s ≈ 5.7 分钟，且失败要重传整包；release 支持断点与校验 |
 | 下载 release 资产 / raw | `bash tools/github.sh asset\|raw ...` | 走镜像选路 + SHA256 校验 |
 | 拉别的仓库做只读分析 | `bash tools/github.sh clone owner/repo` | SSH 优先，回退镜像 |
 | 大文件（>50 MB）取回 | `tools/github.sh download <url> -s <sha256>` | aria2c 多连接，断点续传 |
-| GitHub 域名直连失败时的兜底 | `bash tools/github.sh relay up` 后 `--via relay` 或设 `HTTPS_PROXY=http://127.0.0.1:8899` | 见第四节；只对 GitHub 域生效 |
+| GitHub 域名直连失败时的兜底 | `bash tools/github.sh relay up` 后 `--via relay` 或设 `HTTPS_PROXY=http://127.0.0.1:8899` | 见第四节；只对 GitHub 域生效。**读写都走这条**（push 也行） |
 
 20 MB push 的预估耗时（按上行 150 KB/s）：**约 2.3 分钟**（实测早先记录 1.5–2.5 分钟，一致）。
 **切 release 资产的判据**：单个文件 > 50 MB，或一次 push 预计超过 5 分钟——即总量 > 45 MB。
