@@ -137,11 +137,13 @@
 
 ## 四、链与状态类
 
-### R-17 `chainLimit` 阻塞正常续作 【中】
-默认 8。长任务需要 >8 次交接时，第 9 次只写文档不开会话 → **自动续作停摆**。
+### R-17 链到顶后自动续作停摆 【中·v1.2 已缓解】
+默认 `maxAutoHops=8`。长任务需要 >8 棒时，第 9 棒只写文档不开会话。
 
-**风险**：用户可能不知道发生了什么。
-**建议**：超限时应输出显式提示（当前只有 `logWarn`）。
+**v1.2 之前**：只有一行 `logWarn`，用户在 GUI 里看不出发生了什么（实测新开会话的 title 7/7 全为 null）。
+**v1.2 之后**：三件事同时做——文档 `## 未决问题` 写死「自动续作已到第 N/M 棒，需人工 /handoff」、
+会话标题改名 `[链到顶 N/8] <原标题>`、占位落 `stopped{stoppedReason:'chain-limit'}` + `chains/<root>.json` 标 `stopped:true`。
+**剩余风险**：到顶仍是「停」而不是「继续」——长任务跑过 8 棒就得人工接手一次。这是有意的（成本与可观察性），不是缺陷。
 
 ---
 
@@ -153,10 +155,11 @@ JSON 解析失败 → `readChainState` 返回空 Map → 所有会话 `depth` �
 
 ---
 
-### R-19 多进程同时写 `state.json` 【中】
-两个 DSH 实例（不同 profile 同机）会争抢同一文件。
+### R-19 多进程同时写账本文件 【中】
+两个 DSH 实例（不同 profile 同机）会争抢 `claims.json` / `state.json` / `chains/<root>.json` / `events.jsonl`。
 
-**当前无锁**。最后写入者赢，可能丢失对方的 depth 记录。
+**当前无锁**（写入是 `.tmp` + `rename`，原子但非互斥）。最后写入者赢，可能丢失对方的 depth 记录。
+**缓解**：占位是「宁严勿松」——丢了记录最多多交接一次，不会无限续作（chain.json 的 `limit` 与 `stopped` 会在下一棒重建）。
 
 ---
 
@@ -260,7 +263,9 @@ ISSUES I-2：代码改路径，测试没改，产生假失败。
 ---
 
 ### R-36 只测离线桩，未测真实宿主 【中·ISSUES O-6】
-50 条断言全用假 ctx。真实 Cordis 上下文的行为差异未覆盖——**v1.1.2 的第四个截断源（maxTokens 1200）就是只有真宿主 e2e 才暴露的**，见 ISSUES.md I-11。
+71 条断言全用假 ctx。真实 Cordis 上下文的行为差异未覆盖——**v1.1.2 的第四个截断源（maxTokens 1200）就是只有真宿主 e2e 才暴露的**，见 ISSUES.md I-11。
+
+v1.2 又加了一层：`tools/handoff-check.mjs --deep` 能在**不重启宿主**的前提下读现网证据（代码版本、占位状态、日志噪声、三件套产物、简报送达），但它只验「做了什么」，验不到「模型拿到之后有没有照着做」。
 
 ---
 
@@ -298,11 +303,12 @@ ISSUES I-2：代码改路径，测试没改，产生假失败。
 
 1. `grep -n "enforceMidTurn" lib/index.js` — 三处都在吗？（R-1）
 2. `cordis_inspect_query(Event)` — 两个事件名还在吗？（R-2）
-3. `cordis_inspect_query(Config, include:auto-handoff)` — 17 个字段都在 schema 里吗？（DEFAULTS 17 项，见 §R-1）
+3. `cordis_inspect_query(Config, include:auto-handoff)` — 23 个字段都在 schema 里吗？（DEFAULTS 23 项，见 §R-1）
 4. `list_plugins` — `fiberPhase` 是 `active` 吗？
-5. `cat ~/.dsh/auto-handoff/state.json` — JSON 合法吗？（R-18）
+5. `cat ~/.dsh/auto-handoff/{claims.json,state.json}` — JSON 合法吗？（R-18）；`tail -3 ~/.dsh/auto-handoff/events.jsonl` — 最近一条事件是哪一类？
 6. `/handoff-status` — 读数合理吗？
-7. `node --test test/*.test.mjs` — 50 条断言还过吗？（R-34）
+7. `node test/{integration,chain,claims,docs,goal,midturn}.test.mjs` — 71 条断言还过吗？（R-34）
+8. `node tools/handoff-check.mjs --deep` — 现网体检 0 FAIL 吗？
 
 ---
 
@@ -315,7 +321,37 @@ ISSUES I-2：代码改路径，测试没改，产生假失败。
 | 中 | 15 | R-3~R-7, R-10, R-14, R-16~R-19, R-23~R-25, R-29, R-30, R-31, R-35, R-36, R-39 |
 | 低 | 5 | R-12, R-13, R-15, R-20, R-21, R-40 |
 
-**最该先处理的三条**：R-32（源码分裂）、R-33（无版本控制）、R-21（账本缺失时的错误降级方向）。
+**最该先处理的三条**：R-42（tokenMeter 读数无法离线复算，阈值只能按同一把尺子量）、
+R-43（L2 模型审只留配置未实现）、R-44（阈值绝对值仍无实据，13/20 次样本）。
+
+---
+
+## 十一、v1.2 新增风险
+
+### R-41 分支顺序是隐式契约 【中·已有测试把守】
+`chain-limit` 既是「到顶」判据，也是 block 规则之一。若 REVIEW block 分支排在链到顶之前，
+到顶那一棒落 `failed`（可重试）而永远到不了终态 `stopped`——`maxAutoHops` 形同虚设。
+现在顺序固定为 链到顶 → REVIEW block → 并发 deferred，由 integration「链到顶三件事」断言把守
+（同一次运行 `created.length === 0` 且占位 `stopped`）。
+**风险**：后续重构若调换分支顺序，测试会红——这是有意的，不要为了「代码更好看」去调它。
+
+### R-42 `tokenMeter` 的读数无法离线复算 【高·认知风险】
+语义是「请求+响应压力」，含回放与路由定价。实测 6 份会话的 `logged` / `textChars/4` / `Σ(in+out)` / `Σtotal`
+四种算法**两两都对不上**。所以 `tokenThresholdRatio` 只是「按同一把尺子量」，不是精确窗口占用。
+**必须显式告知**：看到「45%」不要理解成「上下文用掉 45%」。
+
+### R-43 L2 模型审只留配置未实现 【低】
+`modelReview` 默认 `false` 且未接线。想开的人会发现配置项存在但没效果。
+**建议**：v1.3 要么接线，要么从 schema 里去掉——「配置项存在但无用」比「没有这个配置项」更糟。
+
+### R-44 阈值绝对值仍无实据 【中】
+真实交接样本 13 次（`handoff-metrics --verify` 第 ⑦ 条门槛 20）。默认 0.45 是起点不是结论。
+**建议**：满 20 次后跑一遍 `node tools/handoff-metrics.mjs --verify` 看建议行再定。
+
+### R-45 同 cwd 并发判定靠占位推断 【中】
+插件读不到别的会话「当前轮是否在跑」，只能数 `state ∈ {genesis, inflight}` 的同伴棒。
+**后果**：`maxConcurrentHops` 是近似，不是精确信号量；`deferred` 的 `deferredUntil` 过期后可能同时有多棒一起重试。
+**缓解**：`deferred` 是非终态，多棒同抢时会各自重新判一次并发，最终仍受上限约束（不会无界）。
 
 ---
 

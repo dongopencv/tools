@@ -1,8 +1,9 @@
 # dsh-auto-handoff · 设计方案
 
-> 状态：v1（2026-11-06）
+> 状态：v1.2（2026-11-08）
 > 对应需求：`REQUIREMENTS.md`
-> 对应源码：`lib/index.js`（1360 行，2026-11-08 实测 `wc -l`）
+> 对应源码：`lib/index.js`（2347 行）、`lib/claims.js`（209 行）、`lib/docs.js`（182 行），2026-11-08 实测 `wc -l`
+> 配套脚本：`tools/handoff-check.mjs`（现网体检）、`tools/handoff-metrics.mjs`（用真实数据反推阈值）
 
 ---
 
@@ -106,18 +107,27 @@ grep -n "export const inject" lib/index.js  # ['commands', 'sessions']
 performHandoff(session, trigger, signal)
   │
   ├─ 1. resolveSessionCwd(ctx, session)      工作目录（workingDirectory → header.cwd → process.cwd）
-  ├─ 2. measureTokens(ctx, session)          token 压力（失败返回 0）
-  ├─ 3. collectFacts(session, maxFiles)      从日志抽事实
+  ├─ 1. resolveSessionCwd(ctx, session)      工作目录（workingDirectory → header.cwd → process.cwd）
+  ├─ 2. measureTokens(ctx, session)          token 压力，返回 {tokens, reason}；reason 非空 = 读数不可信
+  ├─ 2b. effectiveTokenThreshold(...)        阈值 = 绝对值 或 ratio × requestContext().contextWindow
+  ├─ 3. collectFacts(session, maxFiles)      从日志抽事实（注入判据：data.source.kind 优先）
   ├─ 4. resolveTitle(ctx, session)           会话标题
-  ├─ 5. chainFor(sessionId)                  读链深度（优先 claims.json，回退 state.json）
-  ├─ 6. requestModelSummary(...)             模型摘要（失败→undefined）
-  ├─ 7. renderDoc(...) + clampText(docMaxChars)
-  ├─ 8. mkdir + writeFile(docPath)
-  ├─ 9. if (depth > chainLimit) return       只写文档，不续作
+  ├─ 5. chainFor(sessionId) + countActiveHops 链深度（claims 优先，回退 state.json）+ 同 cwd 同伴棒
+  ├─ 6. requestModelSummary(...)             模型摘要（失败→兜底摘要，兜底必须自带「## 下一步」节）
+  ├─ 7. reviewHandoff(...)                   三条 block 规则，verdict ∈ ok / warn / block
+  ├─ 8. renderIndex + renderFacts + renderDoc 三份产物（index.md / facts.jsonl / full.md）
+  ├─ 9. mkdir + 三个 writeFile               ← 这里之前已经落盘，下面任一分支都能查
+  ├─ 9a. if (nextDepth > maxAutoHops)        → stopped + rename + chain.json.stopped（必须排在 9b 之前）
+  ├─ 9b. if (review.blocked)                 → failed{review-block} + rename，不建会话
+  ├─ 9c. if (siblings >= maxConcurrentHops)  → deferred{deferredUntil} + rename，下一轮自动重试
   ├─ 10. sessionController.create({cwd, agentPreset})
-  ├─ 11. sessionController.prompt({mode:'queue', 文档全文})
-  └─ 12. 更新 claims.json（prompt 之前先写 inflight，失败写 failed）
+  ├─ 11. sessionController.prompt(request, AbortSignal)  简报首行是链元信息
+  └─ 12. 更新 claims.json（prompt 之前先写 inflight，失败写 failed + rename 孤儿，成功写 done/genesis）
 ```
+
+**9a / 9b / 9c 的顺序是有约束的，不能换**：`chain-limit` 本身就是一条 block 规则，若 9b 排在前面，
+到顶那一棒会先落 `failed`（可重试）而永远到不了正确的终态 `stopped`。这条顺序有专门的回归测试
+（`test/integration.test.mjs` 的「链到顶三件事」）。
 
 ### 4.1 事实抽取（`collectFacts`）
 
@@ -196,7 +206,8 @@ const created = await controller.create(preset === undefined ? { cwd } : { cwd, 
 
 | 缺失/异常 | 检测点 | 行为 | 测试 |
 | --- | --- | --- | --- |
-| `tokenMeter` | `measureTokens` try/catch | 返回 0，靠工具计数 | — |
+| `tokenMeter` | `measureTokens` try/catch | 返回 `{tokens:0, reason}`，靠工具计数；`reason` 会进 `gate/skip` 事件与 `/handoff-status` | integration「tokenMeter 缺失」 |
+| `requestContext` 无窗口 | `contextWindowOf` | 比例阈值按 `FALLBACK_CONTEXT_WINDOW`(1,000,000) 算并在日志标明 | integration「比例阈值」 |
 | `sessionController` | `performHandoff` 早退 | 只写文档 + 撤回占位 | AC-7 |
 | `llm` | `requestModelSummary` 早退 | 本地兜底摘要 | AC-4 |
 | 模型摘要超时 | `AbortSignal.timeout` | 本地兜底摘要 | — |
@@ -204,30 +215,45 @@ const created = await controller.create(preset === undefined ? { cwd } : { cwd, 
 | 摘要空串 | `text === ''` | 本地兜底摘要 | — |
 | `sessionTitle` | try/catch | `会话 <id 前8位>` | — |
 | `workingDirectory` | try/catch | `header.cwd` → `process.cwd()` | — |
-| 链深度超限 | `depth > chainLimit` | 只写文档 | AC-5 |
+| 链深度超限 | `nextDepth > maxAutoHops` | 只写文档 + 占位 `stopped` + 标题改名 + `chain.json.stopped` | integration「链到顶三件事」 |
+| REVIEW 判 block | `review.blocked` | 不建新会话，父会话 `failed` + 标题改名，等人工 | integration「REVIEW block」 |
+| 同 cwd 并发超限 | `siblings >= maxConcurrentHops` | 落 `deferred` + 标题改名，`deferredUntil` 后自动重试 | integration「并发 deferred」 |
+| 简报投递失败 | prompt 抛错 | 子会话进 `chain.json.orphans[]` 并改名 `[孤儿·无简报]`，**不 cancel** | integration「孤儿会话」 |
 | 任何监听器异常 | 最外层 try/catch | `logWarn` 吞掉 | AC-7 |
 
 ---
 
 ## 7. 配置设计
 
-12 个配置项，全部有默认值，全部可经 schemastery schema 校验：
+23 个配置项，全部有默认值，全部可经 schemastery schema 校验：
 
 | 键 | 类型 | 默认 | 语义 |
 | --- | --- | --- | --- |
-| `enabled` | boolean | `true` | 总开关；false 时不注册任何监听 |
-| `tokenThreshold` | int ≥1000 | `300000` | token 压力阈值 |
+| `enabled` | boolean | `true` | 总开关；false 时不注册任何监听（只留 `/handoff-status`） |
+| `tokenThreshold` | int ≥0 | `0` | token 压力**绝对值**；非 0 则优先于比例并打 warn |
+| `tokenThresholdRatio` | num 0.1–0.95 | `0.45` | 按 `requestContext().contextWindow` 的比例触发 |
 | `toolCallThreshold` | int ≥5 | `80` | 工具调用阈值 |
-| `handoffDir` | string | `.dsh/handoff` | 文档目录（相对 cwd） |
+| `handoffDir` | string | `.dsh/handoff` | 产物目录（相对 cwd），三份文件在 `<sessionId>/` 下 |
 | `modelSummary` | boolean | `true` | 是否用模型写摘要 |
-| `chainLimit` | int ≥1 | `8` | 续作链深度上限 |
-| `summaryMaxChars` | num ≥400 | `1600` | 摘要字符上限 |
-| `docMaxChars` | num ≥1000 | `6000` | 文档字符上限 |
+| `maxAutoHops` | int ≥1 | `8` | 自动续作链最多几棒（`chainLimit` 是旧名，仍认） |
+| `maxConcurrentHops` | int ≥0 | `2` | 同 cwd 同时最多几棒在跑 |
+| `concurrentWindowMs` | num ≥60000 | `1800000` | `deferred` 多久后自动重试 |
+| `summaryMaxChars` | num ≥400 | `1600` | 摘要字符上限（与 token 预算成函数关系，见 §2026-11-08 第三轮） |
+| `briefMaxChars` | num ≥1000 | `6000` | 注入的 `index.md` 硬上限 |
+| `briefTargetChars` | num ≥500 | `3000` | `index.md` 目标长度，超了从最末非必留小节往前丢 |
+| `goalMaxChars` | num ≥400 | `4000` | 「原始目标」还原上限 |
 | `summaryTimeoutMs` | num ≥5000 | `45000` | 摘要超时 |
 | `maxTrackedFiles` | int ≥1 | `40` | 文件列表上限 |
 | `summaryProvider` | string | `''` | 摘要 provider（空=自动） |
 | `summaryModel` | string | `''` | 摘要 model（空=自动） |
 | `enforceMidTurn` | boolean | `true` | 轮中硬兜底开关 |
+| `claimTtlMs` | num ≥60000 | `86400000` | `inflight` 占位多久算死 |
+| `retryCooldownMs` | num ≥0 | `600000` | `failed` 后多久能重试 |
+| `maxAttempts` | int ≥1 | `3` | `failed` 自动重试次数上限 |
+| `cancelParentAfterHandoff` | boolean | `true` | 交接成功后 cancel 父会话当前轮（保留 inbox） |
+| `modelReview` | boolean | `false` | L2 模型审：只留配置，v1.2 未实现 |
+| `reviewBlockOn` | string[] | `['no-goal','no-next-step','chain-limit']` | 哪些 L1 规则判 block |
+| `toolErrorWarnRatio` | num 0.05–1 | `0.2` | 工具报错占比超过它就 warn |
 
 ---
 
@@ -247,14 +273,15 @@ const created = await controller.create(preset === undefined ? { cwd } : { cwd, 
 
 **这个修复曾经丢失过**，导致 `chainDepth` 用例假失败（写到了工作区却读用户主目录）。恢复记录见 `ISSUES.md` I-2。
 
-### 8.3 50 条断言 / 5 个文件
+### 8.3 71 条断言 / 6 个文件
 
 | 文件 | 断言数 | 覆盖 |
 | --- | --- | --- |
-| `test/integration.test.mjs` | 16 | 轮末闸 AC-1 ~ AC-9，外加「下一步」的三道截断闸、`cancelParentAfterHandoff` 三态、只有 reasoning + tool-call 块时也取得到正文（I-13） |
+| `test/integration.test.mjs` | 23 | 轮末闸 AC-1 ~ AC-9、「下一步」的四道截断闸、`cancelParentAfterHandoff` 三态、只有 reasoning + tool-call 块时也取得到正文（I-13）；v1.2 新增：链到顶三件事、REVIEW block（不建会话）、并发 deferred、孤儿 rename、简报首行链元信息、比例阈值、tokenMeter 降级事件、`claim/settle` 十一键与闸门计数 |
 | `test/midturn.test.mjs` | 7 | 轮中闸 AC-10 ~ AC-13，外加「已交接会话继续跑时只留一条证据行」「被 inflight 拦下后占位放开仍能交接（I-12）」「被拦日志按会话+原因去重」 |
-| `test/chain.test.mjs` | 8 | 链深推进、`chainLimit` 到顶落 `stopped`、最新一棒不是 `done` |
-| `test/claims.test.mjs` | 10 | 占位四态与 TTL/冷却/次数、落盘读回、坏文件降级 |
+| `test/chain.test.mjs` | 8 | 链深推进、`maxAutoHops` 到顶落 `stopped`、最新一棒不是 `done` |
+| `test/claims.test.mjs` | 10 | 占位六态（含 `genesis`/`deferred`）与 TTL/冷却/次数、落盘读回、坏文件降级 |
+| `test/docs.test.mjs` | 14 | `clampSectionBody` 按行边界 + 尾注行数反算、`renderIndex` 六节顺序与两级裁剪、`renderFacts` 逐行可 parse、`renderBriefMeta`/`stripBriefMeta` 往返 |
 | `test/goal.test.mjs` | 9 | `unwrapGoal` 的下钻 / 防环 / 截断 / 降级：单跳、6 层多跳、注入副本被截断时靠读盘救回、相邻两棒同形不误判成环、真环 A→B→A 能停、文档缺失退回正文、`goalMaxChars` 截断、`DEFAULTS` 与 `resolveOptions` 默认值、端到端文档不含简报壳（I-14） |
 
 轮中闸的核心是**只灌 `session/event`、完全不发 `turn-stopping`**，模拟"这一轮永远不结束、模型完全不理规则"。
@@ -272,6 +299,10 @@ const created = await controller.create(preset === undefined ? { cwd } : { cwd, 
 | 进程重启后工具计数清零 | 内存 Map | 该会话的轮中闸失效，轮末闸仍有效 |
 | 不解决缓存失效 | 属另一故障域 | 见 `REQUIREMENTS.md §1.4` |
 | 子代理会话不统计 | `origin === 'subagent'` 跳过 | 子代理的消耗不受本插件管 |
+| `tokenMeter` 的读数无法离线复算 | 语义是「请求+响应压力」，含回放与路由定价 | 比例阈值只是「同一把尺子」，不是精确窗口占用；实测四种算法两两对不上 |
+| 同 cwd 并发判定靠占位状态推断 | 插件读不到别的会话「当前轮是否在跑」 | 只能数 `state ∈ {genesis, inflight}` 的同伴棒，不是精确并发数 |
+| L2 模型审未实现 | 默认 `modelReview:false` | 想开的人会发现配置项存在但没接线（v1.3 候选） |
+| 阈值绝对值仍无实据 | 真实交接样本 13 次（门槛 20） | 默认 0.45 是「按同一把尺子量」的起点，不是结论 |
 
 ---
 
@@ -279,11 +310,12 @@ const created = await controller.create(preset === undefined ? { cwd } : { cwd, 
 
 按收益排序：
 
-1. **加结构化日志**（`handoff/trigger`、`handoff/skip`、`handoff/done`），供后续用真实使用数据定阈值。见 `ISSUES.md` 待办。
-2. **启用 `compaction-basic`**，与换会话互补，解决窗口上限。
+1. ~~加结构化日志~~（v1.2 已完成：`events.jsonl` 九类事件）。剩下的是**攒够样本后用真实数据定阈值**——`node tools/handoff-metrics.mjs --verify` 第 ⑦ 条要求 ≥20 次真实交接。
+2. **启用 `compaction-basic`**，与换会话互补，解决窗口上限（不冲突：压缩保留会话、换会话清零，两者叠加）。
 3. **缓存命中率观测**（只观测不动作），验证 §1.2 的假设。
-4. **整合"压缩 + 归档 + 开新会话"**为一个可配置流水线。
-5. **审核环节**：新会话首轮对上一棒做"需求核对 + 发散提问"，见用户 4 条优先级中的第 3 条后半。
+4. ~~整合"压缩 + 归档 + 开新会话"为一个可配置流水线~~（v1.2 已完成前三段；压缩仍归 billionaire-context）。
+5. ~~审核环节~~（v1.2 已完成 L1 确定性 REVIEW 与 block；L2 模型审待实现）。
+6. **一旦有第二个工作区用起来**，把 `claims.json` 的并发判定换成读 `chains/<root>.json`（现在是冷热分离的权宜）。
 
 ---
 
@@ -407,3 +439,56 @@ v1.1.4 修好了「最近的助手输出」恒为空（I-13），但**「原始�
 一直没有报错——它只是**装着别人家的文档**。凡是「把上游产物当成下游输入」的地方，都要问一句：
 这份输入是原话，还是上一跳的转述？
 
+## 2026-11-08 第六轮修订（v1.2.0）
+
+这一轮不是修 bug，是把地图 #12 里四张定稿票（#29 文档结构 / #17 REVIEW / #18 链与并发 / #20 日志与阈值）
+一起落地。四条都来自实测，不是设计推演：
+
+1. **文档从「一份」变成「三份」。** 旧实现只有 `<sessionId>.md` 一份，落盘与注入是同一份内容的不同裁剪。
+   实测病根不是「字太多」，而是**最贵的内容排在最后、被 6000 字硬截断从尾部砍掉**：
+   `## 触及的文件` 一节独占 1611–1856 字符（40 条路径），而 `session-305b0163`（总长 7544）与
+   `session-5c7d8966`（总长 7540）的「进度与下一步」只剩 **73 / 77 字符**——新会话拿到的「下一步」是半句话。
+   修法：拆成 `index.md`（注入，六节顺序即裁剪优先级，裁剪落节边界）/ `facts.jsonl`（不注入，按需查）/
+   `full.md`（人看，八节原样）。结构参照 Claude Code auto memory 的 `MEMORY.md`（索引注入、主题文件按需读）
+   与 claude-mem 的三段渐进检索（紧凑索引 ~50–100 token/条 → 时间线 → 全文 ~500–1000 token/条）。
+   设计含义：**注入预算是有限的，所以要显式规定「先牺牲谁」**；不能用「整体截断」代替优先级。
+
+2. **REVIEW 的 block 从「不可达」变成真能刹车。** 旧实现 `reviewHandoff` 有六条规则，全是 warn/info，
+   `const blocking = items.filter(i => i.level === 'block')` 恒为空——`grep -c "add('block'" lib/index.js` = **0**，
+   日志里 `REVIEW block` 0 次、`REVIEW ok` 0 次、`REVIEW warn` 6 次。也就是说「判不通过怎么办」此前**根本没有触发路径**。
+   修法：三条 block 规则（没有原始目标 / 摘要里没有可执行的下一步 / 链已到顶）+ 判 block 时不建新会话，
+   父会话落 `failed{note:'review-block'}`、标题改名 `[REVIEW 未通过]` 等人工。
+   附带一个教训：`no-next-step` **不能只判标题存在**——模型会写 `## 下一步` 然后跟一句「继续」。
+   现在看的是 `nextStepSubstance()`（去掉列表符号与空白后的正文长度 < 2 才算没有），阈值定 2 是因为
+   先用 5 试过，「1. 跑一遍测试」只有 5 字，会把正常交接全判 block。
+
+3. **链条的可见性。** 实测同 cwd 19 分钟内发生 6 次交接、合计 3,762,211 tokens，6 个父会话全都还活着；
+   新开的 7 个 root 会话 header 的 `title` **7/7 全为 null**——人在侧栏看到的是一排一模一样的「新会话」。
+   修法：到顶三件事（文档写死「已到第 N/M 棒」+ 标题改名 `[链到顶 N/8]` + 占位 `stopped`），
+   并发超限落 `deferred` 并改名 `[排队交接 N/M]`，孤儿会话改名 `[孤儿·无简报]`，
+   简报首行加链元信息 `链：第 N 棒 / 上限 M ｜ 根 <root> ｜ 触发 <trigger>（X/Y）｜ 同伴棒：K 个`。
+   设计含义：**自动运行的系统必须把状态写在人能看见的地方**（标题、文档、事件），否则出问题时
+   唯一的症状是「它好像又开了个会话」。**「看不见」和「没发生」在排障时完全等价。**
+
+4. **阈值从写死变成按窗口比例，同时把读数可信度显式化。** 旧实现 `tokenThreshold=300000`，
+   而本机模型窗口实测 1,000,000——等于 30% 就满足。实测交接时窗口占比 p25 45% / p50 66% / max 84%，
+   说明**真正把交接推迟到 45–84% 的是「轮末才检查」这个时机，不是阈值**。改成 `tokenThresholdRatio × contextWindow`（默认 0.45）。
+   同时 `measureTokens` 从「任何异常 return 0、零留痕」改成返回 `{tokens, reason}`，不可信时写
+   `gate/skip` 事件并在 `/handoff-status` 打「⚠️ token 读数不可信」。
+   设计含义：**静默降级比报错更危险**——它会让人以为闸门在工作，实际上只剩一半。
+
+5. **日志双轨。** 人读 `.log` 保持可读，机读 `events.jsonl` 九类事件（`gate/skip`、`gate/fire`、`doc/write`、
+   `review/verdict`、`session/create`、`prompt/deliver`、`claim/settle`、`chain/limit`、`error`），
+   5 MiB 轮转留 5 份。`gate/skip` **每会话首次才记**——旧实现每次工具调用一行，实测 1454 / 1468 行是噪声（98.8%），
+   真触发只有 3 次。`claim/settle` 的 done 条目记**闸门实值**（`toolCallCounts.get(id)`）而不是 `facts.toolCalls`
+   （历史累计），否则日志里的「N 次工具调用」与判定用的那个数永远对不上，等于没法复盘。
+
+### 一个必须记住的分支顺序约束
+
+`chain-limit` 既是「到顶」的判据，也是三条 block 规则之一。如果 REVIEW block 分支排在链到顶分支前面，
+到顶那一棒会先命中 block 落 `failed`（可重试），正确的终态 `stopped` 就**永远不可达**，
+`chainLimit` 依旧形同废纸。现在顺序固定为：**链到顶 → REVIEW block → 并发 deferred → 缺 controller 降级**，
+并由 `test/integration.test.mjs` 的「链到顶三件事」断言把守（同一次运行里 `created.length === 0` 且占位是 `stopped`）。
+
+教训：**同一个条件被两个分支同时消费时，先命中的那个决定终态**。凡是「终态」与「可重试态」共用一条判据，
+都要检查分支顺序，而不是只检查条件本身。

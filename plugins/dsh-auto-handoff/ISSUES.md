@@ -1,6 +1,6 @@
 # dsh-auto-handoff · 问题清单（需要修复的问题）
 
-> 状态：v1（2026-11-06）
+> 状态：v1.2（2026-11-08）
 > 分三类：**I = 已修复的历史缺陷**、**O = 当前仍存在的开放问题**、**R = 风险（见 RISKS.md）**
 
 ---
@@ -292,7 +292,7 @@ session-5ddd6bb5: toolCalls=80 toolErrors=1 injected=5 files=40  recentAssistant
   链根 `session-74352d08` 保持 1489 / 13（本来就对）。下钻 6 跳：`e6711e9b → 5ddd6bb5 → 6f3c471f → 9ee68a8f → 87b7046c → 138525f5 → 74352d08`。
 - 离线：新增 `test/goal.test.mjs` 9 条断言（单跳 / 6 层多跳 / 注入副本被截断时靠读盘救回 / 相邻两棒同形不能误判成环 /
   真环 A→B→A 能停 / 文档被删时退回正文 / `goalMaxChars` 截断 / `DEFAULTS` 与 `resolveOptions` 的默认值 /
-  端到端生成的文档里该节不含简报壳且清单不丢）。`node --test test/*.test.mjs` = 5 文件 50 条断言全绿。
+  端到端生成的文档里该节不含简报壳且清单不丢）。当时 5 文件 50 条断言全绿（v1.2 起为 6 文件 71 条）。
 
 **与 E 节「顺带发现的文档隐患」的关系**：E 节记录的是同一个缺陷的**观察面**（同一份文档里出现两组互斥的 REVIEW 数字，
 因为「原始目标」栏里嵌着上一棒整篇文档）。本条是它的**根因与修法**，E 节那段保留原样，作为「当时只记了症状」的证据。
@@ -359,27 +359,42 @@ plugins/dsh-auto-handoff/
 
 ---
 
-### O-4 阈值默认值缺乏实测依据 【中】
+### O-4 阈值默认值缺乏实测依据 【中·v1.2 已改为比例，绝对值仍待样本】
 
-实测数据显示 `session-0a1d53a3` 峰值单次 input 已达 **530K**，而默认 `tokenThreshold` 是 300K。理论上应在膨胀前切走，但**没有真实运行数据验证**这个阈值在日常使用中是否合适。
+实测数据显示 `session-0a1d53a3` 峰值单次 input 已达 **530K**，而旧默认 `tokenThreshold` 是 300K——本机窗口是 1,000,000，
+等于 30% 就满足。更关键的是：实测交接时的窗口占比是 p25 45% / p50 66% / max 84%，
+**真正把交接推迟到 45–84% 的是「轮末才检查」这个时机，不是阈值本身**。
 
-**建议**：先加日志（见 O-5），用真实数据定阈值。
+**v1.2 处理**：改成 `tokenThresholdRatio`（默认 0.45）× `requestContext().contextWindow`，并新增 `events.jsonl` 记下每次交接的
+`tokens / contextWindow / windowRatio`。**绝对值仍无实据**：真实交接样本只有 13 次（`handoff-metrics --verify` 第 ⑦ 条门槛 20）。
+
+**建议**：攒满 20 次真实交接后跑 `node tools/handoff-metrics.mjs --verify` 看建议行再定。
 
 ---
 
-### O-5 缺少结构化日志 【中·用户列为第 2 优先级】
-
-目前只有 `console.log/warn` 的自然语言行，无法机器统计。
+### O-5 缺少结构化日志 【已关闭 2026-11-08】
 
 用户要求："更新插件的日志，然后根据我的使用情况（日志）确定后续修复方案、需求更新方案。"
 
-**需要的字段**：`sessionId`、`trigger`（threshold/mid-turn/manual）、`tokens`、`toolCalls`、`depth`、`docPath`、`newSessionId`、`durationMs`、`summaryUsed`、`outcome`（ok/skip/fail）。
+**v1.2 落地**：新增机读轨 `~/.dsh/auto-handoff/events.jsonl`，一行一 JSON，9 类事件：
+`gate/skip`、`gate/fire`、`doc/write`、`review/verdict`、`session/create`、`prompt/deliver`、`claim/settle`、`chain/limit`、`error`。
+5 MiB 轮转留 5 份。人读的 `.log` 保持可读，两条轨互不替代。
+
+关键字段（`claim/settle` 的 done 条目）：`at`、`sessionId`、`cwd`、`trigger`、`tokens`、`contextWindow`、`windowRatio`、
+`toolCalls`、`depth`、`chainRoot`、`docPath`、`newSessionId`、`durationMs`、`summaryUsed`、`reviewVerdict`、`outcome`。
+
+两条口径纪律（都是踩过的坑）：
+1. `toolCalls` 必须记**闸门用的那个计数**（`toolCallCounts.get(id)`），不是 `facts.toolCalls`（历史累计）——
+   旧日志里两个数对不上，等于没法复盘「到底是哪个闸把它推过线的」。
+2. `gate/skip` **每会话首次才记**。旧实现每次工具调用一行，实测 1454 / 1468 行是噪声（98.8%），真触发只有 3 次。
 
 ---
 
-### O-6 未验证真实长会话 【中】
+### O-6 未验证真实长会话 【部分关闭 2026-11-08】
 
-50 条断言都是离线桩测试（v1.1.5 起含 goal 9 条）。**没有**在真实长任务上完整跑过"阈值触发 → 交接 → 新会话接续"的闭环。
+71 条断言都是离线桩测试。**已在真实宿主里跑通过一次完整闭环**（2026-11-08T02:22:18Z：
+`session-15e27dfd` → `session-0d105005`，539972 tokens / 450 calls，新会话首条 user 消息 6082 字符含「交接前 REVIEW 结论」）。
+但**长链（≥3 棒连续自动续作）仍未在真实任务里跑到过**，只有离线探针与桩件覆盖。
 
 > 补充（2026-11-08）：I-13 的验证用的是**真实会话日志回放**（`work/probe-facts-real.mjs` 喂真实 zstd 日志给真实 `collectFacts`），比纯桩件强，但仍不是端到端——它证明「事实抽取正确」，不证明「真宿主里交接文档里有这段」。
 
@@ -419,12 +434,12 @@ plugins/dsh-auto-handoff/
 
 | 优先级 | 项 | 理由 |
 | --- | --- | --- |
-| P0 | O-1 + O-3 | 源码位置未定 + 无版本控制，是丢失重演的直接风险 |
-| P1 | O-5 日志 | 用户明确的第 2 优先级，且是后续定阈值的数据来源 |
-| P2 | O-6 实机验证 | 证明闭环真的能跑通 |
-| P3 | O-7 启用压缩 | 补上窗口上限这一环 |
-| P4 | O-4 阈值调优 | 依赖 O-5 的数据 |
-| P5 | O-8 / O-9 | 待查项，不阻塞主线 |
+| ~~P0~~ | ~~O-1 + O-3~~ | **已关闭**：源码进 `plugins/dsh-auto-handoff`，随 dongopencv/tools 版本控制 |
+| ~~P1~~ | ~~O-5 日志~~ | **已关闭**：`events.jsonl` 九类事件 + 人读轨保留 |
+| P1 | O-6 长链实机验证 | 已经跑通单次闭环；连续 ≥3 棒的自动续作仍只有离线证据 |
+| P2 | O-7 启用压缩 | 补上窗口上限这一环（与换会话互补，不冲突） |
+| P3 | O-4 阈值调优 | 依赖 `events.jsonl` 攒到 ≥20 次真实交接 |
+| P4 | O-8 / O-9 | 待查项，不阻塞主线 |
 
 ---
 
@@ -497,3 +512,57 @@ plugins/dsh-auto-handoff/
 （`nextDepth=9`），届时只写文档 + 把占位落成 `stopped`（`note: 'chain-limit'`），**不会再开新会话**。
 这正是本棒出生时文首那句「交接链只剩 0 棒」的含义——不是 bug，是设计上的刹车。要接着往下走，只能人工 `/handoff`。
 
+---
+
+## F. v1.2.0 修复记录（2026-11-08）
+
+### I-15 交接文档「最贵的内容在最后被砍掉」 【已完成·原为 #29】
+
+**症状**：`session-305b0163`（总长 7544 字符）与 `session-5c7d8966`（总长 7540）的「进度与下一步」只剩 **73 / 77 字符**，
+新会话拿到的「下一步」是半句话。而 `## 触及的文件` 一节独占 1611–1856 字符（40 条路径），排在最前面。
+
+**根因**：单份文档既是落盘产物又是注入产物，注入时按 6000 字符**从尾部**整体截断——排在最后的「下一步」首当其冲。
+
+**修法**：拆三份（`index.md` 注入 / `facts.jsonl` 机读 / `full.md` 人看），`index.md` 六节**顺序即裁剪优先级**，
+裁剪落在节边界并写尾注说明还有多少行在完整文档里；超 `briefTargetChars` 时从最末非必留节往前丢并写明去处。
+
+**设计含义**：注入预算是有限的，必须显式规定「先牺牲谁」。用「整体截断」代替优先级，牺牲的永远是最后写入的那一段。
+
+---
+
+### I-16 REVIEW 的 block 在数学上不可达 【已完成·原为 #17】
+
+**症状**：`reviewHandoff` 有六条规则，日志里 `REVIEW block` 0 次、`REVIEW ok` 0 次、`REVIEW warn` 6 次。
+`grep -c "add('block'" lib/index.js` = **0**，`const blocking = items.filter(i => i.level === 'block')` 恒为空。
+
+**含义**：此前「判不通过怎么办」根本没有触发路径——不是「实现了但没测到」，是**实现里没有这条路**。
+
+**修法**：三条 block 规则（`no-goal` / `no-next-step` / `chain-limit`），判 block 时不建新会话：
+父会话落 `failed{note:'review-block'}`、标题改名 `[REVIEW 未通过]`、写 `review/verdict` 事件（`blocked:true`），等人工 `/handoff`。
+
+**踩过的坑**：`no-next-step` 第一版只判「`## 下一步` 标题存在」，模型会写标题然后跟一句「继续」——判据改成正文实质长度
+（中间版本用 `<5`，结果「1. 跑一遍测试」只有 5 字，会把正常交接全判 block；最终 `<2`）。
+
+---
+
+### I-17 自动续作的链条对人不可见 【已完成·原为 #18】
+
+**症状**：重启后 19 分钟（02:22:17→02:41:33）同一 cwd 发生 **6 次交接、合计 3,762,211 tokens**，6 个父会话全都还活着；
+新开的 7 个 root 会话 header 的 `title` **7/7 全为 null**——人在侧栏看到的是一排一模一样的「新会话」。
+
+**修法**：到顶三件事（文档写死棒号 + 标题改名 `[链到顶 N/8]` + 占位 `stopped`）；并发超限落 `deferred` 并改名 `[排队交接 N/M]`；
+孤儿会话改名 `[孤儿·无简报]`；简报首行加链元信息；新增 `chains/<root>.json` 记 `hops[]`/`orphans[]`/`stopped`。
+
+**设计含义**：「看不见」和「没发生」在排障时完全等价。自动运行的系统必须把状态写在人能看见的地方。
+
+---
+
+### I-18 `measureTokens` 静默降级 + 阈值写死 【已完成·原为 #20】
+
+**症状**：`measureTokens` 在 `ctx.get('tokenMeter')` 缺失或异常时一律 `return 0`、**零留痕**——token 闸静默失效，
+只剩工具调用闸在工作，而日志里看不出任何异常。同时 `tokenThreshold=300000` 写死，不管什么模型的窗口都是 30%。
+
+**修法**：返回 `{tokens, reason}`（`reason` 七种取值），不可信时写 `gate/skip` 事件并在 `/handoff-status` 打
+「⚠️ token 读数不可信：<reason>」；阈值改成 `tokenThresholdRatio × requestContext().contextWindow`。
+
+**设计含义**：静默降级比报错更危险——它会让人以为闸门在工作，实际上只剩一半。
