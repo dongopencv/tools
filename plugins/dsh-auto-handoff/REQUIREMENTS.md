@@ -91,7 +91,7 @@ seq 1922  input=530,354  cache=128   ← 全额重付
 | US-4 | 作为用户，我希望随时能看到离阈值还有多远 | `/handoff-status` 输出 token/工具调用/百分比 |
 | US-5 | 作为用户，我希望想切就立刻切 | `/handoff` 立即交接 |
 | US-6 | 作为用户，我希望插件不会无限自我续作 | `chainLimit` 生效，超限只写文档 |
-| US-7 | 作为维护者，我希望改动后能离线验证 | 41 条断言（chain 8 / claims 10 / integration 16 / midturn 7）可 `node` 直接跑 |
+| US-7 | 作为维护者，我希望改动后能离线验证 | 50 条断言（chain 8 / claims 10 / goal 9 / integration 16 / midturn 7）可 `node` 直接跑 |
 | US-8 | 作为用户，我不希望插件自己烧钱 | 可 `modelSummary: false` 完全零模型调用 |
 
 ---
@@ -118,9 +118,11 @@ seq 1922  input=530,354  cache=128   ← 全额重付
 ### FR-3 交接文档
 
 - FR-3.1 路径：`<会话工作目录>/.dsh/handoff/<源会话id>.md`。
-- FR-3.2 内容：YAML 头 + 五节（原始目标 / 最近指令 / 最近输出 / 触及文件 / 工具轨迹 / 进度与下一步）。
+- FR-3.2 内容：YAML 头 + 六节（进度与下一步 / 交接前 REVIEW / 原始目标 / 最近指令 / 最近输出 / 触及文件 / 工具轨迹）。
+- FR-3.2.1 「原始目标」必须是**链根**那句用户原话，不是首条 `user/message` 的原文——后者是上一棒注入的整份简报，
+  直接收录会层层嵌套。由 `unwrapGoal` 顺简报首行的文档路径读盘下钻还原（见 ISSUES I-14）。
 - FR-3.3 摘要来源：模型生成（默认）或本地兜底（`modelSummary: false` 或模型不可用）。
-- FR-3.4 上限：`docMaxChars`（6000）、`summaryMaxChars`（1600）、`maxTrackedFiles`（40）。
+- FR-3.4 上限：`docMaxChars`（6000）、`summaryMaxChars`（1600）、`goalMaxChars`（4000）、`maxTrackedFiles`（40）。
 
 ### FR-4 新会话续作
 
@@ -161,7 +163,7 @@ seq 1922  input=530,354  cache=128   ← 全额重付
 | NFR-3 | 每事件开销 O(1) | 工具计数为 Map 自增 |
 | NFR-4 | token 测量 O(surface) | `tokenMeter.measure` 每轮末各一次，可接受 |
 | NFR-5 | 零外部依赖 | 仅 `@deepseek-ai/schemastery` + Node 内置模块 |
-| NFR-6 | 可离线测试 | 41 条断言（chain 8 / claims 10 / integration 16 / midturn 7），`node --test test/*.test.mjs` 直接跑 |
+| NFR-6 | 可离线测试 | 50 条断言（chain 8 / claims 10 / goal 9 / integration 16 / midturn 7），`node --test test/*.test.mjs` 直接跑 |
 
 ---
 

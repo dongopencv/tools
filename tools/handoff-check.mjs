@@ -3,7 +3,7 @@
  * dsh-auto-handoff 现网核验：#46 的四条验收 + 交付健康度。
  *
  *   node tools/handoff-check.mjs          # 常规核验
- *   node tools/handoff-check.mjs --deep   # 另跑插件离线测试（会起 4 个 node 进程）
+ *   node tools/handoff-check.mjs --deep   # 另跑插件离线测试（每个 test/*.test.mjs 起一个 node 进程）
  *
  * 退出码：0 = 没有 FAIL；1 = 至少一条 FAIL。
  *
@@ -342,8 +342,18 @@ async function checkDelivery(limit) {
 }
 
 // 6) 可选：离线测试（chainLimit 这类只能离线验）
+// 套件清单从磁盘读，不写死：v1.1.5 新增 goal.test.mjs 时，写死的列表让 --deep 静默漏跑了一整套
+// （核验还是全绿，只是没跑）。凡是「清单」都不该有第二份。
 async function checkTests() {
-  for (const suite of ['chain', 'claims', 'integration', 'midturn']) {
+  const testDir = join(PLUGIN_DIR, 'test')
+  const suites = existsSync(testDir)
+    ? (await readdir(testDir)).filter((f) => f.endsWith('.test.mjs')).map((f) => f.replace(/\.test\.mjs$/, '')).sort()
+    : []
+  if (suites.length === 0) {
+    record('WARN', '离线测试', '插件目录里没找到 test/*.test.mjs', testDir)
+    return
+  }
+  for (const suite of suites) {
     const file = join(PLUGIN_DIR, 'test', suite + '.test.mjs')
     if (!existsSync(file)) {
       record('WARN', '离线测试 · ' + suite, '测试文件不存在', file)

@@ -39,7 +39,9 @@
 
 `<工作目录>/.dsh/handoff/<sessionId>.md`，YAML 头 + 六节：
 
-- **原始目标** —— 会话最早那条真实用户指令
+- **原始目标** —— 会话最早那条真实用户指令。**不是**首条 `user/message` 的原文：
+  链上每一棒的首条消息都是上一棒注入的整份简报，直接抄会层层嵌套（ISSUES I-14）。
+  现在由 `unwrapGoal` 顺着简报首行的「已把进度写入 `<path>`」**读盘**一跳一跳回到链根
 - **最近的用户指令 / 最近的助手输出** —— 用最近两轮校准方向。助手输出按 `text` → `reasoning` → `（调用工具：…）` 递减取值：
   当前 provider 的助手消息常常只有 reasoning + tool-call 块，只认 `text` 会恒为空（ISSUES I-13）
 - **触及的文件** —— 从工具参数里抽出来、并且**在磁盘上真的存在**的路径
@@ -121,6 +123,7 @@
 | `summaryMaxChars` | `1600` | 模型摘要字数上限 |
 | `summaryTimeoutMs` | `45000` | 摘要超时，超时即降级 |
 | `docMaxChars` | `6000` | 注入新会话那份的裁剪上限（落盘是它的 4 倍） |
+| `goalMaxChars` | `4000` | 「原始目标」一节的字符上限。比 `summaryMaxChars` 大得多是刻意的：它要装得下**链根**那句用户原话（含验收清单） |
 | `maxTrackedFiles` | `40` | 「触及的文件」最多记几个 |
 | `claimTtlMs` | `86400000` | 占位有效期，超时视为上一次交接已死 |
 | `retryCooldownMs` | `600000` | 失败后多久才允许重试 |
@@ -184,12 +187,13 @@
 cd D:/proj/PC1/plugins/dsh-auto-handoff
 node --check lib/index.js
 # 注意：node --test test/ 这种「目录形式」在 Node 24 上会 MODULE_NOT_FOUND，必须写 glob
-node --test test/*.test.mjs       # 一次跑全部 4 个文件，共 41 条断言
+node --test test/*.test.mjs       # 一次跑全部 5 个文件，共 50 条断言
 node test/integration.test.mjs   # 16 个场景
 node test/midturn.test.mjs       # 7 个场景
 node test/chain.test.mjs         # 8 个场景
 node test/claims.test.mjs        # 10 个场景
-# 合计 41 条断言
+node test/goal.test.mjs          # 9 个场景（「原始目标」还原）
+# 合计 50 条断言
 ```
 
 ### 假件必须比真件严格，否则测试全绿也没用

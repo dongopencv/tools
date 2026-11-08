@@ -40,6 +40,7 @@ const DEFAULTS = {
   chainLimit: 8,
   summaryMaxChars: 1600,
   docMaxChars: 6000,
+  goalMaxChars: 4000,
   summaryTimeoutMs: 45000,
   maxTrackedFiles: 40,
   summaryProvider: '',
@@ -95,6 +96,12 @@ export const Config = z.object({
     .min(1000)
     .default(DEFAULTS.docMaxChars)
     .description('交接文档总字符上限。'),
+  goalMaxChars: z
+    .number()
+    .step(100)
+    .min(400)
+    .default(DEFAULTS.goalMaxChars)
+    .description('「原始目标」一节的字符上限。比摘要上限大得多是刻意的：它要装得下整条交接链的原始目标。'),
   summaryTimeoutMs: z
     .number()
     .step(1000)
@@ -229,6 +236,7 @@ function resolveOptions(config) {
     chainLimit: readInt(raw.chainLimit, DEFAULTS.chainLimit),
     summaryMaxChars: readInt(raw.summaryMaxChars, DEFAULTS.summaryMaxChars),
     docMaxChars: readInt(raw.docMaxChars, DEFAULTS.docMaxChars),
+    goalMaxChars: readInt(raw.goalMaxChars, DEFAULTS.goalMaxChars),
     summaryTimeoutMs: readInt(raw.summaryTimeoutMs, DEFAULTS.summaryTimeoutMs),
     maxTrackedFiles: readInt(raw.maxTrackedFiles, DEFAULTS.maxTrackedFiles),
     summaryProvider: readText(raw.summaryProvider, DEFAULTS.summaryProvider),
@@ -247,6 +255,122 @@ function clampText(text, maxChars) {
   const normalized = text.trim()
   if (normalized.length <= maxChars) return normalized
   return normalized.slice(0, maxChars) + '…（已截断）'
+}
+
+/** 交接简报的首行前缀：出现它说明这条 user/message 是上一棒塞进来的整份简报。 */
+const HANDOFF_PREFIX = '[自动交接]'
+
+/** 交接简报里包裹文档正文的两个分隔行。 */
+const DOC_END = '===== 交接文档结束 ====='
+
+/** 文档正文里可能出现的二级小节标题（用于判断「原始目标」到哪为止）。 */
+const DOC_SECTION_TITLES = new Set([
+  '进度与下一步',
+  '交接前 REVIEW',
+  '原始目标',
+  '最近的用户指令',
+  '最近的助手输出',
+  '触及的文件',
+  '工具轨迹',
+])
+
+/**
+ * 从一段文本里取出 `## 原始目标` 这一节的正文。
+ *
+ * 只看行首精确匹配的标题，遇到下一个已知小节标题或文档结束分隔行就停——
+ * 不用「下一个 ## 任意标题」当边界，因为用户的目标本身可能就带 Markdown 标题
+ * （链根那份 1489 字目标里就有 `# 关键决定与坑` 一类的行）。
+ */
+function goalSection(text) {
+  if (typeof text !== 'string' || text === '') return ''
+  const lines = text.split('\n')
+  let start = -1
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index].trim() === '## 原始目标') {
+      start = index + 1
+      break
+    }
+  }
+  if (start === -1) return ''
+  const body = []
+  for (let index = start; index < lines.length; index += 1) {
+    const line = lines[index]
+    const trimmed = line.trim()
+    if (trimmed === DOC_END) break
+    const heading = /^##\s+(.+?)\s*$/.exec(trimmed)
+    if (heading !== null && DOC_SECTION_TITLES.has(heading[1])) break
+    body.push(line)
+  }
+  return body.join('\n').trim()
+}
+
+/** 交接简报首行里的文档路径：`已把进度写入 \`<path>\``。 */
+const DOC_PATH_RE = /已把进度写入\s*`([^`]+\.md)`/u
+
+/**
+ * 从简报正文里解析出上一棒交接文档的路径，再**读盘**取它的「## 原始目标」一节。
+ *
+ * 为什么必须读盘：注入副本被 `docMaxChars` 截断，正文里的嵌套文档只是残缺开头，
+ * 递归下钻到第二层就没有再下一层的 `## 原始目标` 了（实测 693 字处断掉）。
+ * 而盘上那份是全的——每一棒的文档都在 `.dsh/handoff/<session>.md` 里，
+ * 顺着简报里的路径一跳一跳读回链根，才能拿到用户的原话。
+ */
+function docPathFromText(text) {
+  const match = DOC_PATH_RE.exec(text)
+  return match === null ? '' : match[1]
+}
+
+function goalFromDocPath(docPath) {
+  if (typeof docPath !== 'string' || docPath === '') return ''
+  try {
+    if (statSync(docPath).isFile() !== true) return ''
+    return goalSection(readFileSync(docPath, 'utf8'))
+  } catch {
+    // 文档被删了、路径不可读——都不是错误，退回正文下钻即可。
+    return ''
+  }
+}
+
+/**
+ * 还原「用户真正说的第一句话」。
+ *
+ * 链上每一棒的首条 user/message 都是上一棒注入的**整份交接简报**，而旧实现直接
+ * `clampText(userTexts[0], 1200)` 塞进「## 原始目标」，于是每深一层就多嵌一层旧文档：
+ * 实测 depth 6 那份文档的「原始目标」只剩 693 字、本身又以 `[自动交接]` 开头，
+ * 真正的目标（含 13 项验收清单）在第 2 层就丢了。
+ *
+ * 下钻分两条路，按可靠性排序：
+ *   1. **读盘**：从简报首行取出上一棒文档路径，读全文再取它的「## 原始目标」——
+ *      盘上那份不截断，可以一路读到链根；
+ *   2. 读不到盘（文档被删/挪走）时，退回在正文里找 `## 原始目标` 一节，
+ *      能穿透一层就是一层。
+ * 两条都拿不到新内容就停，最多 10 层；末尾按 `goalMaxChars` 截断。
+ */
+function unwrapGoal(text, maxChars) {
+  let current = typeof text === 'string' ? text.trim() : ''
+  const limit = Number.isFinite(maxChars) && maxChars > 0 ? maxChars : DEFAULTS.goalMaxChars
+  // 防环靠「读过哪些文档路径」，不是靠文本指纹：链上相邻两棒的「原始目标」经常
+  // 长度相同、尾 64 字也相同（都是被同一处截断的嵌套开头），用指纹会把正常下钻误判成环。
+  const seenDocs = new Set()
+  for (let depth = 0; depth < 12; depth += 1) {
+    if (!current.startsWith(HANDOFF_PREFIX)) break
+
+    const docPath = docPathFromText(current)
+    if (docPath !== '') {
+      if (seenDocs.has(docPath)) break
+      seenDocs.add(docPath)
+      const fromDisk = goalFromDocPath(docPath)
+      if (fromDisk !== '' && fromDisk !== current) {
+        current = fromDisk
+        continue
+      }
+    }
+
+    const section = goalSection(current)
+    if (section === '' || section === current) break
+    current = section
+  }
+  return clampText(current, limit)
 }
 
 /**
@@ -514,7 +638,7 @@ function pickExistingPaths(candidates, maxTrackedFiles) {
 }
 
 /** 从会话日志里抽取出可写进交接文档的事实。 */
-function collectFacts(session, maxTrackedFiles) {
+function collectFacts(session, maxTrackedFiles, goalMaxChars) {
   const events = typeof session.ownEvents === 'function' ? session.ownEvents() : []
   const userTexts = []
   const assistantTexts = []
@@ -562,7 +686,8 @@ function collectFacts(session, maxTrackedFiles) {
     }
   }
 
-  const firstUser = userTexts.length > 0 ? clampText(userTexts[0], 1200) : ''
+  // 「原始目标」不能用摘要上限那种小钳位，也不能原样收录交接简报（会层层嵌套）。
+  const firstUser = userTexts.length > 0 ? unwrapGoal(userTexts[0], goalMaxChars) : ''
   const recentUsers = userTexts.slice(-2).map((text) => clampText(text, 600))
   const assistantBodies = assistantTexts.length > 0 ? assistantTexts : assistantDigests
   const recentAssistant = assistantBodies.slice(-2).map((text) => clampText(text, 1200))
@@ -1093,7 +1218,7 @@ export function apply(ctx, config) {
         }
         const tokens = measureTokens(ctx, session)
         const toolCalls = toolCallCounts.get(sessionId) ?? 0
-        const facts = collectFacts(session, options.maxTrackedFiles)
+        const facts = collectFacts(session, options.maxTrackedFiles, options.goalMaxChars)
         const tokenPct = Math.min(100, Math.round((tokens / options.tokenThreshold) * 100))
         const toolPct = Math.min(100, Math.round((toolCalls / options.toolCallThreshold) * 100))
         const nearest = Math.max(tokenPct, toolPct)
@@ -1210,7 +1335,7 @@ export function apply(ctx, config) {
     const cwd = resolveSessionCwd(ctx, session)
     const dir = handoffDirectory(cwd, options.handoffDir)
     const tokens = measureTokens(ctx, session)
-    const facts = collectFacts(session, options.maxTrackedFiles)
+    const facts = collectFacts(session, options.maxTrackedFiles, options.goalMaxChars)
     const title = resolveTitle(ctx, session)
     const chain = await chainFor(sessionId)
     const nextDepth = chain.depth + 1
@@ -1536,7 +1661,7 @@ export function apply(ctx, config) {
         }
         const tokens = measureTokens(ctx, session)
         const toolCalls = toolCallCounts.get(sessionId) ?? 0
-        const facts = collectFacts(session, options.maxTrackedFiles)
+        const facts = collectFacts(session, options.maxTrackedFiles, options.goalMaxChars)
         const tokenPct = Math.min(100, Math.round((tokens / options.tokenThreshold) * 100))
         const toolPct = Math.min(100, Math.round((toolCalls / options.toolCallThreshold) * 100))
         const nearest = Math.max(tokenPct, toolPct)
