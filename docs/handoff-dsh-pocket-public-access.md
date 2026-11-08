@@ -17,7 +17,7 @@ cloudflared 已经装好并通过 SHA256 校验，插件那句「cloudflared 下
 - 自定义密码：**没设**（密码值还没拿到）
 - 证据：C:/Users/Admin/.dsh/dsh-pocket/tunnel-auto.json **不存在**（该文件存在 = 曾经成功开过公网）
 
-**用户的明确需求（我理解的）**：把公网访问真正打开，并且访问密码设成**自定义**的（不要插件每次自动轮换的随机 8 位）。
+**用户的明确需求（我理解的）**：把公网访问真正打开，并且访问密码设成**自定义**的（不要插件每次自动生成的随机 8 位）。
 
 ⚠️ 注意：连「用户说的『我电脑应该装了这个』具体指什么」**我都还没确认过**，这就是第 6 节第 1 条。
 
@@ -34,8 +34,8 @@ cloudflared 已经装好并通过 SHA256 校验，插件那句「cloudflared 下
 | dsh CLI | C:\Users\Admin\AppData\Local\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd（**不在 PATH**） |
 | 插件位置 | C:/Users/Admin/.dsh/profiles/desktop/node_modules/dsh-pocket，版本 **2.12.0** |
 | 插件设置 | C:/Users/Admin/.dsh/dsh-pocket/settings.json，内容仅 {"lanEnabled": false} |
-| 公网密码文件 | C:/Users/Admin/.dsh/dsh-pocket/token → 当前值 40574490 |
-| 局域网密码文件 | C:/Users/Admin/.dsh/dsh-pocket/token-lan → 当前值 78212500 |
+| 公网密码文件 | C:/Users/Admin/.dsh/dsh-pocket/token |
+| 局域网密码文件 | C:/Users/Admin/.dsh/dsh-pocket/token-lan |
 | 系统 node | D:\tools\nodejs\node，v24.16.0 |
 | 监听 3081 | 0.0.0.0:3081（PID 38492）与 127.0.0.1:3081（PID 33808），两个都是 DeepSeek Harness.exe |
 
@@ -82,7 +82,7 @@ Windows 资产名：cloudflared-windows-amd64.exe（platformAssets()，lib/tunne
 
 - 规则：PIN_RE，**8–64 位，只能英文字母或数字**（lib/index.js:159），否则抛错
 - 公网：写 token 文件 + settings.json 里置 publicPinCustom = true
-- 自定义后 credentialKindForHost 返回 'persistent'（lib/index.js:125）→ **开公网时不再轮换密码**（rotateAccessToken 被 pinCustom('public') 短路，lib/index.js:90）
+- 自定义后 credentialKindForHost 返回 'persistent'（lib/index.js:125）→ **开公网时不再改密码**（rotateAccessToken 被 pinCustom('public') 短路，lib/index.js:90）
 - RPC 端点名：pin.setCustom（client/api.js:19）
 - 传空串会恢复随机并清掉 custom 标记（lib/index.js:154-157）
 
@@ -179,7 +179,7 @@ Windows 资产名：cloudflared-windows-amd64.exe（platformAssets()，lib/tunne
 
 尝试：对 http://127.0.0.1:61420/dsh-pocket/<endpoint> 发 POST，body {rpcId, method, payload}（method 必须等于 endpoint，content-type: application/json），端点来自 client/api.js 的 POCKET_ENDPOINTS（pocket.status / tunnel.start / tunnel.stop / tunnel.setConfig 等；tunnel.start 要求 payload.disclaimer === true）。
 
-结果：一律一行 unauthorized；带 ?token=40574490 或 ?token=78212500 仍 unauthorized。GUI 没开 9222 调试端口。
+结果：一律一行 unauthorized；带上两个 PIN 文件里的值仍 unauthorized。GUI 没开 9222 调试端口。
 
 **我的结论**：宿主 web 认证在插件路由之前就拦了，必须由用户在 GUI 里点。
 **可疑之处**：dsh web 的启动 token 每次进程启动都变，插件自己是靠 ctx.connection.authenticatedUrl() 现取的（lib/index.js:344-353）；我根本没找到它存在哪，只试了两个文件里的**pocket PIN**——那本来就不是宿主 token，试了当然不通。**所以「原理上不能用 RPC 触发」这个结论不成立，只能说我用错了凭据。** 新会话若要试，应去找 dsh web 真正的启动 token（启动日志/stdout 里通常会打印）。
@@ -193,7 +193,7 @@ Windows 资产名：cloudflared-windows-amd64.exe（platformAssets()，lib/tunne
 1. **「『我电脑应该装了这个』= cloudflared」——纯猜测。** 也可能指插件本身、手机端 App、或别的东西。**必须问清楚，不要假设。**
 2. **「cloudflared 原本没装」——证据不完整。** 我只查了 where、WinGet/Scoop/Chocolatey、注册表卸载项、C:/D: 文件名。没搜非标准目录、没搜改名/portable 版本。只能说「按常见路径没找到」。
 3. **「本机 DNS 坏 / trycloudflare 子域解析不了 / 手机也会打不开」——最可疑的一条。** 只取了瞬间快照、没重试；对照域本来不存在；「手机也会受影响」是从电脑推断手机、毫无依据（手机可能走 4G 或别的 DNS）。**更可能只是新子域的短暂负缓存/传播延迟。不要基于这条去改 DNS 或写 hosts。**
-4. **「QUIC/UDP 7844 被封，只能 http2」——弱证据。** 依据是 cloudflared 自带预检查 FAIL + 一次 http2 成功。可能是瞬时抖动或本机防火墙，也可能预检查在 Windows 上本来就常 FAIL。**而且这条已经没用了**：插件本就强制 http2（3.3）。
+4. **「QUIC/UDP 7844 不通，只能 http2」——弱证据。** 依据是 cloudflared 自带预检查 FAIL + 一次 http2 成功。可能是瞬时抖动或本机防火墙，也可能预检查在 Windows 上本来就常 FAIL。**而且这条已经没用了**：插件本就强制 http2（3.3）。
 5. **「3081 上两个监听 = 两个 DSH GUI 实例」——推断。** 只看了 PID 名字，CommandLine 取出来是空的。
 6. **「可以用 tunnel-auto.json 自动恢复代替用户点击」——完全没验证。** 我连这文件长什么样都没见过。
 7. **「改 hosts 只影响隧道、改动面小、我倾向这个」——这是建议不是结论。** 没测过任何一条 DNS 修法，也没测过 Cloudflare 是否接受被改 hosts 的 SNI/证书。
