@@ -128,6 +128,8 @@ performHandoff(session, trigger, signal)
 | `firstUser` | 第一条 `user/message` | 原始目标 |
 | `recentUsers` | 最后两条 `user/message` | 校准方向 |
 | `recentAssistant` | 最后两条 `assistant/message` | 校准进度 |
+
+**助手消息的正文不等于 `text` 块**：当前 provider（`trae-enterprise` / `DeepSeek-V4.1-Flash`）下 80 条 `assistant/message` 的 block 统计是 `{"reasoning":71,"tool-call":80,"text":1}`——一条消息常常只有「一段思考 + 一个工具调用」。所以 `assistantText()` 按 `text` → `reasoning`/`thinking` 的顺序取正文，再追加 `（调用工具：name）` 摘要；只有工具名、没有正文的消息单独进 `assistantDigests`，仅当整段会话一条正文都取不到时才兜底使用。用户消息仍走 `messageText()`（只认 `text`，注入型消息都从这条路径过滤）。详见 ISSUES I-13。
 | `toolCounts` | 所有 `tool/call` 按 name 聚合 | 工具轨迹 |
 | `files` | 从工具参数 JSON 递归抽路径 | 触及文件 |
 | `toolErrors` | `tool/result.data.error` 存在 | 风险提示 |
@@ -243,7 +245,7 @@ const created = await controller.create(preset === undefined ? { cwd } : { cwd, 
 
 **这个修复曾经丢失过**，导致 `chainDepth` 用例假失败（写到了工作区却读用户主目录）。恢复记录见 `ISSUES.md` I-2。
 
-### 8.3 40 条断言 / 4 个文件
+### 8.3 41 条断言 / 4 个文件
 
 | 文件 | 断言数 | 覆盖 |
 | --- | --- | --- |

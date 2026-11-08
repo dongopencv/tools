@@ -204,6 +204,48 @@ if (!reserved.reserved) {
 
 **教训**：**「暂时」和「永久」不能共用同一个标志位**。凡是记录「这件事已经处理过」的地方，都要问一句：这件事会不会有第二次机会？会的话，标志就必须带过期或带清零点，否则它就从优化变成了绊索——而且**绊索不会报错，只会安静**。
 
+### I-13 `messageText` 只读 `text` 块：交接文档里「最近的助手输出」恒为空 【严重·已修复 2026-11-08】
+
+**现象**：连续 6 棒交接文档的「## 最近的助手输出」一节要么写「（未捕获）」，要么整节缺失；每次 REVIEW 都带一条 warn『没有捕获到助手输出』。摘要请求里那一段也一直是「（无）」——**新会话唯一一条「上一棒做到哪」的依据就此消失**，只能从「触及的文件」和「下一步」里反推。
+
+**根因（实测，不是推断）**：`messageText()` 只认 `block.type === 'text'`：
+
+```js
+if (block.type === 'text' && typeof block.text === 'string') parts.push(block.text)
+```
+
+而当前 provider（`trae-enterprise` / `DeepSeek-V4.1-Flash-1017`）的助手消息**几乎不带 text 块**。解压真实会话日志统计 block 类型：
+
+| 会话 | assistant/message | reasoning | tool-call | text |
+| --- | --- | --- | --- | --- |
+| `session-5ddd6bb5` | 80 | 71 | 80 | **1** |
+| `session-9ee68a8f` | 80 | 71 | 80 | 1 |
+
+一条助手消息的典型形状就是「一段 reasoning + 一个 tool-call」，没有 text。于是 `assistantTexts` 永远是空数组（80 条消息里最多命中 1 条），`recentAssistant` 必然为 `[]`。
+
+**为什么之前的排查方向是错的**：一度怀疑「provider 不给助手输出」。实测证明 provider 给得很足——80 条消息里 71 条有 reasoning 正文，只是**块类型不是 `text`**。问题在解析，不在数据源。
+
+**修法**：
+1. 新增 `assistantText(message)`，与 `messageText` 并存（用户消息仍走后者）：优先 `text` 块，没有就退到 `reasoning` / `thinking` 块，末尾追加 `（调用工具：name、name）` 摘要。
+2. `collectFacts` 里把「只有工具名、没有一句正文」的消息单独进 `assistantDigests`——它是最后兜底，不能和正文混在一条队列里。
+3. 取值改为 `assistantTexts.length > 0 ? assistantTexts : assistantDigests`，再 `slice(-2)`。**有正文时绝不用纯工具名**：交接文档要回答「做到哪」，一串工具名答不了。
+
+**验证**（真实日志回放，非桩件）：探针 `work/probe-facts-real.mjs` 把真实 `lib/index.js` 的 schemastery import 换成桩、追加内部导出，喂真实会话事件：
+
+```
+session-5ddd6bb5: toolCalls=80 toolErrors=1 injected=5 files=40  recentAssistant.length=2
+  >>> "Now design the fix. Key decision: how to produce ... when assistant messages have only reasoning blocks."
+  >>> "Now let's implement the fix. Read the relevant source sections first.\n（调用工具：run_code）"
+```
+
+修复前同一份日志 `recentAssistant.length=0`。`node --test test/*.test.mjs` 4/4 全绿。
+
+**遗留取舍**：reasoning 是模型的内部独白，中位数 5000+ 字符，直接塞进交接文档会又长又散（已由 `clampText(…, 1200)` 截断）。目前取「最后 2 条 × 1200 字」。更好的做法是让摘要请求自己提炼，但那要等 O-5 的结构化日志落地后再一起做。
+
+**教训**：**「字段存在」不等于「这个字段会被填充」**。`messageText` 写的时候只想到用户消息（都是 text 块），复用到助手消息上时就静默返回空字符串——不抛错、不报警，只是让一份文档少了一节。凡是把「给 A 用的解析器」拿去解析 B，必须先数一遍 B 的块类型分布。
+
+---
+
 ---
 
 ## B. 当前开放问题（O 系列）
@@ -283,7 +325,9 @@ plugins/dsh-auto-handoff/
 
 ### O-6 未验证真实长会话 【中】
 
-40 条断言都是离线桩测试。**没有**在真实长任务上完整跑过"阈值触发 → 交接 → 新会话接续"的闭环。
+41 条断言都是离线桩测试。**没有**在真实长任务上完整跑过"阈值触发 → 交接 → 新会话接续"的闭环。
+
+> 补充（2026-11-08）：I-13 的验证用的是**真实会话日志回放**（`work/probe-facts-real.mjs` 喂真实 zstd 日志给真实 `collectFacts`），比纯桩件强，但仍不是端到端——它证明「事实抽取正确」，不证明「真宿主里交接文档里有这段」。
 
 **建议**：临时把 `toolCallThreshold` 压到 8 做一次实机验证。
 
@@ -339,7 +383,7 @@ plugins/dsh-auto-handoff/
 
 ---
 
-\n## ISS-010 `prompt` 少传 AbortSignal，交接简报从未送达
+## ISS-010 `prompt` 少传 AbortSignal，交接简报从未送达
 
 **症状**：全量 86 个会话扫描，「首条 user 消息以 `[自动交接] 上一会话` 开头」命中 **0** 条；新会话都建出来了，但解压后只有 4 帧（header / permission / sandbox / approval），312–318 字节。
 
@@ -348,3 +392,30 @@ plugins/dsh-auto-handoff/
 **为什么离线测试没抓到**：`test/integration.test.mjs` 与 `test/midturn.test.mjs` 的假件是 `prompt: async (request) => { prompts.push(request) }` —— 单参数、永不抛，比真实宿主宽松。
 
 **修复**：`promptSignal(signal)` 补真 AbortSignal；两处假件改成会校验第二参数的真实签名。
+
+---
+
+## E. 本轮 warn 核对结论（2026-11-08）
+
+交接文档里「1 次报错 / 5 条注入」与「2 次报错 / 6 条注入」两个数字**都对**，不是统计错误——它们属于**相邻两棒**：
+
+| 来源 | 会话 | 工具报错 | 滤除的宿主注入 |
+| --- | --- | --- | --- |
+| 文档文首 REVIEW（本棒自己的） | `session-5ddd6bb5` | 1 | 5 |
+| 文档内嵌「原始目标」引用的上一棒 | `session-6f3c471f` | 2 | 6 |
+
+日志 `~/.dsh/auto-handoff/auto-handoff.log` 尾部两行原文：
+
+```
+2026-11-08T07:12:11.130Z ... 交接前 REVIEW warn：本轮有 2 次工具报错；已滤除 6 条宿主注入消息；没有捕获到助手输出
+2026-11-08T07:29:36.082Z ... 交接前 REVIEW warn：本轮有 1 次工具报错；已滤除 5 条宿主注入消息
+```
+
+两棒都缺助手输出（第一棒明写；第二棒只是落到文档里的「（未捕获）」一节），根因同为 I-13。
+
+那 1 次工具报错已定位并解决：`CodeRunFailedError` / `CODE_RUN_FAILED`，正文 `Expected ',', got 'ident'` —— 上一棒自己写探针脚本时的语法笔误，与插件无关，已随脚本重写消失。
+
+**顺带发现的文档隐患（未改代码）**：跨棒引用让同一份交接文档里出现两组互斥数字，读者必然当成 bug 去查。根因是「注入副本」把上一份交接文档**全文**又塞进了这一份的「原始目标」一栏。`renderDoc` 的「原始目标」应只保留用户原话，不含上一份文档正文——否则每深一层，文档就多嵌套一份旧文档。
+
+**运行态核对**：`claims.json` 无 inflight / 无 cooldown 残留（最近两条为 `done` 与当前会话的 `genesis`，正常）；`state.json` 链根 `session-74352d08`、深度 6、末条即本会话。
+

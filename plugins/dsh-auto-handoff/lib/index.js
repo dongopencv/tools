@@ -316,7 +316,7 @@ function orderSummary(summary, maxChars) {
   return clampText(rebuilt.join('\n\n'), maxChars)
 }
 
-/** 从一条 message 的 content 里拼出纯文本。 */
+/** 从一条 message 的 content 里拼出纯文本（只认 text 块：用户消息走的都是这条）。 */
 function messageText(message) {
   if (message === null || typeof message !== 'object') return ''
   const content = message.content
@@ -328,6 +328,45 @@ function messageText(message) {
     }
   }
   return parts.join('\n').trim()
+}
+
+/**
+ * 助手消息的正文提取：text 块之外，还要认 reasoning 与 tool-call。
+ *
+ * 原实现只认 text 块，而当前 provider（trae-enterprise / DeepSeek-V4.1-Flash）
+ * 的助手消息几乎从不带 text：实测 session-5ddd6bb5 的 80 条 `assistant/message` 里
+ * block 统计是 `{"reasoning":71,"tool-call":80,"text":1}`——整条消息常常只有
+ * 「一段思考 + 一个工具调用」。于是：
+ *   · 「最近的助手输出」必然为空，交接文档里永远是「（未捕获）」；
+ *   · REVIEW 每次都误报「没有捕获到助手输出」；
+ *   · 摘要请求里这一段写「（无）」，新会话失去唯一一条「已经做到哪」的依据。
+ *
+ * 退一步的判据：没有 text 就用 reasoning（模型的自我说明），再附上这一条消息
+ * 里发出的工具调用名。都不是最终答案，但足以说明「做到哪一步、在动什么」。
+ */
+function assistantText(message) {
+  if (message === null || typeof message !== 'object') return ''
+  const content = message.content
+  if (!Array.isArray(content)) return ''
+  const texts = []
+  const reasoning = []
+  const calls = []
+  for (const block of content) {
+    if (block === null || typeof block !== 'object') continue
+    if (block.type === 'text' && typeof block.text === 'string') {
+      texts.push(block.text)
+      continue
+    }
+    if ((block.type === 'reasoning' || block.type === 'thinking') && typeof block.text === 'string') {
+      reasoning.push(block.text)
+      continue
+    }
+    if (block.type === 'tool-call' && typeof block.name === 'string' && block.name !== '') calls.push(block.name)
+  }
+  // text 是真正的答复，优先；没有 text 才退到 reasoning。
+  const body = (texts.length > 0 ? texts : reasoning).join('\n').trim()
+  const digest = calls.length === 0 ? '' : `（调用工具：${[...new Set(calls)].join('、')}）`
+  return [body, digest].filter((part) => part !== '').join('\n').trim()
 }
 
 /**
@@ -479,6 +518,9 @@ function collectFacts(session, maxTrackedFiles) {
   const events = typeof session.ownEvents === 'function' ? session.ownEvents() : []
   const userTexts = []
   const assistantTexts = []
+  // 只有工具调用、没有一句说明的助手消息。单独存一份是为了「有正文时不用它」：
+  // 交接文档要的是「做到哪」，纯工具名只能当没有正文时的最后兜底。
+  const assistantDigests = []
   const toolCounts = new Map()
   const files = new Set()
   let toolCalls = 0
@@ -502,8 +544,10 @@ function collectFacts(session, maxTrackedFiles) {
     }
     if (event.type === 'assistant/message') {
       const message = data !== null && typeof data === 'object' && data.message !== undefined ? data.message : data
-      const text = messageText(message)
-      if (text !== '') assistantTexts.push(text)
+      const text = assistantText(message)
+      if (text === '') continue
+      if (text.startsWith('（调用工具：')) assistantDigests.push(text)
+      else assistantTexts.push(text)
       continue
     }
     if (event.type === 'tool/call') {
@@ -520,7 +564,8 @@ function collectFacts(session, maxTrackedFiles) {
 
   const firstUser = userTexts.length > 0 ? clampText(userTexts[0], 1200) : ''
   const recentUsers = userTexts.slice(-2).map((text) => clampText(text, 600))
-  const recentAssistant = assistantTexts.slice(-2).map((text) => clampText(text, 1200))
+  const assistantBodies = assistantTexts.length > 0 ? assistantTexts : assistantDigests
+  const recentAssistant = assistantBodies.slice(-2).map((text) => clampText(text, 1200))
   const sortedTools = [...toolCounts.entries()].sort((a, b) => b[1] - a[1])
   const trackedFiles = pickExistingPaths([...files], maxTrackedFiles)
 

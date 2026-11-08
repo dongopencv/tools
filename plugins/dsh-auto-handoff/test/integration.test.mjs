@@ -489,6 +489,51 @@ async function run() {
     results.push('PASS run_code 参数正文里的路径被抽取')
   }
 
+  // 11) 纯工具轮（PTC）的助手消息只带 reasoning / tool-call 块时，也必须抽出「最近的助手输出」
+  //     真实 provider（trae-enterprise / DeepSeek-V4.1-Flash）实测 block 统计是
+  //     {reasoning:71, tool-call:80, text:1}——80 条 assistant/message 里几乎没有 text 块。
+  //     旧实现只认 text，recentAssistant 恒为空，交接文档写「（未捕获）」、REVIEW 每次误报。
+  {
+    const dir = await mkdtemp(join(tmpdir(), 'auto-handoff-ptc-'))
+    const previousHome = process.env.USERPROFILE
+    process.env.USERPROFILE = dir
+    const events = [userEvent('修插件', 1)]
+    events.push({
+      type: 'assistant/message',
+      seq: 2,
+      time: 0,
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          role: 'assistant',
+          id: 'a2',
+          content: [
+            { type: 'reasoning', text: '先读源码，确认 messageText 只认 text 块。' },
+            { type: 'tool-call', name: 'run_code', arguments: '{}', id: 'tc2' },
+          ],
+        },
+        stream: [],
+      },
+    })
+    events.push(toolCallEvent(1, 1, 3, 'read', { file_path: 'D:/tools/dsh-auto-handoff/lib/index.js' }))
+    const sessions = new Map()
+    sessions.set('sess-a', buildSession('sess-a', dir, {}, events))
+    const harness = makeServices({ sessions, tokensFor: () => 300000, llm: undefined })
+    const ctx = makeCtx(harness)
+    plugin.apply(ctx, { enabled: true, tokenThreshold: 300000, toolCallThreshold: 80, modelSummary: false })
+    ctx.emit('agent/turn-stopping', { agent: { id: 'sess-a' }, turn: 1, signal: new AbortController().signal })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const doc = await readFile(join(dir, '.dsh', 'handoff', 'sess-a.md'), 'utf8')
+    assert.doesNotMatch(doc, /（未捕获）/, '纯工具轮不应再写「（未捕获）」')
+    assert.match(doc, /先读源码，确认 messageText 只认 text 块/, '应从上一条 assistant 的 reasoning 块取到助手输出')
+    assert.match(doc, /调用工具：run_code/, '应带上这一条消息发出的工具调用名')
+    if (previousHome === undefined) delete process.env.USERPROFILE
+    else process.env.USERPROFILE = previousHome
+    await rm(dir, { recursive: true, force: true })
+    results.push('PASS 纯工具轮也能抽出最近的助手输出（reasoning + tool-call 块）')
+  }
+
   // 8) 手动命令存在且可调用
   {
     const r = await scenario({ plugin, name: 'commands', tokens: 1000, toolCalls: 0, modelText: undefined })
