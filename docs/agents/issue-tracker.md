@@ -121,7 +121,3 @@ gh issue close <n> -R dongopencv/tools --comment "resolution 见正文 / 上一�
 
 - `gh issue comment` **没有** `--dry-run`，别试。
 - 探针票用完要删干净：关闭只是留着，删除用 `gh api graphql -f query='mutation($id:ID!){deleteIssue(input:{issueId:$id}){repository{name}}}' -f id=<node_id>`；删除后再读该票返回 HTTP 410。
-
-## 凭据纪律
-
-token 在 `C:\Users\Admin\.skills-vault\download\scripts\.github-token`。**不要 `cat` 它、不要把内容写进任何被 git 跟踪的文件或 issue 正文**。上面所有命令都让 `gh` 自己从 keyring 取，不需要你碰 token。

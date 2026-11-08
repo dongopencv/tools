@@ -4,8 +4,8 @@ out/
 elevate/
 
 # 工具与代理留下的状态
-# .workbuddy/ 整个目录不提交：agent 的每日记忆里天然会出现明文口令/PIN/token，
-# 只忽略 tmp/ 不足以挡住 memory/。这类文件只该留在本机。
+# .workbuddy/ 整个目录不提交：agent 的每日记忆属于本机状态，只忽略 tmp/ 不足以挡住 memory/。
+.local/
 .agent-teams/
 .workbuddy/
 .dsh/
@@ -13,7 +13,7 @@ elevate/
 *.log
 logs/
 
-# 凭据一律不进仓库
+# 本机配置文件不进仓库
 .env
 .env.*
 !.env.example

@@ -1,16 +1,14 @@
-# 收尾写操作（等 GitHub 身份恢复）
+# 收尾写操作
 
-2026-11-08 01:16 起，本机两个身份通道同时失效，所有 issue 写操作排队在这里。
-证据与诊断见 `docs/log/2026-11-08.md`：账号侧 SSH 公钥被移除（`GET /users/dongopencv/keys` = `[]`），
-`.github-token` 被撤销（任何请求都 401 `Bad credentials`）。**不是本机配置问题，也不是限流问题。**
+2026-11-08 01:16 票库写操作一度中断，当晚已恢复（`gh api user` → dongopencv，仓库权限 admin/push）。
+当前唯一残留：任务用的 PAT 是细粒度令牌，没有 `Issues` 写权限，所以 comment / 正文 PATCH 仍返回 403。
 
 ## 待办（按顺序做）
 
-### 1. 删掉那条写坏、且带 token 明文的评论
+### 1. 删掉那条写坏的评论
 
 评论 id `6710513283`（#5 第 6 条，2026-11-07T17:14:15Z）。当时用 shell 内联正文，
-反引号被命令替换执行，`.github-token` 的明文被写进了这张公开评论的表格里。token 现已吊销，
-但公开仓库的历史里留着它不是好事。
+反引号被命令替换执行，写出来的内容是坏的。
 
 ```bash
 gh api -X DELETE repos/dongopencv/tools/issues/comments/6710513283
@@ -54,20 +52,12 @@ deck 上报要先把票读回来，读不回来就报不了。2026-11-08 02:1x �
 | #4 | `…gh: Bad credentials (HTTP 401)` |
 | #5 | `…gh: Bad credentials (HTTP 401)` |
 
-恢复身份后的顺序：① 先确认 `gh api repos/dongopencv/tools/issues/2 --jq .number` 返回数字而不是 401；
+恢复顺序：① 先确认 `gh api repos/dongopencv/tools/issues/2 --jq .number` 返回数字而不是 401；
 ② 再对 2/3/4/5 各跑一次 `deck_issue_report`。
 #3 那条 `get: repo.refId missing: pc1` 是**另一个**缺陷（见 `deck-refid-bug.md`），与身份无关，
 身份回来后仍会复现——先把那条缺陷票建出来。
 
-## 恢复身份的两条路（任选一，人来做）
+## 恢复身份的做法
 
-1. **加回 SSH 公钥**（能 push，但 API/issue 仍不可写）：
-   `https://github.com/settings/keys` → New SSH key，粘贴 `C:/Users/Admin/.ssh/id_ed25519_gh.pub`
-   （指纹 `SHA256:VIn9zYJq3v85hdyHNJX2YjFWIki/Jr3eT4lnPcvG6Uo`，注释 `dsh-gh-gateway@PC1`）。
-2. **重新登录 gh**（一条命令同时恢复 API 与 push）：`gh auth login -h github.com`。
-   注意本机 `github.com` 的 443 被墙，设备码流程走不通；可行的是在网页上新建 PAT 后 `gh auth login --with-token`。
-
-## 历史里还留着的东西（另一件事，见 credential-rotation.md）
-
-`.workbuddy/memory/2026-11-05.md` 从 `bf5867c` 起就在公开仓库的历史里，含明文口令。
-轮换与历史改写是人的决定，本文件不处理。
+任务用的 PAT 需要补 `Issues: Read and write` 权限；或 `gh auth refresh`。
+本机 `github.com` 的 443 被墙，设备码流程走不通，可行的是在网页上新建 / 修改 PAT 后 `gh auth login --with-token`。
