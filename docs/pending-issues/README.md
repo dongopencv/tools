@@ -40,23 +40,28 @@ gh api graphql -f query='query { repository(owner:"dongopencv", name:"tools") {
   issue(number:47) { subIssues(first:20) { totalCount nodes { number } } } } }'
 ```
 
-> `deck_map_link` 在本工作区仍然会失败（后端 `repo.refId missing: pc1`），
-> 上面用 `gh api` 直接落边是当前唯一可行的路。缺陷票见 `deck-refid-bug.md`。
+> **2026-11-08 16:25 复测：`deck_map_link` 已恢复正常**，`deck_map_link({key:"64", parentKey:"47"})` 返回「这次要补 1 条边，建成 1 条」，幂等无副作用。
+> 当年会失败是因为 `repo.refId` 落成了 cwd 目录名 `pc1`；现在 `deck_context` 直接给出 `dongopencv/tools`。
+> **根因仍未查明**（是代码改了还是 `~/.dsh/mattskillsdeck/choices.json` 绑定变干净了），所以缺陷票 `deck-refid-bug.md`（= #63）保持 open，不关。
+> 上面那套 `gh api` 手搓落边仍保留，作为后端不支持原生边时的兜底。
 
 ## 清单
 
-| 文件 | 是什么 | 归属 |
-|---|---|---|
-| `stale-tickets.md` | 已建票 **#64** 的正文（沉睡票的处置） | map #47 子票 |
-| `deck-refid-bug.md` | 已建票 **#63** 的正文；根因追到 `shell.js:257` / `repo.js:28` / `graph.js:20` | 独立缺陷票 |
-| `issue-closeout.md` | 收尾写操作：删坏的评论 / 补 map #2 进度与 Decisions / 报进度 | map #2 与 #5 |
-| `i5-comment.md` | #5 的 resolution 补充评论正文（干净版，等 PATCH/POST） | #5 |
-| `map47-progress.md` | map #47 正文追加草稿：#49 交付物 + 中断期间的真实状态 | map #47 |
-| `map-gist.md` | map #2 决策第 11 条正文（「链路不通」与「没有授权」分开报） | map #2 |
-| `pat-permission-fix.md` | 给 PAT 补两处写权限的实测矩阵与操作步骤 | 人工 |
-| `credential-rotation.md` | 泄露面清点与处置顺序（先删公开副本 → 再轮换 → 最后才谈历史改写） | 人工 |
-| `capswriter-speech-rollout.md` | dsh-capswriter-speech 两端重启与写回的待办 | #30 map |
-| `auto-handoff-restart.md` | auto-handoff **v1.1.2** 重启核验清单（两条脚本命令 + 9 项对照表 + 地图 #12 结账） | 人工 |
+**2026-11-08 16:40 复核：下表多数行已落地，不再算「待做」。** 保留它们是为了留住当初写草稿的判断依据；现状列是逐条实测过的。
+
+| 文件 | 是什么 | 归属 | 现状（2026-11-08 16:40 实测） |
+|---|---|---|---|
+| `stale-tickets.md` | 已建票 **#64** 的正文（沉睡票的处置） | map #47 子票 | **已建票**，已挂到 #47 下 |
+| `deck-refid-bug.md` | 已建票 **#63** 的正文；根因追到 `shell.js:257` / `repo.js:28` / `graph.js:20` | 独立缺陷票 | **已建票**，保持 open（根因未查明） |
+| `issue-closeout.md` | 收尾写操作：删坏的评论 / 补 map #2 进度与 Decisions / 报进度 | map #2 与 #5 | **已完成**，逻辑已固化成 `tools/issue-closeout.sh`（幂等） |
+| `i5-comment.md` | #5 的 resolution 补充评论正文 | #5 | **已发**，评论 id `6716358563` 在 #5 里 |
+| `map47-progress.md` | map #47 正文追加草稿 | map #47 | **已写入**，#47 正文 5330 字节含 16:30 进度 |
+| `map-gist.md` | map #2 决策第 11 条正文（「链路不通」与「没有授权」分开报） | map #2 | **已写入**，#2 正文含该条 |
+| `pat-permission-fix.md` | 给 PAT 补两处写权限的实测矩阵与操作步骤 | 人工 | **已解决**，文末有补齐后的复核矩阵 |
+| `capswriter-speech-rollout.md` | dsh-capswriter-speech 两端重启与写回的待办 | #30 map | **仍待做**（要人操作两台机器） |
+| `auto-handoff-restart.md` | auto-handoff **v1.1.2** 重启核验清单 | 人工 | **仍待做**（版本已到 v1.1.5，清单需按新版重写） |
+
+> `credential-rotation.md` 已于 2026-11-08 删除：处置顺序已执行完（先删公开副本 → 再轮换 → 历史改写判定为不做）。
 
 ## 一条命令跑完 1–3 步
 
