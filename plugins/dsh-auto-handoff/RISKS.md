@@ -325,7 +325,7 @@ ISSUES I-2：代码改路径，测试没改，产生假失败。
 
 - **R-05 孤儿会话**：不再是「prompt 抛错留下的空壳」，因为 prompt 现在带真 AbortSignal 且失败会写 `state:'failed'` + 原因，不会无脑重放。真出问题时看 `~/.dsh/auto-handoff/auto-handoff.log` 里的 `交接简报投递失败：…`。
 - **R-18/R-19（`state.json` 损坏 / 多进程同写）**：主账本已迁到 `claims.json`，写入是「写 `.tmp` 再 `renameSync`」的原子替换，最多保留 500 条；读失败一律当空表（退回多重交接一次，而不是崩主流程）。旧 `state.json` 只作兼容读。
-- **新增 R-20：占位泄漏。** 若进程在 `inflight` 期间被强杀，该会话在 `claimTtlMs`（默认 24h）内不会被再次自动交接。缓解：`/handoff` 人工强制会跳过 TTL 判定（但不打断真正进行中的那一次）。
+- **新增 R-20：占位残留。** 若进程在 `inflight` 期间被强杀，该会话在 `claimTtlMs`（默认 24h）内不会被再次自动交接。缓解：`/handoff` 人工强制会跳过 TTL 判定（但不打断真正进行中的那一次）。
 - **R-21 改代码不生效 → 降级（2026-11-08 实测推翻「必须重启」）。** Node ESM 有模块缓存，光改文件确实不会进运行中的宿主；但 DSH 自带 `dsh-hmr`，它监听 profile 的 `package.json` 与 `cordis.patch.yml`，改动即触发 profile 重组，把改动过的 linked 包（本插件）整体换掉——实测改一行注释后 3 秒内新模块生效。
   仍成立的部分：改动模块若落在宿主自身模块（`hostModules()`）里，或 HMR 判为 `unmanaged-plugin`，会走 `pending` 路径，那就真得重启。
   判据不要用 mtime：看 `auto-handoff.log` 里有没有新格式行（带 `[sessionId]` 前缀）或新一条「已启用：…交接目录 .dsh/handoff…」。

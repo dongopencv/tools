@@ -15,7 +15,7 @@
 
 ## 权限恢复后按这个顺序做
 
-1. ~~**删掉写坏的那条评论**~~ —— ✅ 2026-11-08 已删（`issue-closeout.sh --apply` 第 1 步）
+1. ~~**删掉旧的那条评论**~~ —— ✅ 2026-11-08 已删（`issue-closeout.sh --apply` 第 1 步）
 2. ~~**重发 #5 的 resolution 补充评论**~~ —— ✅ 已发，评论 id `6716358563`
 3. ~~**给 map #2 补「## 进度」与 Decisions 第 11 条**~~ —— ✅ 已补，现为 Decisions 第 11–13 条
 4. ~~**建两张新票**~~ —— ✅ 已建 **#63**（deck 插件 repoOf 解析缺陷，独立缺陷票）、**#64**（沉睡票处置，已挂 map #47 下）
@@ -24,10 +24,10 @@
 建新票 + 挂原生父子边的确切命令（已实跑，可复用）：
 
 ```bash
-# 1) 建票：正文走 -f body="$(cat file)"，标签用 -f 'labels[]=...'
+# 1) 建票：正文走 -F body=@file（绝不内联），标签用 -f 'labels[]=...'
 gh api -X POST repos/dongopencv/tools/issues \
   -f title="沉睡票的处置：14 张停 3 天的线，哪些还在跟" \
-  -f body="$(cat docs/pending-issues/stale-tickets.md)" \
+  -F body=@docs/pending-issues/stale-tickets.md \
   -f 'labels[]=wayfinder:task' --jq .number
 
 # 2) 挂到 map 下：sub_issue_id 要 issue 的 database id，不是票号
@@ -56,12 +56,10 @@ gh api graphql -f query='query { repository(owner:"dongopencv", name:"tools") {
 | `issue-closeout.md` | 收尾写操作：删坏的评论 / 补 map #2 进度与 Decisions / 报进度 | map #2 与 #5 | **已完成**，逻辑已固化成 `tools/issue-closeout.sh`（幂等） |
 | `i5-comment.md` | #5 的 resolution 补充评论正文 | #5 | **已发**，评论 id `6716358563` 在 #5 里 |
 | `map47-progress.md` | map #47 正文追加草稿 | map #47 | **已写入**，#47 正文 5330 字节含 16:30 进度 |
-| `map-gist.md` | map #2 决策第 11 条正文（「链路不通」与「没有授权」分开报） | map #2 | **已写入**，#2 正文含该条 |
+| `map-gist.md` | map #2 决策草稿（落权判定方法） | map #2 | **已写入**，#2 正文含该条 |
 | `pat-permission-fix.md` | 给 PAT 补两处写权限的实测矩阵与操作步骤 | 人工 | **已解决**，文末有补齐后的复核矩阵 |
 | `capswriter-speech-rollout.md` | dsh-capswriter-speech 两端重启与写回的待办 | #30 map | **仍待做**（要人操作两台机器） |
 | `auto-handoff-restart.md` | auto-handoff **v1.1.2** 重启核验清单 | 人工 | **仍待做**（版本已到 v1.1.5，清单需按新版重写） |
-
-> `credential-rotation.md` 已于 2026-11-08 删除：处置顺序已执行完（先删公开副本 → 再轮换 → 历史改写判定为不做）。
 
 ## 一条命令跑完 1–3 步
 

@@ -6,25 +6,22 @@
 #       github.com 的 443 被墙，api.github.com 通，release 资产要选路，
 #       token 只在网关里读取一次。
 #
-# 下载通道（按候选表顺序直接试，失败或大小不符才换下一条；不做预探测）：
-#   relay   本机中转站 127.0.0.1:8899。MITM 反代，把 github 家族域名改写到镜像站。
-#           优点：URL 不用改，任何工具都能透明走；中转站在线时自动进入候选。
-#   mirror  gh-proxy.com / ghfast.top / ghproxy.net 前缀改写（直连镜像站）。
-#   direct  裸 url（github 家族本机基本不通，留给 codeload/api 这类可达域名）。
+# 下载通道：只有一条 —— 直连 GitHub。
+#   github.com 的 443 在本机时通时不通，所以 release 资产先走 API 资产端点
+#   （api.github.com → 302 → release-assets.githubusercontent.com，本机稳定可达）。
 #
 # 用法：
-#   github.sh status                       # 自检：gh / token / 身份 / 各通道 / SSH
-#   github.sh env                          # 打印 export，eval 后当前 shell 全走中转站
-#   github.sh relay [up|down|deploy|status] # 中转站起停查 / 部署新版本（多上游回退）
+#   github.sh status                       # 自检：gh / token / 身份 / 可达域 / SSH
+#   github.sh env --config                 # 打印脚本实际读取的配置变量
 #   github.sh token                        # 打印 token（供其它脚本 $(...) 取用）
 #   github.sh api <path>                   # GET api.github.com（自动带 token）
 #   github.sh api -X POST <path> -f k=v    # 带 body 的写操作
 #   github.sh release <owner/repo> [tag]   # release 的 tag + 资产清单
-#   github.sh download <url> [-o FILE] [-s SHA256] [--via relay|mirror|direct]
-#   github.sh asset <owner/repo> <tag> <file> [-o FILE] [-s SHA256] [--via ...]
+#   github.sh download <url> [-o FILE] [-s SHA256]
+#   github.sh asset <owner/repo> <tag> <file> [-o FILE] [-s SHA256]
 #   github.sh ghdl <owner/repo> [tag] [-p PATTERN] [-D DIR]  # 委派 gh release download
-#   github.sh clone <owner/repo> [DIR]     # SSH 优先 → relay(HTTPS) → 镜像
-#   github.sh push <owner/repo> [ref] [--via ssh|relay|auto]  # auto=SSH 失败回落中转站
+#   github.sh clone <owner/repo> [DIR]     # 只走 SSH
+#   github.sh push <owner/repo> [ref]      # 只走 SSH
 #   github.sh sshcheck                     # 验证 SSH 密钥对 GitHub 的认证
 #   github.sh raw <owner/repo> <ref> <path>
 #
@@ -41,22 +38,11 @@ if [[ ! -s "$TOKEN_FILE" && -s /c/Users/Admin/.skills-vault/download/scripts/.gi
   TOKEN_FILE=/c/Users/Admin/.skills-vault/download/scripts/.github-token
 fi
 
-MIRRORS=(https://gh-proxy.com/ https://ghfast.top/ https://ghproxy.net/ "")
 DL_DIR="${GITHUB_DL_DIR:-$HOME/Downloads/github}"
 ARIA2="${ARIA2C:-aria2c}"
 # 低于这个大小不值得开多连接（实测小文件上 aria2 不加速，见 cmd_download）
 ARIA2_MIN="${GITHUB_ARIA2_MIN:-8388608}"
 
-# ── 中转站（8899 MITM 反代）──
-RELAY="${GITHUB_RELAY:-http://127.0.0.1:8899}"
-RELAY_HOST="${GITHUB_RELAY_HOST:-127.0.0.1}"
-RELAY_PORT="${GITHUB_RELAY_PORT:-8899}"
-RELAY_SERVER="${GITHUB_RELAY_SERVER:-/c/Users/Admin/dsh-mirror-proxy/server.mjs}"
-RELAY_CA="${GITHUB_RELAY_CA:-/c/Users/Admin/dsh-mirror-proxy/certs/ca.crt.pem}"
-# 中转站运行目录：server.mjs 是部署副本，证书与日志都在这里（源码在 tools/relay/，用 deploy.sh 同步）
-RELAY_HOME="${GITHUB_RELAY_HOME:-/c/Users/Admin/dsh-mirror-proxy}"
-RELAY_CERT_DIR="${RELAY_CERT_DIR:-$RELAY_HOME/certs}"
-RELAY_LOG_DIR="${RELAY_LOG_DIR:-$RELAY_HOME/logs}"
 
 info() { echo "$*" >&2; }
 ok()   { echo "[ok] $*" >&2; }
@@ -87,23 +73,18 @@ require_token() {
   echo "$t"
 }
 
-# ── curl 参数：Schannel 对 MITM 私有 CA 的吊销查询会失败，必须 --ssl-no-revoke ──
+# ── curl 参数：Schannel 的吊销查询会失败，必须 --ssl-no-revoke ──
 SCHANNEL=0
 curl --version 2>/dev/null | head -1 | grep -qi schannel && SCHANNEL=1
 
-# 按通道给 curl 参数：relay 走 -x 代理；rest 在没有环境代理时强制 --noproxy
+# 直连 curl 参数：没有环境代理时强制 --noproxy，免得被全局代理劫持
 curl_opts() {
-  local kind="$1"
   (( SCHANNEL )) && { echo --ssl-no-revoke; }
-  if [[ "$kind" == relay ]]; then
-    echo -x; echo "$RELAY"
-  else
-    [[ -n "${HTTP_PROXY:-}${HTTPS_PROXY:-}" ]] || { echo --noproxy; echo '*'; }
-  fi
+  [[ -n "${HTTP_PROXY:-}${HTTPS_PROXY:-}" ]] || { echo --noproxy; echo '*'; }
   return 0
 }
 
-opts_of() { local -a a=(); while IFS= read -r v; do a+=("$v"); done < <(curl_opts "$1"); echo "${a[*]}"; }
+opts_of() { local -a a=(); while IFS= read -r v; do a+=("$v"); done < <(curl_opts); echo "${a[*]}"; }
 
 # 预热系统解析器缓存。
 # 为什么需要：4G 网络下首次解析 release-assets.githubusercontent.com 实测 11119 ms，
@@ -132,7 +113,7 @@ dns_warm() {
 # ──────────────────────────────────────────────────────────────────────────
 # 传输通道：gh 优先 → curl → node fetch
 #
-# 背景（2026-11-06 实测于 PC1 受限会话）：curl 可能拿不到 TLS 凭据句柄
+# 背景（2026-11-06 实测于 PC1 受限会话）：curl 可能拿不到 TLS 句柄
 #   curl: (35) schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS
 # 此时 gh（自带 TLS 栈）与 node 的 fetch 仍可用。因此 api/status 不能只绑 curl。
 # ──────────────────────────────────────────────────────────────────────────
@@ -158,29 +139,11 @@ node_get() {
 }
 
 # node 下载：curl 不可用时的兜底。
-#   node_download <url> <out>                 —— 直连（不走中转/镜像）
-#   node_download <url> <out> <token>         —— 带 Authorization（API 资产端点要用）
-#   node_download <url> <out> <token> <proxy> —— 额外走 HTTP 代理（relay 通道）。
-#                                     node ≥ 24 用 NODE_USE_ENV_PROXY=1 生效（实测可用）。
+#   node_download <url> <out>         —— 直连
+#   node_download <url> <out> <token> —— 带 Authorization（API 资产端点要用）
 node_download() {
-  local url="$1" out="$2" tok="${3:-}" proxy="${4:-}"
+  local url="$1" out="$2" tok="${3:-}"
   have_node || return 1
-  if [[ -n "$proxy" ]]; then
-    NODE_USE_ENV_PROXY=1 HTTPS_PROXY="$proxy" HTTP_PROXY="$proxy" \
-      node -e '
-        const [u, o, tok] = process.argv.slice(1);
-        const fs = require("fs");
-        const h = { "User-Agent": "pc1-github-sh" };
-        if (tok) h["Authorization"] = "Bearer " + tok;
-        fetch(u, { headers: h, redirect: "follow" })
-          .then(async r => {
-            if (!r.ok) { process.stderr.write("http " + r.status + "\n"); process.exitCode = 1; return; }
-            fs.writeFileSync(o, Buffer.from(await r.arrayBuffer()));
-          })
-          .catch(e => { process.stderr.write(String(e.message || e) + "\n"); process.exitCode = 1; });
-      ' "$url" "$out" "$tok"
-    return $?
-  fi
   node -e '
     const [u, o, tok] = process.argv.slice(1);
     const fs = require("fs");
@@ -212,20 +175,54 @@ node_probe() {
 # ── SSH 通道选路 ──
 # 文档一直写「默认 22，22 不通改 ssh.github.com:443」，但 2026-11-06 复核发现代码只拼
 # git@github.com:owner/repo.git，端口从不切换——文档承诺的兜底根本没实现。
-# 这里先探 github.com:22（/dev/tcp 探测，一个 TCP 握手，几十毫秒）；不通就换成
-# ssh://git@ssh.github.com:443/owner/repo.git。实测 22 端口同一小时内会整段不通。
-ssh_port_ok() { (exec 3<>/dev/tcp/"$1"/"$2") 2>/dev/null; }
+# 2026-11-08 又发现：选路本身用 /dev/tcp 探端口是错的。MSYS bash 的
+#   exec 3<>/dev/tcp/github.com/22
+# 连跑三次 1/3 通，而同一分钟 ssh -T git@github.com 3/3 successfully authenticated
+# ——替身探测会稳定地把「好的通道」判成坏，然后土路兜底吃满超时。
+# 现在改成直接用将来要走它的那个命令去试（ssh -T），并把结论缓存 10 分钟。
+#
+# 三个坑，都是实测撞出来的，改这函数前先读：
+#   1) 不能把结论存在普通变量里——调用点是 $(ssh_url_of ...)，命令替换跑在子 shell，
+#      变量赋值随子 shell 一起消失，等于每次都重探（实测同一脚本内连续两次给出相反答案）。
+#      → 结论落盘到 $_SSH_CACHE，子 shell 与下一次调用都能读到。
+#   2) 不能只探一次就定死 10 分钟——22 端口实测有单次失败、紧接着就成功的情况。
+#      → 单端口重试 2 次，2 次都失败才降级到 443。
+#   3) 缓存文件用 stat -c %Y 判年龄，不用 mktemp/锈 /tmp（本机 /tmp 映射不稳）。
+_SSH_CACHE="${GITHUB_SSH_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/pc1-ssh-target}"
+_SSH_CACHE_TTL="${GITHUB_SSH_CACHE_TTL:-600}"
+_ssh_works() { # $1=host $2=port；单端口重试 2 次，任一次 authenticated 即算通
+  local host="$1" port="$2" i out
+  for i in 1 2; do
+    out=$(timeout 25 ssh -p "$port" -o ConnectTimeout=8 -o BatchMode=yes \
+            -o StrictHostKeyChecking=accept-new -T "git@$host" 2>&1 || true)
+    [[ "$out" == *"successfully authenticated"* ]] && return 0
+    (( i == 1 )) && sleep 1
+  done
+  return 1
+}
 ssh_target() {
-  if ssh_port_ok github.com 22; then echo "22 github.com"; else echo "443 ssh.github.com"; fi
+  local t="" age=0
+  if [[ -s "$_SSH_CACHE" ]]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$_SSH_CACHE" 2>/dev/null || echo 0) ))
+    (( age < _SSH_CACHE_TTL )) && t=$(<"$_SSH_CACHE")
+  fi
+  if [[ -z "$t" || "$t" != "22 github.com" && "$t" != "443 ssh.github.com" ]]; then
+    if _ssh_works github.com 22; then t="22 github.com"; else t="443 ssh.github.com"; fi
+    mkdir -p "$(dirname "$_SSH_CACHE")" 2>/dev/null || true
+    printf "%s\n" "$t" > "$_SSH_CACHE" 2>/dev/null || true
+  fi
+  echo "$t"
 }
 ssh_url_of() {
-  local repo="$1"
-  if ssh_port_ok github.com 22; then
-    echo "git@github.com:$repo.git"
-  else
-    info "github.com:22 不通 → 改走 ssh.github.com:443" >&2
-    echo "ssh://git@ssh.github.com:443/$repo.git"
-  fi
+  local repo="$1" t
+  t=$(ssh_target)
+  case "$t" in
+    "22 github.com") echo "git@github.com:$repo.git" ;;
+    *)
+      info "github.com:22 认证不通 → 改走 ssh.github.com:443" >&2
+      echo "ssh://git@ssh.github.com:443/$repo.git"
+      ;;
+  esac
 }
 
 # git 能否 fork 远端助手（不能则 push/fetch/clone 在本会话里全废）
@@ -245,90 +242,25 @@ git_fork_state() {
   esac
 }
 
-# ── 中转站探测 / 起停 ──
-relay_up() { (exec 3<>/dev/tcp/$RELAY_HOST/$RELAY_PORT) 2>/dev/null; }
-
-# 中转站版本探针：新版有 /__relay/status（能报上游顺序与超时），旧版没有。
-# 它决定了「回退」是不是真的存在——旧版只认死一个上游 gh-proxy.com。
-relay_version() {
-  relay_up || { echo none; return 0; }
-  local body
-  body=$(curl -s --max-time 5 "$RELAY/__relay/status" 2>/dev/null)
-  case "$body" in
-    *'"ok": true'*|*'"ok":true'*) echo multi ;;
-    *) echo legacy ;;
-  esac
-}
-
-relay_start() {
-  if relay_up; then
-    case "$(relay_version)" in
-      legacy) warn "中转站已在跑，但它是**单上游旧版**（无 /__relay/status）；跑 github.sh relay deploy 换成多上游回退版" ;;
-      *)      ok "中转站已在跑 ($RELAY)" ;;
-    esac
-    return 0
-  fi
-  [[ -f "$RELAY_SERVER" ]] || { warn "中转站服务文件不存在: $RELAY_SERVER"; return 1; }
-  command -v node >/dev/null 2>&1 || { warn "没有 node，起不了中转站"; return 1; }
-  info "拉起中转站: node $RELAY_SERVER（证书 $RELAY_CERT_DIR）"
-  RELAY_CERT_DIR="$RELAY_CERT_DIR" RELAY_LOG_DIR="$RELAY_LOG_DIR" \
-    nohup node "$RELAY_SERVER" >/dev/null 2>&1 &
-  local i
-  for i in $(seq 1 40); do
-    relay_up && { ok "中转站就绪 ($RELAY)"; return 0; }
-    sleep 0.25
-  done
-  warn "中转站启动超时"
-  return 1
-}
-
-# 把仓库里的 tools/relay/server.mjs 部署到运行目录并重启（备份 + 自检）
-relay_deploy() {
-  local script
-  for script in "$SCRIPT_DIR/relay/deploy.sh" "/d/proj/PC1/tools/relay/deploy.sh"; do
-    [[ -f "$script" ]] && { RELAY_DEPLOY_DIR="$RELAY_HOME" RELAY_PORT="$RELAY_PORT" bash "$script" "$@"; return $?; }
-  done
-  warn "找不到 relay/deploy.sh（应在仓库 tools/relay/ 下）"
-  return 1
-}
-
-relay_stop() {
-  relay_up || { info "中转站没在跑"; return 0; }
-  local pid
-  pid=$(netstat -ano 2>/dev/null | grep LISTENING | grep -E "[:.]$RELAY_PORT[[:space:]]" | awk '{print $NF}' | head -1)
-  [[ -n "$pid" ]] || { warn "没找到监听 $RELAY_PORT 的进程"; return 1; }
-  taskkill //PID "$pid" //F >/dev/null 2>&1 && { ok "已停止中转站 (pid $pid)"; return 0; }
-  warn "停止失败 (pid $pid)"
-  return 1
-}
-
-# ── 通道枚举：每行 kind|url ──
+# ── 通道：只有直连一条 ──
+# 稳定端点只有 api.github.com 与 release-assets，其余用 API 端点绕开。
 candidates() {
-  local url="$1" m
-  relay_up && echo "relay|$url"
-  for m in "${MIRRORS[@]}"; do
-    if [[ -z "$m" ]]; then echo "direct|$url"; else echo "prefix|$m$url"; fi
-  done
-  return 0
+  echo "direct|$1"
 }
 
 prefix_name() {
   case "$1" in
-    https://gh-proxy.com/*) echo gh-proxy ;;
-    https://ghfast.top/*)   echo ghfast ;;
-    https://ghproxy.net/*)  echo ghproxy.net ;;
-    relay)                  echo "relay(8899)" ;;
-    prefix)                 echo mirror ;;
-    direct)                 echo direct ;;
-    *)                      echo "$1" ;;
+    direct) echo direct ;;
+    rest)   echo "release-assets" ;;
+    *)      echo "$1" ;;
   esac
 }
 
 # 探测：真测速。
 #
 # 老实现比的是 %{size_download} —— 每个通道都被 -r 0-1023 卡在 1024 字节，
-# 于是 (( size > best )) 永远只有候选列表里第一个赢，等于从未测速（实测三个
-# 镜像对同一资产全返回 `206 1024`）。现在比 %{speed_download}（curl 的平均
+# 于是 (( size > best )) 永远只有候选列表里第一个赢，等于从未测速。现在比
+# %{speed_download}（curl 的平均
 # 字节/秒），并顺带从 Content-Range 取文件总大小，供后面决定要不要上 aria2。
 #
 # 直连 github.com 被墙时旧版每次烧满 --max-time 12；现在 --connect-timeout 3
@@ -342,7 +274,7 @@ probe() {
   local kind="$1" url="$2" code size spd total hdr
   hdr=$(mktemp 2>/dev/null || echo "/tmp/probe.$$")
   read -r code size spd < <(
-    curl -sS $(opts_of "$kind") -D "$hdr" -o /dev/null \
+    curl -sS $(opts_of) -D "$hdr" -o /dev/null \
       -w '%{http_code} %{size_download} %{speed_download}' \
       --connect-timeout 3 --max-time "$PROBE_TIMEOUT" \
       -L -r "0-$((PROBE_BYTES-1))" "$url" 2>/dev/null || echo "000 0 0"
@@ -387,7 +319,7 @@ fetch_one() {
   local alog; alog="$(mktemp 2>/dev/null || echo "$out.aria2.log")"
   local okflag=0
   # rest = api.github.com 的资产端点（302 到 release-assets 预签名 URL）。
-  # token 与 Accept 只该发给 GitHub 自己的域名，镜像/中转站一律不带。
+  # token 与 Accept 只发给 GitHub 自己的域名。
   local -a auth=() akx=() akh=()
   if [[ "$kind" == rest ]]; then
     dns_warm api.github.com
@@ -403,8 +335,6 @@ fetch_one() {
   if command -v "$ARIA2" >/dev/null 2>&1 && (( fsize >= ARIA2_MIN )); then
     info "  aria2c 8 连接（文件 $(( fsize / 1048576 )) MiB）"
     local -a ax=()
-    [[ "$kind" == relay ]] && ax+=(--all-proxy="$RELAY")
-    [[ -f "$RELAY_CA" ]] && ax+=(--ca-certificate="$RELAY_CA")
     if "$ARIA2" "${ax[@]}" "${akh[@]}" --allow-overwrite=true -x 8 -s 8 -k 1M --max-tries=2 --timeout=30 \
          --summary-interval=0 --console-log-level=warn --show-console-readout=false \
          --auto-file-renaming=false --connect-timeout=5 \
@@ -413,22 +343,20 @@ fetch_one() {
     [[ $okflag -eq 1 ]] || info "  aria2 失败，改用 curl"
   fi
   if [[ $okflag -eq 0 ]]; then
-    # 必须校验 HTTP 状态码：镜像对不存在的资产会回 200 + "Not Found" 正文，
+    # 必须校验 HTTP 状态码：错误页会回 200 + "Not Found" 正文，
     # 只看 curl 退出码会把 9 字节的 "Not Found" 当成下载成功（实测踩到）。
     local code
-    code=$(curl -sS $(opts_of "$kind") -L --connect-timeout 5 --retry 2 --max-time 1800 \
+    code=$(curl -sS $(opts_of) -L --connect-timeout 5 --retry 2 --max-time 1800 \
       -o "$out" -w '%{http_code}' "${auth[@]}" "$url" 2>/dev/null || echo 000)
     [[ "$code" == 2* ]] && okflag=1 || info "  curl 拿到 http=$code"
   fi
   if [[ $okflag -eq 0 ]] && have_node; then
     info "  curl 没成，改用 node fetch"
-    local -a ndl=("$url" "$out")
-    [[ "$kind" == relay ]] && ndl+=("" "$RELAY")
-    node_download "${ndl[@]}" && okflag=1
+    node_download "$url" "$out" && okflag=1
   fi
   [[ $okflag -eq 1 && -s "$out" ]] || return 1
   # 拿到 HTML / 短文本说明是错误页/拦截页，不是目标文件。
-  # 只判 HTML 不够：镜像对 404 会回 200 + 正文 "Not Found"（9 字节），
+  # 只判 HTML 不够：404 会回 200 + 正文 "Not Found"（9 字节），
   # 不加这个检查就会把错误页当成品写进目标路径。
   if (( $(stat -c %s "$out" 2>/dev/null || echo 0) < 4096 )); then
     if head -c 200 "$out" | grep -qiE '<!DOCTYPE html|<html|^Not Found$|Bad Gateway|^404:|"message"\s*:\s*"Not Found"'; then
@@ -444,12 +372,11 @@ fetch_one() {
 }
 
 cmd_download() {
-  local url="" out="" sha="" via=""
+  local url="" out="" sha=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -o|--out)    out="$2"; shift 2 ;;
       -s|--sha256) sha="$2"; shift 2 ;;
-      --via)       via="$2"; shift 2 ;;
       -*)          die "download: 未知选项 $1" ;;
       *)           url="$1"; shift ;;
     esac
@@ -461,27 +388,15 @@ cmd_download() {
     local base="${url%%\?*}"; out="$DL_DIR/$(basename "$base")"
   fi
 
-  # 为什么不再「先逐通道测速再挑」：
-  #   镜像站在 Range 请求上表现不一致 —— 有的老实回 206（能被 PROBE_BYTES 截断），
-  #   有的直接回 200 并开始推整个文件，于是 probe 只能靠 --max-time 硬砍，
-  #   每个这样的候选白烧满 PROBE_TIMEOUT 秒。实测四个候选一轮探测 60+ 秒，
-  #   而两个候选的端到端下载只要 0.8–1.6 秒。探测本身成了主要成本。
-  # 所以改成**按优先级顺序直接下**：每个通道边下边计时，失败或速度低于阈值就换下一个；
-  # 拿到的第一个「够快」的通道直接用来下完，选路成本 ≈ 一次真实传输。
+  # 候选表现在只有直连一条（见 candidates），选路逻辑保留是为了将来加端点时不重写：
+  # 按顺序直接下，失败就换下一个，选路成本 ≈ 一次真实传输。
   local chosen="" kind="" best=0 code size spd total ck cu fsize=0
   local -a order=()
   while IFS='|' read -r ck cu; do
     [[ -z "$ck" ]] && continue
-    case "$via" in
-      "")      ;;
-      relay)   [[ "$ck" == relay ]] || continue ;;
-      mirror)  [[ "$ck" == prefix ]] || continue ;;
-      direct)  [[ "$ck" == direct ]] || continue ;;
-      *)       die "download: --via 只支持 relay|mirror|direct" ;;
-    esac
     order+=("$ck|$cu")
   done < <(candidates "$url")
-  [[ ${#order[@]} -gt 0 ]] || die "没有可用通道（--via 过滤掉了全部候选）" 2
+  [[ ${#order[@]} -gt 0 ]] || die "没有可用通道" 2
 
   if [[ "$PROBE" == 1 ]]; then
     info "逐通道测速（GITHUB_PROBE=1）…"
@@ -515,31 +430,28 @@ cmd_download() {
     fi
     info "  这条不通/太慢，换下一条"
   done
-  [[ $dlok -eq 1 ]] || die "下载失败（候选表里的通道全试过：relay/镜像/直连；先跑 github.sh status）" 2
+  [[ $dlok -eq 1 ]] || die "下载失败（直连不通；先跑 github.sh status）" 2
   verify_out "$out" ${sha:+-s "$sha"}
 }
 
-# 资产下载：先走常规通道（github.com 直链 + 镜像）；全失败时回落到 API 资产端点
+# 资产下载：先走 API 资产端点（api.github.com 302 → release-assets）；拿不到 id 才回落直链。
 # （api.github.com 通，302 到 release-assets.githubusercontent.com 也通）。
 cmd_asset() {
   local repo="${1:?需要 owner/repo}" tag="${2:?需要 tag}" name="${3:?需要文件名}"
   shift 3
-  local out="" sha="" via=""
+  local out="" sha=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -o|--out) out="$2"; shift 2 ;;
       -s|--sha256) sha="$2"; shift 2 ;;
-      --via) via="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
   [[ -n "$out" ]] || out="$DL_DIR/$name"
 
-  # 顺序很重要：**先 release-assets，后镜像**。
+  # 顺序很重要：**先 release-assets**。
   # api.github.com/…/releases/assets/<id> 会 302 到 release-assets.githubusercontent.com，
-  # 那是预签名 URL、直连可达，实测是全场最快的通道（同一 324 MB 资产：
-  # release-assets 5.09 MiB/s / ghfast 3.39 MiB/s / gh-proxy 1.32 MiB/s）。
-  # 老版本把它排在「所有镜像都失败之后」，等于永远用次优路径。
+  # 那是预签名 URL、直连可达，实测全场最快（324 MB 资产 5.09 MiB/s）。
   local t json obj id
   t=$(gh_token 2>/dev/null || true)
   if [[ -n "$t" ]]; then
@@ -570,11 +482,11 @@ cmd_asset() {
         warn "curl 走不通，改用 node fetch"
         if node_download "$aurl" "$out" "$t"; then verify_out "$out" ${sha:+-s "$sha"}; return 0; fi
       fi
-      warn "release-assets 失败，回落到镜像/直连"
+      warn "release-assets 失败，回落到直链"
     fi
   fi
 
-  cmd_download "https://github.com/$repo/releases/download/$tag/$name" --out "$out" ${sha:+-s "$sha"} ${via:+--via "$via"}
+  cmd_download "https://github.com/$repo/releases/download/$tag/$name" --out "$out" ${sha:+-s "$sha"}
 }
 
 # 委派官方 gh：api.github.com → release-assets.githubusercontent.com（本机实测可达）
@@ -587,12 +499,7 @@ cmd_ghdl() {
   [[ -n "$tag" ]] && args+=("$tag")
   args+=(-R "$repo")
   info "委派: gh ${args[*]} $*"
-  if relay_up; then
-    info "  经中转站 $RELAY"
-    HTTP_PROXY="$RELAY" HTTPS_PROXY="$RELAY" NODE_EXTRA_CA_CERTS="$RELAY_CA"       "$g" "${args[@]}" "$@" || die "gh release download 失败" 2
-  else
-    "$g" "${args[@]}" "$@" || die "gh release download 失败" 2
-  fi
+  "$g" "${args[@]}" "$@" || die "gh release download 失败" 2
 }
 
 # release：列出 release 的 tag / 资产。没有 "latest" release 时（404）回退到列全部。
@@ -631,7 +538,7 @@ cmd_clone() {
       return 4 ;;
   esac
 
-  # 1) SSH 优先：不经任何镜像/代理，也是本机 push 的唯一通道
+  # 1) SSH 优先，也是本机 push 的唯一通道
   if [[ -f "$HOME/.ssh/id_ed25519_gh" ]]; then
     info "尝试: SSH ($ssh_url)"
     if git -c core.sshCommand="ssh -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new"          clone "$ssh_url" "$dir" >/dev/null 2>&1; then
@@ -640,76 +547,17 @@ cmd_clone() {
     rm -rf "$dir" 2>/dev/null
   fi
 
-  # 2) 中转站：URL 不用改写，用 -c http.proxy 把 git 的 HTTPS 送进 8899
-  if relay_up; then
-    info "尝试: relay HTTPS ($RELAY)"
-    local -a gp=(-c "http.proxy=$RELAY")
-    [[ -f "$RELAY_CA" ]] && gp+=(-c "http.sslCAInfo=$RELAY_CA")
-    if git "${gp[@]}" clone --depth 1 "$url" "$dir" >/dev/null 2>&1; then
-      ok "clone 成功: $dir（relay）"; return 0
-    fi
-    rm -rf "$dir" 2>/dev/null
+  # 2) HTTPS 直连（SSH 失败时才试；schannel 后端避免私有 CA 干扰）
+  info "尝试: HTTPS ($url)"
+  if git -c http.sslBackend=schannel clone --depth 1 "$url" "$dir" >/dev/null 2>&1; then
+    ok "clone 成功: $dir（HTTPS）"; return 0
   fi
-
-  # 3) 镜像前缀（schannel：本机 git 全局是 openssl + 8899 私有 CA，镜像域名不在那张证书里）
-  #    不带 Authorization：镜像是第三方，公开仓库 clone 不需要凭据（实测）
-  local m cand
-  for m in "${MIRRORS[@]}"; do
-    [[ -z "$m" ]] && continue
-    cand="$m$url"
-    info "尝试: $m"
-    if git -c http.sslBackend=schannel clone --depth 1 "$cand" "$dir" >/dev/null 2>&1; then
-      ok "clone 成功: $dir（$(prefix_name "$cand")）"
-      git -C "$dir" remote set-url origin "$url"
-      return 0
-    fi
-    rm -rf "$dir" 2>/dev/null
-  done
+  rm -rf "$dir" 2>/dev/null
   die "clone 全部通道失败" 2
 }
 
-# push 两条通道：SSH 与 中转站(HTTPS)。默认 auto = SSH 先，失败自动回落 relay。
-#
-# 「HTTPS 写操作本机三条路全死」是 2026-11-08 之前的结论，**已被实测推翻**：
-#   GET  /dongopencv/tools.git/info/refs?service=git-receive-pack  经 relay → 200 (1.4s)，直连 21s 超时
-#   POST /dongopencv/tools.git/git-receive-pack                    经 relay → 200
-#   真推临时分支 probe-relay-push 成功，随后 push --delete 删净
-# 原因：relay 不区分方法，把 ctx.method 与 ctx.body 原样转发（tools/relay/server.mjs tryUpstream）。
-# 前提是 token 有 Contents: Read and write；403 时响应头 X-Accepted-Github-Permissions 会点名缺哪项。
-# 详见 docs/network-baseline.md 第四节。
-
-# 中转站通道：token 经 GIT_CONFIG_* 环境变量注入，不出现在进程命令行（ps 看不到）。
-# 不需要 http.sslVerify=false —— git 在本机默认 sslBackend=schannel，信任来自 Windows
-# 证书存储（relay 的 CA 已装进去），http.sslCAInfo 会被 schannel 静默忽略。
-# 实证：给一个不存在的 CA 路径照样成功；换成 openssl 后端且不给 CA 才报
-# "unable to get local issuer certificate (20)"。
-push_relay() {
-  local repo="$1" ref="$2"
-  relay_up || { warn "中转站没在跑（bash tools/github.sh relay up）"; return 1; }
-  local tok b64 url t0 t1 rc out
-  tok=$(require_token) || return 1
-  b64=$(printf 'x-access-token:%s' "$tok" | base64 | tr -d '\r\n')
-  url="https://github.com/$repo.git"
-  info "push(relay) → $url ($ref)"
-  t0=$(date +%s)
-  out=$(GIT_TERMINAL_PROMPT=0 \
-        GIT_CONFIG_COUNT=2 \
-        GIT_CONFIG_KEY_0=http.proxy       GIT_CONFIG_VALUE_0="$RELAY" \
-        GIT_CONFIG_KEY_1=http.extraheader GIT_CONFIG_VALUE_1="Authorization: Basic $b64" \
-        git push "$url" "$ref" 2>&1)
-  rc=$?
-  t1=$(date +%s)
-  (( t1 > t0 )) && info "耗时 $((t1-t0))s"
-  [[ $rc -eq 0 ]] && { ok "push 成功（relay）"; return 0; }
-  printf '%s\n' "$out" | sed 's/^/  /' >&2
-  case "$out" in
-    *"403"*|*"Permission to"*)
-      warn "这是授权问题不是链路问题：token 缺 Contents: Read and write"
-      warn "看响应头 X-Accepted-Github-Permissions 点了哪一项；补权限见 docs/pending-issues/pat-permission-fix.md" ;;
-  esac
-  return 1
-}
-
+# push 只有一条通道：SSH。
+# 走本地 ~/.ssh/id_ed25519_gh（22 或 ssh.github.com:443），不需要 token。
 push_ssh() {
   local repo="$1" ref="$2"
   [[ -f "$HOME/.ssh/id_ed25519_gh" ]] || {
@@ -729,18 +577,15 @@ push_ssh() {
 
 cmd_push() {
   local -a pos=()
-  local via="auto"
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --via) via="$2"; shift 2 ;;
-      -*)    die "push: 未知选项 $1（可用 --via ssh|relay|auto）" ;;
+      -*)    die "push: 未知选项 $1（只走 SSH，没有通道选项）" ;;
       *)     pos+=("$1"); shift ;;
     esac
   done
   [[ ${#pos[@]} -ge 1 ]] || die "push: 需要 owner/repo [ref] [remote]"
   local repo="${pos[0]}" ref="${pos[1]:-HEAD}" remote="${pos[2]:-origin}"
   [[ "$repo" == */* ]] || die "push: 需要 owner/repo"
-  case "$via" in ssh|relay|auto) ;; *) die "push: --via 只支持 ssh|relay|auto" ;; esac
 
   local fork fork_msg; { read -r fork; read -r fork_msg; } < <(git_fork_state)
   case "$fork" in
@@ -757,16 +602,8 @@ cmd_push() {
       return 4 ;;
   esac
 
-  info "push $repo $ref → $remote（通道 $via）"
-  case "$via" in
-    ssh)   push_ssh   "$repo" "$ref" || die "push 失败（--via ssh）" 1 ;;
-    relay) push_relay "$repo" "$ref" || die "push 失败（--via relay）" 1 ;;
-    auto)
-      push_ssh "$repo" "$ref" && return 0
-      warn "SSH 通道失败 → 回落中转站(HTTPS)"
-      push_relay "$repo" "$ref" && return 0
-      die "push 全部通道失败（ssh + relay）。SSH 不通先查账号上有没有公钥：github.sh api users/<owner>/keys" 2 ;;
-  esac
+  info "push $repo $ref → $remote（SSH）"
+  push_ssh "$repo" "$ref" || die "push 失败。SSH 不通先查账号上有没有公钥：github.sh api users/<owner>/keys" 2
 }
 
 cmd_sshcheck() {
@@ -783,7 +620,7 @@ cmd_sshcheck() {
 # raw 取文件正文。raw 域本机时通时不通，所以：
 # 1) 走 API contents 端点（最稳，base64 回来自己解）；
 # 2) 再试 node fetch 直取 raw 域；
-# 3) 最后才试 curl 走镜像通道。
+# 3) 最后才试 curl 直连。
 cmd_raw() {
   local repo="${1:?owner/repo}" ref="${2:?ref}" path="${3:?path}"
   local t json b64 out
@@ -812,77 +649,29 @@ cmd_raw() {
     printf "%s\n" "$out"; return 0
   fi
 
-  # 3) curl 走镜像/中转通道
-  #
-  # Authorization 只发给 direct / relay；镜像是第三方，公开内容不需要它（无 token 照样 200 / 206）。
-  local ck cu auth=()
-  while IFS='|' read -r ck cu; do
-    [[ -z "$ck" ]] && continue
-    auth=()
-    [[ "$ck" == direct || "$ck" == relay ]] && [[ -n "$t" ]] && auth=(-H "Authorization: token $t")
-    out=$(curl -sS $(opts_of "$ck") --max-time 25 "${auth[@]}" -L "$cu" 2>/dev/null)
-    if [[ -n "$out" ]] && ! grep -qi "<!DOCTYPE html" <<<"${out:0:200}"; then printf "%s\n" "$out"; return 0; fi
-  done < <(candidates "$rawurl")
+  # 3) curl 直连
+  local auth=()
+  [[ -n "$t" ]] && auth=(-H "Authorization: token $t")
+  out=$(curl -sS $(opts_of) --max-time 25 "${auth[@]}" -L "$rawurl" 2>/dev/null)
+  if [[ -n "$out" ]] && ! grep -qi "<!DOCTYPE html" <<<"${out:0:200}"; then printf "%s\n" "$out"; return 0; fi
   die "raw 取不到: $repo/$ref/$path" 2
 }
 
-# 打印可直接 eval 的 export：让当前 shell 里任意工具（gh / git / npm / curl）透明走中转站
-# env 有两种用法，之前只做了第一种却写成「打印脚本会用的环境变量」：
-#   github.sh env              → 打印可直接 eval 的代理 export（中转站在跑才有）
-#   github.sh env --config     → 打印脚本实际读取/推导的全部配置变量及当前值（不要求中转站）
+# 打印脚本实际读取/推导的配置变量及当前值。
 cmd_env() {
-  if [[ "${1:-}" == "--config" || "${1:-}" == "-c" ]]; then
-    printf '%-24s %s\n' \
-      GITHUB_TOKEN_FILE   "$TOKEN_FILE（$( [[ -s "$TOKEN_FILE" ]] && echo 存在 || echo 缺失 )）" \
-      GITHUB_DL_DIR       "$DL_DIR" \
-      GITHUB_RELAY        "$RELAY" \
-      GITHUB_RELAY_HOST   "$RELAY_HOST" \
-      GITHUB_RELAY_PORT   "$RELAY_PORT" \
-      GITHUB_RELAY_SERVER "$RELAY_SERVER（$( [[ -f "$RELAY_SERVER" ]] && echo 存在 || echo 缺失 )）" \
-      GITHUB_RELAY_HOME   "$RELAY_HOME" \
-      GITHUB_RELAY_CA     "$RELAY_CA（$( [[ -f "$RELAY_CA" ]] && echo 存在 || echo 缺失 )）" \
-      RELAY_CERT_DIR      "$RELAY_CERT_DIR" \
-      RELAY_LOG_DIR       "$RELAY_LOG_DIR" \
-      ARIA2C              "$ARIA2（$( command -v "$ARIA2" >/dev/null 2>&1 && echo 在 PATH || echo 不在 PATH )）" \
-      GITHUB_ARIA2_MIN    "$ARIA2_MIN" \
-      GITHUB_PROBE        "$PROBE（1 = 回到先测速再选路的旧策略）" \
-      GITHUB_PROBE_BYTES  "$PROBE_BYTES" \
-      GITHUB_PROBE_TIMEOUT "$PROBE_TIMEOUT"
-    return 0
-  fi
-  relay_up || die "中转站没在跑（先 github.sh relay up；只想知道配置就加 --config）" 1
-  echo "export HTTP_PROXY=$RELAY"
-  echo "export HTTPS_PROXY=$RELAY"
-  echo "export http_proxy=$RELAY"
-  echo "export https_proxy=$RELAY"
-  [[ -f "$RELAY_CA" ]] && echo "export NODE_EXTRA_CA_CERTS=$RELAY_CA"
-  # github 家族故意不进 NO_PROXY：它们必须走中转站
-  echo "export NO_PROXY=localhost,127.0.0.1,::1"
-  echo "export no_proxy=localhost,127.0.0.1,::1"
+  printf '%-24s %s\n' \
+    GITHUB_TOKEN_FILE   "$TOKEN_FILE（$( [[ -s "$TOKEN_FILE" ]] && echo 存在 || echo 缺失 )）" \
+    GITHUB_DL_DIR       "$DL_DIR" \
+    ARIA2C              "$ARIA2（$( command -v "$ARIA2" >/dev/null 2>&1 && echo 在 PATH || echo 不在 PATH )）" \
+    GITHUB_ARIA2_MIN    "$ARIA2_MIN" \
+    GITHUB_PROBE        "$PROBE（1 = 先测速再选路）" \
+    GITHUB_PROBE_BYTES  "$PROBE_BYTES" \
+    GITHUB_PROBE_TIMEOUT "$PROBE_TIMEOUT"
   return 0
 }
 
-cmd_relay() {
-  case "${1:-status}" in
-    up)     relay_start ;;
-    down)   relay_stop ;;
-    deploy) shift; relay_deploy "$@" ;;
-    status)
-      if relay_up; then
-        case "$(relay_version)" in
-          multi)  ok "中转站在线: $RELAY（多上游回退版）"; curl -s --max-time 5 "$RELAY/__relay/status" | sed 's/^/  /'; echo >&2 ;;
-          legacy) warn "中转站在线: $RELAY，但是**单上游旧版**（无回退）。github.sh relay deploy 可换成新版" ;;
-          *)      ok "中转站在线: $RELAY" ;;
-        esac
-      else
-        warn "中转站未运行: $RELAY（github.sh relay up 拉起）"
-      fi ;;
-    *)      die "relay: 只支持 up|down|deploy|status" ;;
-  esac
-}
-
 # status 的判读原则：每条通道都说清「这次探测走的是哪个传输器、结论是什么」。
-# 不能把 curl 的失败报成「token 无效」——那是把传输器问题栽给凭据。
+# 不能把 curl 的失败报成「token 无效」——那是把传输器问题栽给 token。
 cmd_token() { require_token; echo; }
 
 cmd_status() {
@@ -908,7 +697,7 @@ cmd_status() {
       warn "  探测 api.github.com 得到: ${cprobe:0:160}"
       case "$cprobe" in
         *SEC_E_NO_CREDENTIALS*|*"curl: (35)"*)
-          warn "  这是本机 curl 的 TLS 凭据句柄问题，不是网络也不是 token。api/status 会自动改用 gh 或 node。" ;;
+          warn "  这是本机 curl 的 TLS 句柄问题，不是网络也不是 token。api/status 会自动改用 gh 或 node。" ;;
       esac
     fi
   else
@@ -927,7 +716,7 @@ cmd_status() {
   if t=$(gh_token) && [[ -n "$t" ]]; then
     # 顺序必须和 cmd_api 一致：gh → curl → node。三处（api / status / asset）以前各写一套，
     # 同一台机器上「谁先谁后」都不一样，读代码的人没法预测。统一成这一个顺序。
-    # 失败时如实说是哪个传输器失败，不把传输器问题栽给凭据。
+    # 失败时如实说是哪个传输器失败，不把传输器问题栽给 token。
     if g=$(gh_bin) && who=$(GH_TOKEN="$t" "$g" api user --jq .login 2>/dev/null) && [[ -n "$who" ]]; then
       how="gh api"
     elif raw=$(curl -sS $(opts_of rest) --max-time 15 -H "Authorization: token $t" -H "Accept: application/vnd.github+json" https://api.github.com/user 2>/dev/null) && [[ -n "$raw" ]]; then
@@ -943,27 +732,15 @@ cmd_status() {
     warn "无 token"
   fi
 
-  echo "── 中转站 ──" >&2
-  if relay_up; then
-    case "$(relay_version)" in
-      multi)  ok "在线 $RELAY，多上游回退版（下载通道之一，也是 gh/git 的透明代理）" ;;
-      legacy) warn "在线 $RELAY，但是单上游旧版：上游 gh-proxy.com 挂了就整条断。github.sh relay deploy 换新版" ;;
-      *)      ok "在线 $RELAY" ;;
-    esac
-  else warn "未运行（github.sh relay up 可拉起；不影响镜像通道）"; fi
-
   echo "── 通道可达性（用 node fetch 探测，绕开 curl 的 TLS 问题）──" >&2
   local code size tries i
   # 每条通道探测一个真实可取的 URL。codeload 的根路径会直接拒绝，必须打归档路径，
   # 否则会把「本来能用」的通道误判成不通（2026-11-06 实测：root 失败，tar.gz 200）。
   local -a probes=(
     "api.github.com|https://api.github.com/|API 挂了就没法干活；重试或换时段"
-    "github.com|https://github.com/|443 被墙，属正常：下载走 relay/镜像，写操作走 SSH"
+    "github.com|https://github.com/|443 时通时不通；不通不影响干活（写走 SSH，读走 api.github.com）"
     "codeload.github.com|https://codeload.github.com/octocat/Hello-World/tar.gz/refs/heads/master|归档域；根路径 403 是它自己的策略，不代表不通"
     "raw.githubusercontent.com|https://raw.githubusercontent.com/dongopencv/tools/master/AGENTS.md|raw 域时通时不通（实测 8/8 失败、偶发成功）；要稳就改走 api.github.com/repos/<o>/<r>/contents/<path>"
-    "gh-proxy.com|https://gh-proxy.com/|镜像"
-    "ghfast.top|https://ghfast.top/|镜像"
-    "ghproxy.net|https://ghproxy.net/|镜像"
     "release-assets.githubusercontent.com|https://release-assets.githubusercontent.com/|release 资产域（根路径 404 属正常）"
   )
   local item name purl hint
@@ -988,23 +765,21 @@ cmd_status() {
   done
 
   echo "── SSH（push 通道） ──" >&2
-  local sshok=0 hp
+  # 2026-11-08：别再用 /dev/tcp 探端口。MSYS bash 的 /dev/tcp 连 github.com:22 会 10 s 超时，
+  # 而同一秒 `ssh -T git@github.com` 秒回 authenticated——探测手段本身在骗人（#5 复核）。
+  # 直接拿真正要用的 ssh 去试，顺手把「端口通」与「密钥注册了」一次说清。
+  local sshok=0 hp out
   for hp in "github.com 22" "ssh.github.com 443"; do
     set -- $hp
-    if timeout 10 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; then
-      ok "$1:$2 → 通"; sshok=1
-    else
-      warn "$1:$2 → 不通"
-    fi
-  done
-  if [[ $sshok -eq 1 ]]; then
-    local out
-    local sport shost; read -r sport shost < <(ssh_target)
-    out=$(timeout 20 ssh -p "$sport" -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -T "git@$shost" 2>&1 || true)
+    out=$(timeout 20 ssh -p "$2" -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T "git@$1" 2>&1 || true)
     case "$out" in
-      *"successfully authenticated"*) ok "SSH 认证: $(printf "%s" "$out" | head -1)" ;;
-      *) warn "SSH 端口通但认证未过（密钥未注册？跑 skills-vault 里的 setup-gh.sh stage 4：C:/Users/Admin/.skills-vault/download/scripts/setup-gh.sh——不在本仓库）" ;;
+      *"successfully authenticated"*) ok "$1:$2 → 通，认证成功"; sshok=1 ;;
+      *"Permission denied"*)         warn "$1:$2 → 端口通，但认证失败（公钥没注册到这个账号？）" ;;
+      *)                             warn "$1:$2 → 不通" ;;
     esac
+  done
+  if [[ $sshok -eq 0 ]]; then
+    warn "    两条 SSH 都不通 → push 做不了。先在 https://github.com/settings/keys 确认公钥已注册。"
   fi
 
   echo "── git 传输（本会话能不能 push/fetch） ──" >&2
@@ -1018,7 +793,7 @@ cmd_status() {
 }
 
 # api：先 gh，再 curl，最后 node。三者的失败理由不一样，不能混为一谈。
-# gh 自带 TLS 栈且处理分页/JSON；curl 在本机可能没有 TLS 凭据句柄；node 永远兜底。
+# gh 自带 TLS 栈且处理分页/JSON；curl 在本机可能没有 TLS 句柄；node 永远兜底。
 cmd_api() {
   local method=GET path="" jq="" body="" x
   local -a fields=()
@@ -1101,7 +876,6 @@ cmd_api() {
 case "${1:-}" in
   status)   shift; cmd_status "$@" ;;
   env)      shift; cmd_env "$@" ;;
-  relay)    shift; cmd_relay "$@" ;;
   token)    shift; cmd_token "$@" ;;
   api)      shift; cmd_api "$@" ;;
   release)  shift; cmd_release "$@" ;;

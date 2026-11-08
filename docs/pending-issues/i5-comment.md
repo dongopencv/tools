@@ -29,7 +29,7 @@ exit 1
 
 | 入口 | 结果 |
 |---|---|
-| `bash <vault>/scripts/github.sh status` | 全绿：gh 2.103.3 / token 41 B / api 认证 dongopencv / 各镜像可达 / SSH 22+443 都认证成功 |
+| `bash <vault>/scripts/github.sh status` | 全绿：gh 2.103.3 / token 41 B / api 认证 dongopencv / SSH 22+443 都认证成功 |
 | `... api repos/dongopencv/tools --jq .full_name` | `dongopencv/tools` |
 | `~/.dsh/skills`（整根 junction） | 同一真身 |
 | `~/.trae-cn/skills`（整根 junction） | 同上 |

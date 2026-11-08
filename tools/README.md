@@ -22,18 +22,17 @@ bash tools/github.sh <子命令> [参数…]
 
 | 子命令 | 作用 | 例 |
 |---|---|---|
-| `status` | 全通道体检：gh / 传输器 / token / 中转站 / 可达性 / SSH / git 传输 | `bash tools/github.sh status` |
+| `status` | 全通道体检：gh / 传输器 / token / 可达性 / SSH / git 传输 | `bash tools/github.sh status` |
 | `api` | 调 GitHub API（自动在 gh → curl → node 之间选路） | `bash tools/github.sh api repos/owner/repo --jq .full_name` |
 | `release` | 列出 release 的 tag / 资产 | `bash tools/github.sh release owner/repo v1.2.3` |
-| `asset` | 下载 release 资产（**先走 release-assets**，镜像兜底，SHA256 校验） | `bash tools/github.sh asset owner/repo v1.2.3 file.zip -s <sha256>` |
-| `download` | 下载任意 URL（顺序试通道，大文件才上 aria2） | `bash tools/github.sh download <url> -o out.bin -s <sha256>` |
+| `asset` | 下载 release 资产（走 api 资产端点 → release-assets，SHA256 校验） | `bash tools/github.sh asset owner/repo v1.2.3 file.zip -s <sha256>` |
+| `download` | 下载任意 URL（大文件才上 aria2） | `bash tools/github.sh download <url> -o out.bin -s <sha256>` |
 | `raw` | 取文件正文（走 API contents，raw 域不稳时的兜底） | `bash tools/github.sh raw owner/repo master README.md` |
-| `clone` | 克隆仓库（SSH 优先，回退镜像） | `bash tools/github.sh clone owner/repo` |
-| `push` | 推送（SSH 优先，失败自动回落中转站 HTTPS） | `bash tools/github.sh push owner/repo HEAD [--via ssh\|relay\|auto]` |
+| `clone` | 克隆仓库（SSH 优先，不通才 HTTPS 直连） | `bash tools/github.sh clone owner/repo` |
+| `push` | 推送（只走 SSH：22 不通自动改 ssh.github.com:443） | `bash tools/github.sh push owner/repo HEAD` |
 | `ghdl` | 委派官方 `gh release download` | `bash tools/github.sh ghdl owner/repo v1.2.3 -p '*.zip'` |
 | `sshcheck` | 只测 SSH 密钥认证 | `bash tools/github.sh sshcheck` |
-| `env` | 打印可直接 eval 的代理 export（中转站在跑才有）；`--config` 打印全部配置变量的当前值 | `eval "$(bash tools/github.sh env)"` / `bash tools/github.sh env --config` |
-| `relay` | 起停/部署本地 8899 中转站（`deploy` 把仓库版同步到运行目录并重启） | `bash tools/github.sh relay up` / `relay deploy` |
+| `env` | 打印全部配置变量的当前值 | `bash tools/github.sh env --config` |
 | `token` | 打印 token（调试用，**别贴进 issue/日志**） | `bash tools/github.sh token` |
 
 ### 传输器选路
@@ -42,12 +41,12 @@ bash tools/github.sh <子命令> [参数…]
 
 1. **`gh`** —— 自带 TLS 栈，最稳。但在仓库目录里不带 `-R` / `GH_REPO` 会试图 fork git
    推断 remote 而失败（`failed to run git: pipe: Access is denied`）。
-2. **`curl`** —— 本机某些会话里 curl 拿不到 TLS 凭据句柄：
+2. **`curl`** —— 本机某些会话里 curl 拿不到 TLS 句柄：
    `curl: (35) schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`。
    这是 curl 自身的问题，**不是网络也不是 token 的问题**。
 3. **`node` 的 `fetch`** —— 永远兜底，本机实测稳定可用。
 
-`status` 会分别报告「传输器」和「token 认证」两节，就是为了不把传输器故障误读成凭据故障。
+`status` 会分别报告「传输器」和「token 认证」两节，就是为了不把传输器故障误读成 token 故障。
 
 > 这个顺序在 `api`、`status`、`asset` 三处**曾经各不相同**（有的 gh→node→curl，有的只有
 > gh→node），同一台机器上「谁先谁后」读代码都预测不出来。2026-11-07 统一成 gh → curl → node
@@ -58,23 +57,18 @@ bash tools/github.sh <子命令> [参数…]
 老版本是「先逐通道探测再挑最快」，实测这个策略本身比下载还贵：
 
 - 探测比的是 `%{size_download}`，而每个通道都被 `-r 0-1023` 卡在 1024 字节 → 永远只有候选表第一个赢，等于从未测速。
-- 镜像对 Range 的处理不一致：有的老实回 `206`，有的直接回 `200` 并开始推整个文件 → 探测只能靠 `--max-time` 硬砍，四个候选一轮 **60+ 秒**，而真正下载只要 0.8–1.6 秒。
+- 不同通道对 Range 的处理不一致：有的老实回 `206`，有的直接回 `200` 并开始推整个文件 → 探测只能靠 `--max-time` 硬砍，一轮 **60+ 秒**，而真正下载只要 0.8–1.6 秒。
 
 现在改成**按候选表顺序直接下，失败或大小不符就换下一条**，选路成本 ≈ 一次真实传输：
 
-1. `asset` 先走 `api.github.com/…/releases/assets/<id>`（302 到 `release-assets.githubusercontent.com`，预签名、直连可达，**全场最快**：同一 324 MB 资产 5.09 MiB/s，而 ghfast 3.39、gh-proxy 1.32）。
-2. 失败才回落到 `download` 的候选表：relay(8899) → gh-proxy → ghfast → ghproxy.net → 直连。
+1. `asset` 走 `api.github.com/…/releases/assets/<id>`（302 到 `release-assets.githubusercontent.com`，预签名、直连可达，**全场最快**：324 MB 资产实测 5.09 MiB/s）。
+2. 失败才回落到直链 `browser_download_url`。
 3. 每换一条通道都先删半截文件：不同通道未必都支持续传，`-C -` 接手别处残片会算出坏哈希。
 4. aria2 只在文件 ≥ 8 MiB 时启用（实测 2.18 MiB 时它与 curl 打平，更小的文件反而慢 6–12 倍）。
 
 实测（同一 2.18 MiB 资产）：改造前 `download` **52.2 s**，改造后 **8.2 s**；`asset` 三轮 3.0 / 3.8 / 12.8 s（第三轮是当时链路自己慢）。
 
 想回到「先测速再选」的旧行为：`GITHUB_PROBE=1 bash tools/github.sh download <url>`。
-
-### 镜像分支不带凭据
-
-`raw` 与 `clone` 的镜像分支都不带 `Authorization`，只有 `api.github.com` / `release-assets` /
-直连 / relay 才带。
 
 ### 通道探测要说人话
 
@@ -84,50 +78,18 @@ bash tools/github.sh <子命令> [参数…]
 
 `release` 在仓库没有 `latest` release 时会自动回退成列出全部 release。
 
-### 写操作的通道与前提（2026-11-08 二次更正，实测）
-
-`push` 有**两条**通道，默认 `--via auto`：SSH 先，失败自动回落中转站 HTTPS。
+### 写操作只有 SSH 一条
 
 ```bash
-bash tools/github.sh push owner/repo HEAD              # auto：SSH → 失败回落 relay
-bash tools/github.sh push owner/repo HEAD --via ssh    # 只走 SSH（22 不通自动改 ssh.github.com:443）
-bash tools/github.sh push owner/repo HEAD --via relay  # 只走 8899 中转站（HTTPS）
+bash tools/github.sh push owner/repo HEAD     # 只走 SSH；22 不通自动改 ssh.github.com:443
 ```
 
-**「HTTPS 写三条路全死」这句是错的，2026-11-08 已实测推翻。** 证据：
+`github.com:443` 时通时不通**不影响 push**：写走 SSH，读走 `api.github.com`。别为它加通道。
 
-| 请求 | 直连 | 经 8899 relay |
-|---|---|---|
-| `GET …/tools.git/info/refs?service=git-receive-pack` | ❌ 21.09 s，http 000 | ✅ 200 / 413 B / 1.40 s，返回真实 ref |
-| `POST …/tools.git/git-receive-pack`（body `0000`） | ❌ 21.05 s，http 000 | ✅ 200 / 0 B / 1.74 s |
-| 真推临时分支 `probe-relay-push` | — | ✅ `* [new branch]`，随后 `push --delete` 删净 |
-| `github.sh push … --via relay` | — | ✅ 5 s，`[ok] push 成功（relay）` |
-| `github.sh push … --via ssh` | ✅ 4 s | — |
-
-原因：`tryUpstream` 把 `ctx.method` 与 `ctx.body` **原样转发**（`tools/relay/server.mjs:113,156`），
-不区分读写；`github.com` 经 relay 是真转发到 GitHub，不是让镜像站代劳。
-
-**两个容易搞错的前提**：
-
-1. **不需要 `http.sslVerify=false`，也不需要 `http.sslCAInfo`**。本机 git 默认
-   `http.sslBackend=schannel`，信任来自 **Windows 证书存储**（relay 的 CA 已装在里面）。
-   实测：给一个**不存在**的 `http.sslCAInfo` 路径照样成功（schannel 静默忽略它）；
-   只有显式 `http.sslBackend=openssl` 且不给 CA 才报
-   `SSL certificate problem: unable to get local issuer certificate (20)`，那时才需
-   `http.sslCAInfo=C:/Users/Admin/dsh-mirror-proxy/certs/ca.crt.pem`。
-   **关校验是多余且不必要的安全损失。**
-2. **token 不进命令行**：用 `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`
-   环境变量注入 `http.extraheader`；`git -c http.extraheader=…` 会出现在 `ps` /
-   `Get-CimInstance Win32_Process` 里。`push_relay()` 已按这个写法实现。
-
-若 `push` 返回 `403` 且远端提示 `Permission to <owner>/<repo>.git denied`，
-**那是授权问题不是链路问题**：看响应头 `X-Accepted-Github-Permissions` 点了哪一项，
-细粒度 PAT 缺 `Contents: Read and write`。判据见 `docs/pending-issues/pat-permission-fix.md`。
-
-SSH 报 `Permission denied (publickey)` 时**先查账号上有没有公钥**
-（`github.sh api users/dongopencv/keys`）：2026-11-08 曾测得 **0 个**（公钥被移除，
-改 `~/.ssh/config` 无用），当天 02:38 补回 1 个（id 169145688，ssh-ed25519），之后 SSH 恢复。
-
+SSH 报 `Permission denied (publickey)` = **账号上没有这把公钥**，既不是 config 问题也不是网络问题。
+自检：`ssh-keygen -l -f ~/.ssh/id_ed25519_gh.pub` 拿到指纹，再对照公开端点
+`bash tools/github.sh api users/<owner>/keys`（或网页 https://github.com/settings/keys）。
+细粒度 PAT 读/写不了账号级公钥（`gh api user/keys` 返回 403），**加公钥只能人工在设置页做**。
 **在受限会话（agent 沙箱）里，git 连传输进程都 fork 不出来**：
 
 ```
@@ -144,9 +106,9 @@ fatal: unable to fork
 - `gh`（必需，MSI 装完要重开 shell 才进 PATH；脚本会自己去 `C:/Program Files/GitHub CLI/gh.exe` 找）
   - 本机实测版本：`gh version 2.103.3 (2026-10-26)`（release tag `v2.103.3`）
   - 已装二进制的 SHA256：`d303d8ac3f5e9438bf7c977b64dd6425513eae46218f8881d30694f28c1d0dfd`（`sha256sum '/c/Program Files/GitHub CLI/gh.exe'`）；核对官方 hash 以 `v2.103.3` release 的 `gh_2.103.3_checksums.txt` 为准
-- `node`（兜底传输器 + 中转站）
+- `node`（兜底传输器）
 - `aria2c`（可选，多连接下载；没有就回退 curl 续传）
-- `ssh` + `~/.ssh/id_ed25519_gh`（push 的 SSH 通道；SSH 不可用时 push 仍可走中转站）
+- `ssh` + `~/.ssh/id_ed25519_gh`（push 的唯一通道）
 
 实测（本机）：`aria2c` 在 workspace-write 沙箱里会以
 `Failed to initialize WinTLS context handle` 失败，脚本会自动回退 curl，
@@ -160,7 +122,7 @@ fatal: unable to fork
 | 码 | 含义 | 典型场景 |
 |---|---|---|
 | `0` | 成功 | 下载完成并通过 SHA256、API 返回 JSON、push 成功 |
-| `1` | 参数或环境错误 | 缺 `owner/repo`、未知选项、`--via` 取值非法、两条 push 通道都被服务端拒绝 |
+| `1` | 参数或环境错误 | 缺 `owner/repo`、未知选项、SSH 被服务端拒绝 |
 | `2` | 网络全通道失败 | 候选通道全试过仍失败；`api` 三个传输器全挂 |
 | `3` | 校验失败 / API 明确拒绝 | SHA256 不符、下到 HTML 错误页；GitHub 返回 4xx/5xx（**传输是通的**，别去查网） |
 | `4` | 受限会话 | git 无法 fork 传输进程（沙箱），clone/push/fetch 注定失败，需普通终端 |
@@ -174,14 +136,6 @@ fatal: unable to fork
 |---|---|---|
 | `GITHUB_TOKEN_FILE` | `tools/.github-token`，若不存在则回退 `C:/Users/Admin/.skills-vault/download/scripts/.github-token` | token 文件（**不在仓库里**，靠 `.gitignore` 的 `*.token` 挡住） |
 | `GITHUB_DL_DIR` | `$HOME/Downloads/github` | 下载落地目录 |
-| `GITHUB_RELAY` | `http://127.0.0.1:8899` | 本地中转站地址（喂给代理变量） |
-| `GITHUB_RELAY_HOST` | `127.0.0.1` | 中转站主机（`relay_up` 用它做 TCP 探活） |
-| `GITHUB_RELAY_PORT` | `8899` | 中转站端口（同上） |
-| `GITHUB_RELAY_SERVER` | `/c/Users/Admin/dsh-mirror-proxy/server.mjs` | 中转站服务文件 |
-| `GITHUB_RELAY_HOME` | `/c/Users/Admin/dsh-mirror-proxy` | 中转站运行目录（证书与日志都在这里；真身是仓库 `tools/relay/server.mjs`，用 `relay deploy` 同步） |
-| `GITHUB_RELAY_CA` | `<RELAY_HOME>/certs/ca.crt.pem` | 中转站 MITM 证书；存在时 `env` 会一起导出 `NODE_EXTRA_CA_CERTS` |
-| `RELAY_CERT_DIR` | `<RELAY_HOME>/certs` | 传给 server.mjs 的证书目录 |
-| `RELAY_LOG_DIR` | `<RELAY_HOME>/logs` | 传给 server.mjs 的日志目录 |
 | `ARIA2C` | `aria2c` | aria2 可执行文件 |
 | `GITHUB_ARIA2_MIN` | `8388608` | 文件小于这个字节数就不用 aria2（小文件多连接是负优化） |
 | `GITHUB_PROBE` | `0` | 设 `1` 回到「先逐通道测速再选」的旧策略 |
@@ -202,7 +156,7 @@ fatal: unable to fork
 
 ### 下载失败要能看出来
 
-镜像和 relay 对不存在的资产会回 **HTTP 200 + 正文 `Not Found`**（9 字节）。
+有些直链对不存在的资产会回 **HTTP 200 + 正文 `Not Found`**（9 字节）。
 早期版本只看 curl 退出码，于是 404 也 `exit=0` 并写出一个 9 字节的假文件。
 现在 `fetch_one` 校验 `%{http_code}` 必须是 `2xx`，并对小于 4 KiB 的产物再查一遍
 `<!DOCTYPE html` / `Not Found` / `Bad Gateway` / `404:` 等错误页特征。
@@ -219,7 +173,7 @@ bash C:/Users/Admin/.skills-vault/download/scripts/github.sh status   # 跑的�
 ```
 
 - 定位顺序：`$GITHUB_GATEWAY` → `$HOME/proj/PC1/tools/github.sh` → `/d/proj/PC1/tools/github.sh`。仓库换位置就 `export GITHUB_GATEWAY=/path/to/tools/github.sh`。
-- 收敛前 vault 那份是 421 行旧副本（缺 `ghdl`/`env`/`relay`，且带着 `sha256sum "$out"` 的 Windows 反斜杠误判），已备份为同目录 `github.sh.bak-2026-11-07-pre-shim`。**不要再改那份备份、也不要照着它改。**
+- 收敛前 vault 那份是 421 行旧副本（缺 `ghdl`/`env`，且带着 `sha256sum "$out"` 的 Windows 反斜杠误判），已备份为同目录 `github.sh.bak-2026-11-07-pre-shim`。**不要再改那份备份、也不要照着它改。**
 - vault 根 `~/.skills-vault` 是三个客户端的 junction 目标（`~/.workbuddy/skills`、`~/.trae-cn/skills`、`~/.dsh/skills`），所以 `bash <任意客户端>/download/scripts/github.sh` 走到的都是同一个真身。
 - vault 里仍独立存在的只有两件与网关无关的东西：`setup-gh.sh`（五段向导）与 `.github-token`（token 文件，真身也把它当 fallback 读，见脚本第 37–41 行）。它们不属于网关实现，不在收敛范围内。
 - 改网关只改本仓库 `tools/github.sh`，commit + push；vault 侧不需要同步，也不会再分叉。
@@ -229,7 +183,7 @@ bash C:/Users/Admin/.skills-vault/download/scripts/github.sh status   # 跑的�
 - `docs/network-baseline.md` —— 上下行实测、通道可达性、选路判据（>50 MB 不走 git push）
 - `AGENTS.md` —— 本机网络限制与 token 位置
 - `docs/agents/issue-tracker.md` —— issue 操作约定（含沙箱内跑 `gh` 的坑）
-- `docs/pending-issues/pat-permission-fix.md` —— PAT 缺哪几项写权限、怎么补
+- `AGENTS.md` 的「授权：一次配到底」—— 细粒度 PAT 该给哪四项、有效期怎么选
 
 ## issue-closeout.sh
 
@@ -240,14 +194,14 @@ bash tools/issue-closeout.sh            # 演练：打印每一步要执行的�
 bash tools/issue-closeout.sh --apply    # 真写
 ```
 
-五步：预检读写权限 → 删坏评论 `6710513283` → 重发干净版 resolution → 回写 #5 正文 → 给 map #2 补 Decisions 第 11 条。
+五步：预检读写权限 → 删旧评论 → 重发 resolution → 回写 #5 正文 → 给 map #2 补 Decisions 第 11 条。
 幂等靠正文里的 HTML 注释标记（`<!-- resolution-2026-11-08-vault-forwarder -->` 等），重复跑会 `[skip]`。
 
 退出码：`0` 完成；`2` 权限不足（会打印实测的 `X-Accepted-Github-Permissions` 与要改哪两项）；`3` 前置文件缺失。
 
-**为什么要有这个脚本**：上一版是四条手敲命令，其中「内联正文」那条被 bash 当成命令替换执行，
-反引号里的内容被跑掉、把 `.github-token` 的明文顶进了公开评论的表格单元格，
-GitHub secret scanning 秒级检出并吊销了那枚 token。脚本把所有正文都走 `-F body=@file`，杜绝这一类。
+**为什么要有这个脚本**：上一版是四条手敲命令，其中一条用 `-f body="$(cat …)"` 把正文内联进 shell，
+正文里的反引号被当成命令替换执行，把本地 token 文件的内容写进了公开评论，GitHub 侧随即作废了那枚 token。
+脚本把所有正文都走 `-F body=@file`，杜绝这一类。
 
 正文素材在 `docs/pending-issues/i5-comment.md` 与 `map-gist.md`，改内容改那两个文件即可。
 

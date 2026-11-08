@@ -3,7 +3,7 @@ work/
 out/
 elevate/
 
-# 工具与代理留下的状态
+# 工具与运行会话留下的状态
 # .workbuddy/ 整个目录不提交：agent 的每日记忆属于本机状态，只忽略 tmp/ 不足以挡住 memory/。
 .local/
 .agent-teams/

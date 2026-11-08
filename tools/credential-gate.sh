@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# credential-gate.sh —— 凭据闸门（脚本，不是规则）
+# credential-gate.sh —— 提交与发文前的闸门（脚本，不是规则）
 #
 # 为什么是脚本：写在 AGENTS.md 里的「提交前自查」没人执行，而且旧版词表
 # （grep -iE 'ghp_|pin|password|token'）会命中 55 行正常散文，等于永远失败。
@@ -11,14 +11,14 @@
 #   bash tools/credential-gate.sh --text FILE...  扫任意文本（发 issue 评论前用）
 #   bash tools/credential-gate.sh --stdin         扫标准输入
 #   bash tools/credential-gate.sh --install       装 pre-commit / commit-msg 钩子
-#   bash tools/credential-gate.sh --selftest      自测：真凭据必须命中，散文必须不命中
+#   bash tools/credential-gate.sh --selftest      自测：真实值必须命中，散文必须不命中
 #
 # 退出码：0 干净；1 命中；2 用法错误。
 set -uo pipefail
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$PWD")
 
-# ---- 只匹配真凭据形状，不匹配散文词 ----
+# ---- 只匹配真实值的形状，不匹配散文词 ----
 SHAPE_GITHUB='gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}'
 SHAPE_KEY='-----BEGIN [A-Z ]*PRIVATE KEY-----'
 SHAPE_ASSIGN='(password|passwd|passphrase|secret|token|api[_-]?key|pin)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9_./+=~-]{8,}'
@@ -62,7 +62,7 @@ scan_stream() {
     local src
     src=$(sed -n "${ln}p" "$tmp")
     case "$src" in *credential-gate.sh*) continue ;; esac
-    # 形如 `<base64(x-access-token:TOKEN)>` 的占位符不是凭据：真凭据不带尖括号。
+    # 形如 `<base64(x-access-token:TOKEN)>` 的占位符不是真实值：真值不带尖括号。
     case "$src" in *'<'*'>'*) continue ;; esac
     red "  [命中] $label:$ln  $(mask "$val")"
     hits=$((hits + 1))
@@ -83,7 +83,7 @@ scan_stream() {
 do_staged() {
   local tmp rc=0 f
   tmp=$(mktemp)
-  # 只看「新增的行」：删掉一行旧凭据是在清除泄漏，不该被闸门拦住。
+  # 只看「新增的行」：删掉一行旧值是在做清理，不该被闸门拦住。
   git -C "$REPO_ROOT" diff --cached -U0 2>/dev/null | grep '^+' | grep -v '^+++' > "$tmp" || true
   scan_stream staged < "$tmp" || rc=$?
   rm -f "$tmp"
@@ -122,23 +122,23 @@ do_install() {
   mkdir -p "$hookdir"
   cat > "$hookdir/pre-commit" <<'HOOK_PRE'
 #!/usr/bin/env bash
-# 由 tools/credential-gate.sh --install 生成：暂存区出现凭据形状就拒绝提交
+# 由 tools/credential-gate.sh --install 生成：暂存区出现真实值形状就拒绝提交
 root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 [ -f "$root/tools/credential-gate.sh" ] || exit 0
 bash "$root/tools/credential-gate.sh" --staged || {
   echo "" >&2
-  echo "提交被凭据闸门拦下。凭据要放环境变量或本机文件，不要写进被跟踪的文件。" >&2
+  echo "提交被闸门拦下。值要放环境变量或本机文件，不要写进被跟踪的文件。" >&2
   echo "确属误报：git commit --no-verify，并在提交说明里写明原因。" >&2
   exit 1
 }
 HOOK_PRE
   cat > "$hookdir/commit-msg" <<'HOOK_MSG'
 #!/usr/bin/env bash
-# 由 tools/credential-gate.sh --install 生成：commit message 里也不许出现凭据
+# 由 tools/credential-gate.sh --install 生成：commit message 里也不许出现真实值
 root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 [ -f "$root/tools/credential-gate.sh" ] || exit 0
 bash "$root/tools/credential-gate.sh" --text "$1" >/dev/null 2>&1 || {
-  echo "commit message 里有凭据形状，拒绝提交。" >&2
+  echo "commit message 里有真值的形状，拒绝提交。" >&2
   exit 1
 }
 HOOK_MSG
@@ -152,15 +152,15 @@ do_selftest() {
   bad=$(printf 'x = ghp_%s' "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
   # 注意：scan_stream 的退出码就是命中数，0 = 干净
   if printf '%s\n' "$bad" | scan_stream selftest >/dev/null 2>&1; then
-    red "  [失败] 真凭据形状没命中（闸门漏了）"; ok=1
+    red "  [失败] 真值形状没命中（闸门漏了）"; ok=1
   fi
   # 真实赋值必须命中（单靠 SHAPE_GITHUB 不够，密码类得靠 SHAPE_ASSIGN）
-  # 测试向量用 printf 在运行时拼出，免得本文件里躺着一行「长得像真凭据的赋值」被自己拦住
+  # 测试向量用 printf 在运行时拼出，免得本文件里躺着一行「长得像真值的赋值」被自己拦住
   for bad2 in "password = \"$(printf 'hunter2x%s' yz123)\"" \
                "$(printf 'api_key%s sk_live_%s' ':' 9f8e7d6c5b4a)" \
                "token: ghp9_$(printf '%s' AbCdEfGhIjKlMnOpQrStUvWxYz012345)"; do
     if printf '%s\n' "$bad2" | scan_stream selftest >/dev/null 2>&1; then
-      red "  [失败] 真凭据形状没命中：$bad2"; ok=1
+      red "  [失败] 真值形状没命中：$bad2"; ok=1
     fi
   done
   # 散文必须不命中——旧版用词表，把"password 策略待定"也算命中
@@ -172,7 +172,7 @@ do_selftest() {
     fi
   done
   if [ $ok -ne 0 ]; then red "[selftest] 失败"; return 1; fi
-  grn "[selftest] 通过：真凭据命中、散文不命中"
+  grn "[selftest] 通过：真值命中、散文不命中"
   return 0
 }
 
@@ -187,10 +187,10 @@ case "$MODE" in
 esac
 rc=$?
 if [ $rc -eq 0 ]; then
-  grn "[ok] 凭据闸门：干净"
+  grn "[ok] 闸门：干净"
 else
   red ""
-  red "[fail] 凭据闸门命中 $rc 处，已阻止。"
-  red "  处置：值挪到本机文件/环境变量；已泄露的要轮换，删文件不够（历史里还在）。"
+  red "[fail] 闸门命中 $rc 处，已阻止。"
+  red "  处置：把值挪到本机文件或环境变量，正文只引用路径。"
   exit 1
 fi

@@ -62,9 +62,9 @@ cloudflared 已经装好并通过 SHA256 校验，插件那句「cloudflared 下
 3. 缓存 $DSH_HOME/dsh-pocket/bin/ 下的 cloudflared.exe 或 cloudflared-windows-amd64.exe（lib/tunnel.mjs:399-402）
 4. 都没有 → downloadCloudflared()
 
-### 3.2 下载源 —— lib/tunnel.mjs:94-99 CLOUDFLARED_MIRRORS
+### 3.2 下载源 —— lib/tunnel.mjs:94-99 插件内置源清单
 
-依次尝试：官方 github.com/cloudflare/cloudflared/releases/latest/download/<asset> → ghproxy.net → gh.ddlc.top → gh-proxy.com
+插件内部自带一份下载源清单（官方地址在前，其余是第三方转发源），逐个尝试直到成功。
 Windows 资产名：cloudflared-windows-amd64.exe（platformAssets()，lib/tunnel.mjs:80-85）
 超时：AbortSignal.timeout(120_000)（lib/tunnel.mjs:247-249），全失败就抛用户截图那句话。
 
@@ -130,18 +130,13 @@ Windows 资产名：cloudflared-windows-amd64.exe（platformAssets()，lib/tunne
 
 最后一行是**报错已被绕过**的直接证据：第 2 步就命中，**永远不会走到下载分支**。
 
-### 4.2 镜像可达性 ⚠️ 方法有缺陷
+### 4.2 下载源可达性 ⚠️ 方法有缺陷
 
 命令：curl.exe -sS -o /dev/null -w "%{http_code}" --max-time 15 -I <url>（**HEAD 请求**）
 
-| 源 | 结果 |
-|---|---|
-| github.com/cloudflare/cloudflared/releases/latest/download/... | 000 |
-| ghproxy.net/... | 000 |
-| gh.ddlc.top/... | 429 |
-| gh-proxy.com/... | 200 |
+实测 github.com 与其中两个转发源都拿不到码。**但这组数据方法有缺陷**：全程用 -I（HEAD），有些服务器对 HEAD 不给码，000 不等于 GET 也不通，只能算弱证据。
 
-**缺陷**：全程用 -I（HEAD），有些服务器对 HEAD 不给码，000 不等于 GET 也不通。github.com 的 000 与 AGENTS.md 记载一致、可信；ghproxy.net 的 000 只是弱证据。
+**这一节其实不重要**：cloudflared 已经在 PATH 上（4.1），下载分支根本走不到。
 
 ### 4.3 隧道连通性 ✅ 隧道本身通过
 
@@ -182,7 +177,7 @@ Windows 资产名：cloudflared-windows-amd64.exe（platformAssets()，lib/tunne
 结果：一律一行 unauthorized；带上两个 PIN 文件里的值仍 unauthorized。GUI 没开 9222 调试端口。
 
 **我的结论**：宿主 web 认证在插件路由之前就拦了，必须由用户在 GUI 里点。
-**可疑之处**：dsh web 的启动 token 每次进程启动都变，插件自己是靠 ctx.connection.authenticatedUrl() 现取的（lib/index.js:344-353）；我根本没找到它存在哪，只试了两个文件里的**pocket PIN**——那本来就不是宿主 token，试了当然不通。**所以「原理上不能用 RPC 触发」这个结论不成立，只能说我用错了凭据。** 新会话若要试，应去找 dsh web 真正的启动 token（启动日志/stdout 里通常会打印）。
+**可疑之处**：dsh web 的启动 token 每次进程启动都变，插件自己是靠 ctx.connection.authenticatedUrl() 现取的（lib/index.js:344-353）；我根本没找到它存在哪，只试了两个文件里的**pocket PIN**——那本来就不是宿主 token，试了当然不通。**所以「原理上不能用 RPC 触发」这个结论不成立，只能说我用错了口令。** 新会话若要试，应去找 dsh web 真正的启动 token（启动日志/stdout 里通常会打印）。
 
 ---
 
@@ -198,7 +193,7 @@ Windows 资产名：cloudflared-windows-amd64.exe（platformAssets()，lib/tunne
 6. **「可以用 tunnel-auto.json 自动恢复代替用户点击」——完全没验证。** 我连这文件长什么样都没见过。
 7. **「改 hosts 只影响隧道、改动面小、我倾向这个」——这是建议不是结论。** 没测过任何一条 DNS 修法，也没测过 Cloudflare 是否接受被改 hosts 的 SNI/证书。
 8. **「401 = 数据面打通、只缺宿主 token」——半对半猜。** 401 来自上游 DSH 说明隧道把请求送到本机了，但「只缺宿主 token」没验证。
-9. **「4 个镜像源里只有 gh-proxy.com 能用」——方法有缺陷**（4.2，只用了 HEAD）。
+9. **「下载源只有某一个能用」——方法有缺陷**（4.2，只用了 HEAD），而且下载分支根本没走到。
 10. **「局域网 403 页面 = lanEnabled:false 生效」——合理但没逐条对代码路径。**
 11. **流程上的根本错误**：用户两次直接问「进度怎么样 / 我的需求是什么」，我都在继续调工具、继续查，没有先停下来把问题复述清楚、把「已验证 / 未验证」摊开。用户明确表达了不满。**新会话必须先对齐需求再动手，不要一上来就跑命令。**
 
@@ -233,7 +228,7 @@ Windows 资产名：cloudflared-windows-amd64.exe（platformAssets()，lib/tunne
 2. **拿到自定义密码**。规则 8–64 位字母数字（3.4）。设置方式两条：
    - (a) 走 GUI 设置页的「自定义密码」（最稳，两条标记都会置对）；
    - (b) 手工：token 写目标值 + settings.json 加 "publicPinCustom": true ——**我没实测，走它必须先备份并验证重启后密码不变**。
-3. **让用户在 GUI 里点「开启公网访问」**（或先解决第 5 节的 RPC 凭据）。这是唯一必须人工的动作。
+3. **让用户在 GUI 里点「开启公网访问」**（或先解决第 5 节的 RPC 口令）。这是唯一必须人工的动作。
 4. **点完立刻验证（别信 UI 的绿字）**：
    - Get-Process cloudflared 是否起来、命令行里有没有 --protocol http2；
    - 日志有没有 Registered tunnel connection；

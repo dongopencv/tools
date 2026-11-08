@@ -15,40 +15,24 @@
 | `docs/log/` | 每日状态记录：一天一行，推进了什么 / 卡在哪 / 明天第一件事 |
 | `docs/pending-issues/` | 写好但发不出去的东西：待建票草稿、待发评论、待做的收尾写操作 |
 
-## 本机网络限制（重要）
+## GitHub 通道（只有两条）
 
-**`github.com` 的 HTTPS（443）被墙**，直连 100% 超时。可达的只有：
+`api.github.com` 与 `git@github.com` 是本机到 GitHub 的全部通道。没有别的路：**没有代理、没有镜像、没有中转站、没有 fallback 链路**。发现某个脚本里还留着这种东西，删掉它，不要修它。
 
-- `api.github.com` — `gh` CLI 走这条，不受影响
-- SSH `github.com:22` 与 `ssh.github.com:443`（2026-11-06 03:53 复测：22 端口 6/6 通、443 端口 5/6 通；当天早些时候 22 曾整段不通、443 全通）— `git push` 的**主**通道。**脚本默认走 22**（`git@github.com:owner/repo.git`），22 不通时改走 `ssh://git@ssh.github.com:443/owner/repo.git`（2026-11-07 实测 22 端口 `Connection reset` 时 443 正常）。`~/.ssh/config` 必须同时有 `Host github.com` 与 `Host ssh.github.com`（后者带 `Port 443`），否则走 443 时不带密钥、报 `Permission denied (publickey)`
+| 用途 | 通道 |
+|---|---|
+| 读 API、改 issue/评论、读仓库内容、下载 release 资产 | `gh api` / `api.github.com`（302 到 `release-assets.githubusercontent.com`） |
+| `git clone` / `git fetch` / `git push` | SSH：`git@github.com:owner/repo.git`，22 不通就 `ssh://git@ssh.github.com:443/owner/repo.git` |
 
-因此：
+- `github.com` 的 443 时通时不通，**这不影响干活**：读走 `api.github.com`，写走 SSH。不要为此加通道。
+- `~/.ssh/config` 必须同时有 `Host github.com` 与 `Host ssh.github.com`（后者带 `Port 443`），否则走 443 时不带密钥、报 `Permission denied (publickey)`。
+- SSH 报 `Permission denied (publickey)` = 账号上没有这把公钥。加公钥**只能人工**在 https://github.com/settings/keys 操作：`gh api user/keys` 用细粒度 PAT 是 403，写不了。
+- 所有 GitHub 操作走 `tools/github.sh`，别各处手搓 `curl`/`gh`/`git`：`bash tools/github.sh asset owner/repo v1.2.3 file.zip -s <sha256>`。用法见 `tools/README.md`。
+- 传输器顺序固定：`gh` → `curl` → `node fetch`。失败时如实说是哪一层失败，不要把传输器问题栽给 token。
 
-- **`git clone` / `git push` 首选 SSH**：`git@github.com:owner/repo.git`。
-  **「HTTPS 写操作三条路全死」这句 2026-11-08 已被实测推翻**：git over HTTPS **经 8899 中转站可读也可写**，
-  当时缺的只是 token 的 `Contents: Read and write`。真推临时分支 `probe-relay-push` 成功、随后 `push --delete` 删净
-  （表格见 `docs/network-baseline.md` 第四节）。现成用法：`bash tools/github.sh push <owner/repo> [ref]`，
-  默认 `--via auto` = SSH 先、失败自动回落 relay；也可 `--via relay` 强制。
-  **不需要 `http.sslVerify=false`**：本机 git 默认 `sslBackend=schannel`，信任来自 Windows 证书存储（relay 的 CA 已在里面），
-  `http.sslCAInfo` 会被静默忽略——实测给一个**不存在**的 CA 路径照样成功。token 用 `GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n`
-  环境变量注入，别写成 `git -c http.extraheader=…`（后者在 `ps` / `Win32_Process` 里可见）。
-  push 报 `403` + `Permission to ... denied` 时那是**授权问题不是链路问题**——先看响应头有没有 `X-Accepted-Github-Permissions: ...=write`，
-  补权限见 `docs/pending-issues/pat-permission-fix.md`。SSH 报 `Permission denied (publickey)` 时**先查账号上有没有公钥**
-  （2026-11-08 那天 `GET /users/dongopencv/keys` 一度为 0 个，02:38 已补回 1 个 id 169145688），别在 `~/.ssh/config` 上耗时间。
-- 所有 GitHub 操作（API / 下载 / clone / push）优先走网关脚本 `tools/github.sh`，别各处手搓 `curl`/`gh`/`git`：
-  `bash tools/github.sh asset owner/repo v1.2.3 file.zip -s <sha256>`
-  用法见 `tools/README.md`（#5 落地）。**只有一份实现：本仓库的 `tools/github.sh`**；`skills-vault` 里那份已于 2026-11-07 收敛成转发器（29 行；逻辑只有定位 + `exec` 那 10 行）（`exec` 到本仓库，可用 `GITHUB_GATEWAY` 覆盖路径），不再是副本、也不会再分叉。vault 里保持独立的只有凭据相关的 `setup-gh.sh` 与 `.github-token`（后者也是真身的 token fallback）。
-- `gh release download` **本身是可用的**：它走 `api.github.com` 拿 302 跳到 `release-assets.githubusercontent.com`，全程不经 github.com（实测 2.3 MB 资产秒下）。网关的价值是镜像回退 + SHA256 校验 + 断点续传，不是「gh 不能用」。
-- **`github.com` 域名的兜底是 8899 中转站**（本地 MITM 反代 → `gh-proxy.com`）：`bash tools/github.sh relay up` 后加 `--via relay`，或给任意进程塞 `HTTPS_PROXY=http://127.0.0.1:8899`。实测 15,721,375 B 资产 25 s / 612 KiB/s（同域直连是 21 s 超时）。它只代理 GitHub 家族域名（其它域名走普通 CONNECT 隧道、不解密）；**读写都转发**（`tryUpstream` 原样转发 method 与 body，所以 push 也通）；登录时由计划任务 `\dsh-gh-proxy` 自启（电池模式不启动），没起就 `relay up`；细节见 `docs/network-baseline.md` 第四节。
+## 上行带宽（2026-11-06 实测）
 
-## 实测网络速度（2026-11-06）
-
-**上行才是瓶颈**：2026-11-06 实测 58–364 KB/s，随 4G 时段波动很大，按 **150 KB/s** 估工期。下行总体不慢，但分层明显：国际 CDN 2–6 MB/s；`release-assets.githubusercontent.com` 与可用镜像在同一批资产上 1.3–5.1 MiB/s；GitHub 归档（`codeload` / `api tarball`）0.5–1.6 MB/s，小文件被延迟主导可低到 19 KB/s。逐条实测见 `docs/network-baseline.md`——**别用这里的摘要数字当带宽用**，那里才是表格。
-
-- 20 MB 的 push 约 1.5–2.5 分钟 → 单次 push 尽量 ≤ 20 MB。
-- **大于 50 MB 的东西不要用 git push 传**（50 MB ÷ 150 KB/s ≈ 5.7 分钟，且失败要整包重传），改用 release 资产。
-
-完整实测表、复测方法与选路策略见 `docs/network-baseline.md`（#4 落地）。
+上行 58–364 KB/s，按 **150 KB/s** 估工期。20 MB 的 push 约 1.5–2.5 分钟；**大于 50 MB 不要用 git push**，改用 release 资产。
 
 ## agent 会话的能力边界（取决于文件策略，不是机器属性）
 
@@ -81,11 +65,55 @@ gh issue view 3 --json number   # 成功 = 宽策略；报 pipe: Access is denie
 - 没有批量验证 → 不管它多合理，都不要当基础件；自己写更不该当基础件。
 - 自研只允许出现在"确实没人做过"的空白处，且必须先证明空白存在（搜过、比对过、留证据）。
 
-## token
+## token（唯一真身 + 一次事故的前因后果）
 
-GitHub PAT 只有一份真身：`C:\Users\Admin\.skills-vault\download\scripts\.github-token`。
-同目录 `github.env` 存 `GITHUB_TOKEN=`，`gh` 的 keyring 里也有一份，三处同一个值。
-`tools/github.sh` 优先读文件，读不到回退 `gh auth token`。换 token 就改这三处。
+**三处同一个值，换就一起改：**
+
+| 位置 | 用途 |
+|---|---|
+| `C:\Users\Admin\.skills-vault\download\scripts\.github-token` | `tools/github.sh` 首选读取 |
+| 同目录 `github.env` 的 `GITHUB_TOKEN=` | 给别的脚本用 |
+| `gh` keyring | `gh api` 用 |
+
+### 2026-11-07 的事故（写给以后的我，别重犯）
+
+01:14:15 我把一条 issue 评论发到了公开仓库，正文里有 token 明文。01:14:17 GitHub secret scanning 命中、**自动吊销**，全程没有通知、没有确认、不可撤销。01:16 起票库写操作全线中断——改不了 issue、发不了评论、push 不了，**阻塞约 15 小时**。
+
+真正的原因不是「安全意识不够」，而是**命令写错了**：正文用 `-f body="$(cat body.md)"` 内联进 shell，`$()` 与反引号会被再执行一次，文件内容就那样进了 URL 与日志。
+
+### 因此，写 issue / 评论 / commit message 只有一种写法
+
+```bash
+# 对：正文永远走文件，只传路径
+gh api -X PATCH repos/OWNER/REPO/issues/N -F body=@/tmp/body.md
+gh api -X POST  repos/OWNER/REPO/issues/N/comments -F body=@/tmp/body.md
+
+# 错：任何形式的拼接
+gh api -X PATCH ... -f body="$(cat body.md)"     # 再执行一次
+gh api -X PATCH ... -f body="...${VAR}..."       # 变量同样会展开
+```
+
+发之前跑一遍闸门，它只匹配真实值的形状，不会命中散文：
+
+```bash
+bash tools/credential-gate.sh --text /tmp/body.md
+```
+
+`.git/hooks/pre-commit` 与 `commit-msg` 已装同一个闸门（`tools/credential-gate.sh --install` 可重装）。被拦时不要 `--no-verify` 糊过去。
+
+### 授权：一次配到底，不要反复人工授权
+
+细粒度 PAT（`github_pat_` 前缀）在 **Repository access → 本仓库** 下把这四项全给 `Read and write`，有效期选 `No expiration`：
+
+`Contents` · `Issues` · `Pull requests` · `Metadata`（`Metadata` 必选，是其它项的前置）
+
+配齐之后 issue 正文、评论、删除评论、push 全部可用，不需要每次再点头。**`gh api user/keys` 除外**——细粒度 PAT 永远读/写不了账号级 SSH 公钥，那是账号设置页的人工操作。
+
+### 不要再做的事
+
+- **不要再写这类分析文档。** 它们一条都没阻止中断，一条都没缩短恢复。要防就改脚本（`tools/credential-gate.sh`），要恢复就换 token。
+- **不要把 token 值写进任何被 git 跟踪的文件、issue 正文、评论、commit message。** 要引用就引用路径。
+- **不要擅自改动本机环境**：系统/用户环境变量、`gh` 登录态、`~/.ssh/*`、`.git/config`、计划任务、正在运行的进程与服务、其它会话正在跑的任务。要动先问人；改完必须能说清改了哪一处、原值是什么。
 
 ## Agent skills
 
@@ -138,4 +166,4 @@ single-context. See `docs/agents/domain.md`.
 
 判据：如果连续一周 `attention.sh` 的第 1 段都没变短，说明问题不在票多，在于**不敢做决定**。
 
-> **规则还有很多需要修改的。** 凡是能用脚本卡的（凭据闸门、提交前自查、收尾写操作），一律改成脚本，不要留在文档里当规则。
+> **规则还有很多需要修改的。** 凡是能用脚本卡的（提交前闸门、收尾写操作），一律改成脚本，不要留在文档里当规则。

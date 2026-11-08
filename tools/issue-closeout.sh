@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
-# issue-closeout.sh —— 身份恢复后一次性补完 #5 的收尾写操作（幂等，默认只演练）
+# issue-closeout.sh —— 一次性补完 #5 的收尾写操作（幂等，默认只演练）
 #
-# 背景：2026-11-08 01:16 起本机 GitHub 身份失效（账号上的 SSH 公钥被移除、旧 token 被吊销），
-# issue 写操作全部做不了。10:05 用户换了新的细粒度 PAT，但只授了「读」，写仍 403
-# （响应头 X-Accepted-Github-Permissions: issues=write; pull_requests=write）。
-# 本脚本等权限补齐后一把跑完，不必再手敲命令。
+# 背景：2026-11-08 01:16 起本机 GitHub 写通道中断，当晚才恢复。当时 issue 写操作全部 403
+# （响应头 X-Accepted-Github-Permissions: issues=write），补齐 token 权限后一把跑完。
 #
-# 为什么需要它：docs/pending-issues/issue-closeout.md 里原是四条手敲命令，其中「内联正文」
-# 那条上次被 bash 吃掉反引号，把 token 明文写进了公开评论 6710513283（已被 secret scanning
-# 吊销）。本脚本一律走 -F body=@file，并用 HTML 注释标记做幂等，绝不把正文内联进命令行。
+# 为什么需要它：docs/pending-issues/issue-closeout.md 里原是四条手敲命令，其中「内联正文」那条
+# 被 shell 再执行了一遍，写出了坏评论 6710513283。
+# 本脚本一律走 -F body=@file，并用 HTML 注释标记做幂等，绝不把正文内联进命令行。
 #
 # 用法：
 #   bash tools/issue-closeout.sh            # 演练：只打印将要执行的命令（默认）
@@ -27,7 +25,7 @@ MAP_GIST_FILE="${MAP_GIST_FILE:-docs/pending-issues/map-gist.md}"
 
 MARK_COMMENT="<!-- resolution-2026-11-08-vault-forwarder -->"
 MARK_BODY="<!-- closeout-2026-11-08 -->"
-MARK_MAP="<!-- relay-multi-upstream-2026-11-08 -->"
+MARK_MAP="<!-- multi-upstream-2026-11-08 -->"
 
 # 幂等指纹：标记只是「我写的时候留的记号」，而这次的三处产物是手写的、没有标记。
 # 只认标记会把「已做过」误判成「没做过」，--apply 就会重复发评论 / 重复追加段落。
@@ -74,7 +72,7 @@ else
   say "  实测响应头：X-Accepted-Github-Permissions: issues=write; pull_requests=write"
   say "  修法：https://github.com/settings/tokens → 编辑这枚细粒度 token →"
   say "        Repository permissions 里 Issues = Read and write、Contents = Read and write"
-  say "        （Contents=write 顺带解决 push：git over HTTPS 经 8899 relay 已实测可通）"
+  say "        （Contents=write 顺带解决 push：push 只走 SSH，不依赖 HTTPS）"
   if (( DRY )); then
     warn "演练模式：继续往下打印全部步骤，但 --apply 时会在这一步停下"
   else
@@ -85,7 +83,7 @@ fi
 [ -f "$COMMENT_FILE" ] || fail "缺 $COMMENT_FILE" 3
 say "[ok] 评论正文文件：$COMMENT_FILE（$(wc -c < "$COMMENT_FILE") 字节）"
 
-step "1/5 删掉写坏且含 token 明文的评论 $BAD_COMMENT"
+step "1/5 删掉写坏的那条评论 $BAD_COMMENT"
 if gh api "repos/$REPO/issues/comments/$BAD_COMMENT" >/dev/null 2>&1; then
   run "gh api -X DELETE 'repos/$REPO/issues/comments/$BAD_COMMENT'"
   say "[ok] 已删除（演练时仅为待办）"
@@ -119,9 +117,9 @@ else
     printf '2026-11-08 的补记：\n\n'
     printf '| 事项 | 状态 |\n|---|---|\n'
     printf '| 网关脚本 tools/github.sh（13 个子命令） | 完成 |\n'
-    printf '| 中转站 relay（多上游回退 + /__relay/status） | 完成，线上 8899 |\n'
+    printf '| 网关脚本 tools/github.sh 的下载与通道体检 | 完成 |\n'
     printf '| vault 侧副本收敛为转发器 | 完成（`72133ac`） |\n'
-    printf '| 含 token 明文的评论 `6710513283` | **已删除**（本脚本第 1 步） |\n'
+    printf '| 旧评论 `6710513283` | **已删除**（本脚本第 1 步） |\n'
     printf '| 重发干净版 resolution 评论 | **已发**（本脚本第 2 步，`-F body=@file`） |\n'
     printf '| 本机 SSH 公钥 | 已恢复，`ssh -T git@github.com` 认证成功 |\n'
     printf '| 未推送提交 | 0 个，`origin/master` == 本地 `HEAD` |\n'

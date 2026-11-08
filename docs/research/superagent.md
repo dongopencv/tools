@@ -61,7 +61,7 @@
 | 主 Session 工具收敛 | `src/app/sessions.ts:263` | 聊天助手直接 write/edit 源码，绕过全部授权 |
 | noWait guard | `src/app/sessions.ts:70-86` | 值守式轮询把 turn 挂死 |
 | 槽位/暂停/派工授权 | `src/executor/dsh.ts:171-199` | 多工人改同一仓互相覆盖 |
-| 凭据与命令边界 | `src/infra/environment.ts:45-58` | 工人拿宿主 token 推任意仓库 |
+| 权限与命令边界 | `src/infra/environment.ts:45-58` | 工人拿宿主 token 推任意仓库 |
 
 **冗余 3 处**：「这票还算不算被授权」判定了四遍（`evals.ts:285` / `policy.ts:213-240` / `tickets.ts:113` / `policy.ts:144-165`）；machineGate 与 gate 过滤条件重复、矩阵语义三处定义；重复开票拦三处、票结束拦两处。
 

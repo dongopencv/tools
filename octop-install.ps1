@@ -63,8 +63,8 @@ if ($policy -eq "Restricted") {
 }
 
 # ── GitHub 网关 ───────────────────────────────────────────────────────────
-# 本机 github.com:443 被墙，裸 Invoke-WebRequest / 裸 git clone 走 HTTPS 必然超时。
-# 所有 GitHub 访问收敛到 tools/github.sh（镜像选路 + SHA256 + 断点续传）。
+# 本机读 GitHub 走 api.github.com，写走 SSH，裸走 github.com:443 会时通时不通。
+# 所有 GitHub 访问收敛到 tools/github.sh（SHA256 + 断点续传）。
 # 脚本被 `irm <url> | iex` 单独执行时没有脚本目录，会退回直连并给出提示。
 $script:GitHubGateway = $null
 foreach ($cand in @(
