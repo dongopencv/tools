@@ -1,0 +1,16 @@
+{
+  "displayName": "长会话自动交接",
+  "description": "会话达到 token 或工具调用阈值时，自动写交接文档并开新会话续作，避免单个长会话把上下文和额度吃光。",
+  "config": {
+    "enabled": "总开关。关闭后不注册任何监听与命令。",
+    "tokenThreshold": "会话累计 token 压力达到该值即交接。",
+    "toolCallThreshold": "会话工具调用次数达到该值即交接；与 token 阈值任一命中即可。",
+    "handoffDir": "交接文档目录，相对会话工作目录，默认 .dsh/handoff。",
+    "modelSummary": "是否用模型生成本轮摘要；关闭后使用本地兜底摘要（零额外 token）。",
+    "chainLimit": "自动续作链的深度上限，超过后只写文档不再自动开新会话。",
+    "summaryMaxChars": "模型摘要写入文档前的字符上限。",
+    "docMaxChars": "交接文档总字符上限。",
+    "summaryTimeoutMs": "单次摘要模型请求的超时（毫秒）。",
+    "maxTrackedFiles": "交接文档里最多列出多少个被触及的文件路径。"
+  }
+}

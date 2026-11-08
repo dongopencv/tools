@@ -1,0 +1,246 @@
+# dsh-auto-handoff · 问题清单（需要修复的问题）
+
+> 状态：v1（2026-11-06）
+> 分三类：**I = 已修复的历史缺陷**、**O = 当前仍存在的开放问题**、**R = 风险（见 RISKS.md）**
+
+---
+
+## A. 已修复（I 系列）
+
+### I-1 `enforceMidTurn` 配置读取丢失 —— 轮中硬兜底完全失效 【严重·已修复】
+
+**发现于**：2026-11-06 恢复源码后跑测试，`test/midturn.test.mjs` 第一条用例失败。
+
+**症状**：`created=0`，轮中触发一次都没有执行。
+
+**根因**：`resolveOptions()` 里漏了 `enforceMidTurn` 的读取。
+
+```js
+// 修复前：Config 里声明了、触发代码引用了，但 resolveOptions 没传出来
+return {
+  ...
+  summaryModel: readText(raw.summaryModel, DEFAULTS.summaryModel),
+  // ← 缺 enforceMidTurn
+}
+
+// 触发代码
+if (options.enforceMidTurn === true && ...)  // 永远是 undefined，永不成立
+```
+
+**危害**：这是**双闸里的第二道闸**。它失效意味着：只要某一轮跑得久（批量任务连续调用几百次工具），`turn-stopping` 迟迟不来，阈值早就超了却什么都不发生——正是用户担心的"规则不触发"场景原样复现。
+
+**修复**：
+
+```js
+enforceMidTurn: readBool(raw.enforceMidTurn, DEFAULTS.enforceMidTurn),
+```
+
+**验证**：`test/midturn.test.mjs` 4/4 通过。
+
+**教训**：这个 bug 是"三处不一致"造成的——`Config` 声明、`DEFAULTS` 定义、`resolveOptions` 读取，三处必须同步。恢复源码时手工拼装极易漏掉中间一环。
+
+---
+
+### I-2 测试链账本路径未隔离 【中·已修复】
+
+**发现于**：同上，`test/integration.test.mjs` 链上限用例失败（`1 !== 0`）。
+
+**症状**：`chainDepth: 8` 的测试数据写进了 `<tmp>/.dsh/handoff/state.json`，而插件从 `~/.dsh/auto-handoff/state.json` 读，读不到，于是照常开新会话。
+
+**根因**：测试还在用旧路径（工作区），代码已外移到用户主目录。
+
+**修复**：测试里加 `USERPROFILE` 指向临时目录，两处（写、读）路径统一到 `.dsh/auto-handoff/state.json`，并在用例结束时恢复环境变量。
+
+**教训**：磁盘状态位置变更时，必须同步更新所有测试夹具。
+
+---
+
+### I-3 新会话未继承 `agentPreset` 【中·已修复】
+
+**症状**：新会话工具集可能与源会话不同，交接文档里写的"用 X 工具继续"落空。
+
+**修复**：读 `session.header.agentPreset`，传给 `controller.create()`。
+
+**验证**：AC-8。
+
+---
+
+### I-4 摘要拿不到模型路由 【中·已修复】
+
+**症状**：`requestContext()` 返回 `undefined` 时直接走本地兜底，用户配了 `modelSummary: true` 却看不到模型摘要。
+
+**修复**：`resolveSummaryRoute()` 五级回退（配置 → requestContext → requestHeader → agentDefaultModel → 末条 assistant source）。
+
+---
+
+### I-5 链账本污染工作区仓库 【中·已修复】
+
+**症状**：`state.json` 原本写在 `<cwd>/.dsh/handoff/`，会被用户 `git add` 带走。
+
+**修复**：外移到 `~/.dsh/auto-handoff/state.json`。
+
+---
+
+### I-6 交接阻塞关轮 【高·已修复】
+
+**症状**：初版把 `turn-stopping` 监听器写成 `async` 并 `await` 摘要（超时 45s），宿主等 45 秒才关轮。
+
+**修复**：同步判定 + 同步占位 + `void (async () => {})()` 后台执行，不 await。
+
+---
+
+### I-7 源文件搬运丢失 【严重·已发生，用户已恢复】
+
+**经过**：11-05 13:30 前后，当年那台机器上的插件目录被清空、另一份目录建成但为空，profile 里的依赖行与符号链接同时消失。全盘 `*handoff*` 的 `.js`/`.mjs` 一度为零。当时那个盘位（`D:\PC0`，本机现已不存在）不是 git 仓库，无提交可回滚。
+
+**现状（2026-11-08 收口）**：源码已迁到 `D:\proj\PC1\plugins\dsh-auto-handoff`，纳入 `dongopencv/tools` 仓库（git 提交 + 远端），I-7 的「丢失无法回滚」这一半已经消除。迁移步骤与验证见 README「源码位置」。
+
+**残留问题**：无（原 O-1 / O-2 / O-3 已关闭，见下）。
+
+**教训**：
+1. 长期维护项目的源码目录**必须**纳入版本控制。
+2. 迁移目录时应 `git mv` 或先复制再删除，不能"先删后建"。
+
+---
+
+## B. 当前开放问题（O 系列）
+
+### O-1 源码路径唯一化 【已关闭 2026-11-08】
+
+**决定的方案**：源码进仓库（当年列的方案 A 的变体）。
+
+| 路径 | 角色 |
+| --- | --- |
+| `D:\proj\PC1\plugins\dsh-auto-handoff` | **唯一权威源码**，进 git（`dongopencv/tools`） |
+| `D:\tools\dsh-auto-handoff` | 过渡期的运行副本；profile 仍 `link:` 到这里 |
+
+为什么不是「把 `link:` 直接改成仓库路径」：`Dsh` 的 profile 依赖表在 `~/.dsh/profiles/<name>/package.json`，四份 profile（desktop / zz-audit / zz-caps / zz-desktop-probe）都写着 `link:D:/tools/dsh-auto-handoff`，且 desktop 的 `pnpm-lock.yaml` 把同一行固化在 26–28 行。改 profile 必须连 lockfile 一起改，而本机**没有 pnpm**（`which pnpm` 为空），改完无法用 `pnpm install` 重建 `node_modules` 符号链接——只能手改 package.json + 手建链接，风险高于收益。
+
+所以分两段：**先在仓库里立住权威源码**（这一段已完成），**等宿主重启窗口再切 `link:`**（清单见下）。
+
+**切换清单（待宿主重启时一次性做）**：
+
+1. 改四份 profile 的 `package.json` 依赖行：`"dsh-auto-handoff": "link:D:/proj/PC1/plugins/dsh-auto-handoff"`。
+2. 改 `profiles/desktop/pnpm-lock.yaml` 的 26–28 行（`specifier` 与 `version` 两处都要改）。
+3. 重建 `node_modules/dsh-auto-handoff` 符号链接（用 `cmd /c mklink /D`，**不要** `ln -s`——本机 `ln -s` 在 `node_modules` 里建出的是 junction，`readlink` 不可用且删的时候 `rm` 删不掉，只能 `rmdir`）。
+4. 重启 DSH，跑 `node tools/handoff-check.mjs --deep`，确认「代码版本」通过。
+
+验证方式（不重启也能做）：
+
+```bash
+node --preserve-symlinks -e "import('dsh-auto-handoff').then(m=>console.log(Object.keys(m)))"
+# 在 profile 目录下跑，能列出 Config/DEFAULTS/apply/inject 即表示链接与 peer 依赖都对得上
+```
+
+---
+
+### O-2 文档行号与源码对齐 【已关闭 2026-11-08】
+
+`DESIGN.md:5` 原写「`lib/index.js`（938 行）」，实测 **1360 行**，已改。`REQUIREMENTS.md:4` 的 `D:\PC0` 路径已改成权威路径。
+
+对齐后的目录结构：
+
+```
+plugins/dsh-auto-handoff/
+  README.md REQUIREMENTS.md DESIGN.md ISSUES.md RISKS.md
+  package.json cordis.patch.yml
+  lib/index.js (1360) lib/claims.js (146)
+  test/{integration,midturn,claims,chain}.test.mjs
+  icons/icon.svg  locale/{en,zh}.json
+```
+
+行号引用只在 `DESIGN.md` 一处出现（已改），其余文档用函数名而非行号，避免每次改动都要重排。
+
+---
+
+### O-3 版本控制 【已关闭 2026-11-08】
+
+插件源码现位于 `D:\proj\PC1\plugins\dsh-auto-handoff`，随 `dongopencv/tools` 一起提交与推送。`D:\tools` 下那份是过渡期运行副本，**不再是权威**；等 O-1 的切换清单执行完即可删除。
+
+---
+
+### O-4 阈值默认值缺乏实测依据 【中】
+
+实测数据显示 `session-0a1d53a3` 峰值单次 input 已达 **530K**，而默认 `tokenThreshold` 是 300K。理论上应在膨胀前切走，但**没有真实运行数据验证**这个阈值在日常使用中是否合适。
+
+**建议**：先加日志（见 O-5），用真实数据定阈值。
+
+---
+
+### O-5 缺少结构化日志 【中·用户列为第 2 优先级】
+
+目前只有 `console.log/warn` 的自然语言行，无法机器统计。
+
+用户要求："更新插件的日志，然后根据我的使用情况（日志）确定后续修复方案、需求更新方案。"
+
+**需要的字段**：`sessionId`、`trigger`（threshold/mid-turn/manual）、`tokens`、`toolCalls`、`depth`、`docPath`、`newSessionId`、`durationMs`、`summaryUsed`、`outcome`（ok/skip/fail）。
+
+---
+
+### O-6 未验证真实长会话 【中】
+
+13 条测试都是离线桩测试。**没有**在真实长任务上完整跑过"阈值触发 → 交接 → 新会话接续"的闭环。
+
+**建议**：临时把 `toolCallThreshold` 压到 8 做一次实机验证。
+
+---
+
+### O-7 `compaction-basic` 处于禁用状态 【中·平台侧】
+
+`list_plugins` 显示 `include:compaction-basic` 为 `enabled: false`。
+
+后果：平台级压缩未开启，单靠换会话**不解决上下文窗口上限**问题——会话到 530K 时仍可能撞窗。
+
+**建议**：评估启用，与换会话形成互补。
+
+---
+
+### O-8 子代理会话 0 落盘 【低·待查】
+
+全盘 39 个会话，`origin === 'subagent'` 的为 0。但两次会话里 `agent_teams_create` 调了 4 次、`agent_teams_add_member` 5 次。
+
+含义不明：要么团队会话不落盘，要么落在别处。影响"交接是否需覆盖子代理"的判断。
+
+---
+
+### O-9 「2 亿 token」口径不一致 【低·需用户确认】
+
+实测：Σinput ≈ 2,360 万，cacheRead ≈ 1.36 亿。与用户口径的 2 亿差约 8 倍。
+
+可能是账单加权、可能是别的会话。影响阈值标定。
+
+---
+
+## C. 优先级建议
+
+按"对长期维护的阻塞程度"排序：
+
+| 优先级 | 项 | 理由 |
+| --- | --- | --- |
+| P0 | O-1 + O-3 | 源码位置未定 + 无版本控制，是丢失重演的直接风险 |
+| P1 | O-5 日志 | 用户明确的第 2 优先级，且是后续定阈值的数据来源 |
+| P2 | O-6 实机验证 | 证明闭环真的能跑通 |
+| P3 | O-7 启用压缩 | 补上窗口上限这一环 |
+| P4 | O-4 阈值调优 | 依赖 O-5 的数据 |
+| P5 | O-8 / O-9 | 待查项，不阻塞主线 |
+
+---
+
+## D. 已核实无需处理
+
+| 项 | 结论 |
+| --- | --- |
+| `llm-workbuddy` provider 重复声明 warning | 与本插件无关，是既有其它插件的问题 |
+| `measureTokens` 是 O(1) 还是 O(surface) | 确认是 O(surface)（`tokenMeter` 文档原文），每轮一次，可接受；早前笔误已纠正 |
+
+---
+
+\n## ISS-010 `prompt` 少传 AbortSignal，交接简报从未送达
+
+**症状**：全量 86 个会话扫描，「首条 user 消息以 `[自动交接] 上一会话` 开头」命中 **0** 条；新会话都建出来了，但解压后只有 4 帧（header / permission / sandbox / approval），312–318 字节。
+
+**根因**：`lib/index.js` 里 `await controller.prompt({...})` 只传一个实参。宿主暴露给插件的实现是 `async prompt(request, signal) { signal.throwIfAborted(); ... }`，第二参数缺失即 TypeError。
+
+**为什么离线测试没抓到**：`test/integration.test.mjs` 与 `test/midturn.test.mjs` 的假件是 `prompt: async (request) => { prompts.push(request) }` —— 单参数、永不抛，比真实宿主宽松。
+
+**修复**：`promptSignal(signal)` 补真 AbortSignal；两处假件改成会校验第二参数的真实签名。

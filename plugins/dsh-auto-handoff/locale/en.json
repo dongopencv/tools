@@ -1,0 +1,16 @@
+{
+  "displayName": "Auto Handoff for Long Sessions",
+  "description": "When a session reaches a token or tool-call threshold, it writes a handoff document and starts a fresh session that continues from it, so one long session can never eat your whole context budget.",
+  "config": {
+    "enabled": "Master switch. When off, no listeners and no command are registered.",
+    "tokenThreshold": "Token pressure at which the session is handed off.",
+    "toolCallThreshold": "Tool-call count at which the session is handed off; either threshold triggers.",
+    "handoffDir": "Handoff directory relative to the session working directory; default .dsh/handoff.",
+    "modelSummary": "Generate the summary with the model; when off, a local fallback summary costs no extra tokens.",
+    "chainLimit": "Depth limit for the automatic continuation chain; beyond it the document is written but no new session is started.",
+    "summaryMaxChars": "Character cap for the model summary before it enters the document.",
+    "docMaxChars": "Character cap for the whole handoff document.",
+    "summaryTimeoutMs": "Timeout in ms for a single summary model request.",
+    "maxTrackedFiles": "Maximum number of touched file paths listed in the handoff document."
+  }
+}

@@ -1,0 +1,30 @@
+# dsh-auto-handoff 的 profile 补丁层：一行 insert，不覆盖任何既有行。
+- insert:
+    - id: auto-handoff
+      name: 'dsh-auto-handoff'
+      config:
+        # 总开关
+        enabled: true
+        # 会话累计 token 压力达到该值即交接
+        tokenThreshold: 300000
+        # 会话工具调用次数达到该值即交接（任一命中即可）
+        toolCallThreshold: 80
+        # 交接文档目录（相对会话工作目录）
+        handoffDir: .dsh/handoff
+        # 是否用模型生成本轮摘要；关闭则用本地兜底摘要
+        modelSummary: true
+        # 自动续作链的深度上限，防止无限自我续作
+        chainLimit: 8
+        # 模型摘要的字符上限
+        summaryMaxChars: 1600
+        # 交接文档总字符上限
+        docMaxChars: 6000
+        # 单次摘要请求的超时（毫秒）
+        summaryTimeoutMs: 45000
+        # 交接文档里最多列多少个文件
+        maxTrackedFiles: 40
+        # 摘要用的 provider/model；留空自动沿用本会话最近使用的模型
+        summaryProvider: ''
+        summaryModel: ''
+        # 轮中硬兜底：工具调用一超阈值立刻交接，不等本轮结束
+        enforceMidTurn: true
