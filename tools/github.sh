@@ -218,14 +218,36 @@ node_probe() {
 #   3) 缓存文件用 stat -c %Y 判年龄，不用 mktemp/锈 /tmp（本机 /tmp 映射不稳）。
 _SSH_CACHE="${GITHUB_SSH_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/pc1-ssh-target}"
 _SSH_CACHE_TTL="${GITHUB_SSH_CACHE_TTL:-600}"
-_ssh_works() { # $1=host $2=port；单端口重试 2 次，任一次 authenticated 即算通
-  local host="$1" port="$2" i out
+# ssh 也吃 getaddrinfo：conhost 解析一次 github.com 可能 3 s 也可能 14 s（实测 4 轮
+# 3.2/3.4/12.5/14.4 s，同一分钟）。跟 curl 一样钉 IP 就稳了：实测 4 轮 3.4/3.6/4.7/4.9 s。
+# 注意用的是 -o HostName=<ip> 而不是把 IP 当 ssh 的参数：argv 里仍是 github.com，
+# 所以 ~/.ssh/config 的 Host github.com 段（IdentityFile / IdentitiesOnly）照常生效；
+# HostKeyAlias 保持 known_hosts 里的名字不变，不会因为换了 IP 就报 host key 变了。
+ssh_pin() { # $1=host → 可选的 -o 串；解析不出来就输出空（调用方退回不钉）
+  local host="$1" ip
+  ip=$(fast_ip "$host" 2>/dev/null | awk '{print $1}')
+  [[ -n "$ip" ]] || return 0
+  printf '%s' "-o HostName=$ip -o HostKeyAlias=$host"
+}
+
+# 钉住 IP 的 ssh 探测。钉 IP 只是「把最坏情况压平」，不是必需条件：
+# 解析失败、或钉住的 IP 恰好坏了，都要能退回系统解析再试一次。
+_ssh_try() { # $1=host $2=port $3...=额外 ssh 选项 → 打印输出
+  local host="$1" port="$2"; shift 2
+  timeout 25 ssh -p "$port" -o ConnectTimeout=8 -o BatchMode=yes \
+    -o StrictHostKeyChecking=accept-new "$@" -T "git@$host" 2>&1 || true
+}
+
+_ssh_works() { # $1=host $2=port；先钉 IP 试 2 次，再退回系统解析试 1 次
+  local host="$1" port="$2" i out pin
+  pin=$(ssh_pin "$host")
   for i in 1 2; do
-    out=$(timeout 25 ssh -p "$port" -o ConnectTimeout=8 -o BatchMode=yes \
-            -o StrictHostKeyChecking=accept-new -T "git@$host" 2>&1 || true)
+    out=$(_ssh_try "$host" "$port" $pin)
     [[ "$out" == *"successfully authenticated"* ]] && return 0
     (( i == 1 )) && sleep 1
   done
+  out=$(_ssh_try "$host" "$port")
+  [[ "$out" == *"successfully authenticated"* ]] && return 0
   return 1
 }
 ssh_target() {
@@ -261,7 +283,11 @@ ssh_url_of() {
 git_fork_state() {
   local out
   git rev-parse --show-toplevel >/dev/null 2>&1 || { printf 'n/a\n不在 git 仓库里\n'; return 0; }
-  out=$(git ls-remote "$(git remote get-url origin 2>/dev/null || echo .)" HEAD 2>&1 || true)
+  # 这一步本身就要起一次 SSH（实测冷解析 15 s），先钉住 IP，把「解析慢」和
+  # 「fork 被禁」两件事分开 —— 否则沙箱里被拦和网络慢会混成同一个 15 s 超时。
+  local sp; sp=$(ssh_pin github.com 2>/dev/null)
+  out=$(GIT_SSH_COMMAND="ssh -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new $sp" \
+        git ls-remote "$(git remote get-url origin 2>/dev/null || echo .)" HEAD 2>&1 || true)
   case "$out" in
     *"cannot create standard input pipe"*|*"unable to fork"*|*"Permission denied"*)
       printf 'blocked\n沙箱禁止 git fork 管道（cannot create standard input pipe）\n' ;;
@@ -363,7 +389,26 @@ fetch_one() {
     auth+=(-H "Accept: application/octet-stream")
     akh+=(--header="Accept: application/octet-stream")
   fi
-  if command -v "$ARIA2" >/dev/null 2>&1 && (( fsize >= ARIA2_MIN )); then
+  # 数据面优先交给 node（tools/ghfetch.cjs）：它对同一 host 的所有 IP 并发抢跑，
+  # 谁先回响应头谁赢。curl 只能逐个试，坏 IP 要按 --speed-time 白等一轮。
+  # 2026-11-08 同一 2.5 MiB 资产冷缓存 A/B（每轮 flushdns）：
+  #   node 8 轮 → 2161/2427/1930/2757/2271/2210/2771 ms（中位 ~2.2 s）
+  #   curl 8 轮 → 7431/3759/3696/4574/11945/10043/17836/14922 ms（中位 ~8.7 s）
+  # 差距 4 倍，所以 rest 通道直接让 node 打头，curl 退成兜底。
+  if [[ "$kind" == rest ]] && have_node; then
+    local nt; nt=$(gh_token 2>/dev/null || true)
+    if node_download "$url" "$out" "$nt" 2>/dev/null; then
+      if (( fsize <= 0 )); then okflag=1
+      else
+        local ngot; ngot=$(stat -c %s "$out" 2>/dev/null || echo 0)
+        if (( ngot == fsize )); then okflag=1
+        else info "  node 拿到大小不符（$ngot / $fsize），改用 curl"; rm -f "$out"; fi
+      fi
+    else
+      info "  node 没成，改用 curl"
+    fi
+  fi
+  if (( okflag == 0 )) && command -v "$ARIA2" >/dev/null 2>&1 && (( fsize >= ARIA2_MIN )); then
     info "  aria2c 8 连接（文件 $(( fsize / 1048576 )) MiB）"
     local -a ax=()
     if "$ARIA2" "${ax[@]}" "${akh[@]}" --allow-overwrite=true -x 8 -s 8 -k 1M --max-tries=2 --timeout=30 \
@@ -378,17 +423,50 @@ fetch_one() {
     # 只看 curl 退出码会把 9 字节的 "Not Found" 当成下载成功（实测踩到）。
     # 状态码必须和退出码分开取：老写法 code=$(curl ... || echo 000) 在 curl 先打印 302、
     # 再因跳转目标解析超时而退出非零时，会拼成 "302000"，于是传成功也被判失败（实测踩到）。
-    local code crc
-    code=$(curl -sS $(net_opts) -L --connect-timeout 5 --retry 2 --max-time 1800 \
-      -o "$out" -w '%{http_code}' "${auth[@]}" "$url" 2>/dev/null)
-    crc=$?
-    [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
-    if [[ "$code" == 2* ]]; then okflag=1
-    else info "  curl 拿到 http=$code（curl exit=$crc）"; fi
+    #
+    # 数据面（release-assets）会解析出 4 个 IP，**好坏不一，坏的是哪个并不固定**。
+    # 2026-11-08 同一 2.5 MiB 资产实测：.108 1.19/0.84 MB/s、.109 1.05/0.99、.110 0.91/0.93、
+    # .111 0.37/0.18 MB/s（6.9 s / 14.0 s）；另一轮 .110 连续三次只拿到 0 字节。
+    # 只钉第一个 IP 就是抽签：抽到坏的那个，白等一轮 connect 超时再由 node 兜底重解析 ——
+    # 这就是「同一条命令 4 s 还是 44 s」的分水岭。所以这里逐个 IP 试，谁先成谁算。
+    local code crc ip
+    local base; base=$(opts_of)
+    local apiip; apiip=$(fast_ip api.github.com 2>/dev/null | awk '{print $1}')
+    [[ -n "$apiip" ]] && base+=" --resolve api.github.com:443:$apiip"
+    local -a rels=()
+    if [[ "$kind" == rest ]]; then
+      while read -r ip; do [[ -n "$ip" ]] && rels+=("$ip"); done < <(fast_ip release-assets.githubusercontent.com 2>/dev/null | tr ' ' '\n')
+    fi
+    (( ${#rels[@]} )) || rels=("")
+    for ip in "${rels[@]}"; do
+      local -a ropts=()
+      [[ -n "$ip" ]] && ropts=(--resolve "release-assets.githubusercontent.com:443:$ip")
+      # --speed-limit/--speed-time 是这里的另一个关键：连上了不代表传得动。
+      # 2026-11-08 实测同一 2.5 MiB 资产，四个 IP 的瞬时速率从 1.19 MB/s 到 181 KB/s，
+      # 还出现过单轮 44 s（≈58 KB/s）而 --connect-timeout 全程没触发 —— 因为连接早建好了，
+      # 卡在传输。不设速度下限的话，慢 IP 会一直磨到 --max-time，等于白等。
+      # 低于 96 KB/s 持续 12 s 就放弃这条 IP，换下一条。
+      code=$(curl -sS $base "${ropts[@]}" -L --connect-timeout 4 --retry 1 --max-time 1800 \
+        --speed-limit 98304 --speed-time 12 \
+        -o "$out" -w '%{http_code}' "${auth[@]}" "$url" 2>/dev/null)
+      crc=$?
+      [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
+      if [[ "$code" == 2* ]]; then
+        if (( fsize > 0 )); then
+          local got; got=$(stat -c %s "$out" 2>/dev/null || echo 0)
+          if (( got == fsize )); then okflag=1; break; fi
+          info "  大小不符（$got / $fsize，IP ${ip:-默认}），换下一个 IP"
+          rm -f "$out"; continue
+        fi
+        okflag=1; break
+      fi
+      info "  curl 拿到 http=$code（curl exit=$crc，IP ${ip:-默认}）"
+      rm -f "$out" 2>/dev/null
+    done
   fi
-  if [[ $okflag -eq 0 ]] && have_node; then
-    info "  curl 没成，改用 node fetch"
-    node_download "$url" "$out" && okflag=1
+  if [[ $okflag -eq 0 ]] && have_node && [[ "$kind" != rest ]]; then
+    info "  curl 没成，改用 node（tools/ghfetch.cjs）"
+    node_download "$url" "$out" $(gh_token 2>/dev/null || true) && okflag=1
   fi
   [[ $okflag -eq 1 && -s "$out" ]] || return 1
   # 拿到 HTML / 短文本说明是错误页/拦截页，不是目标文件。
@@ -639,7 +717,8 @@ cmd_clone() {
   # 1) SSH 优先，也是本机 push 的唯一通道
   if [[ -f "$HOME/.ssh/id_ed25519_gh" ]]; then
     info "尝试: SSH ($ssh_url)"
-    if git -c core.sshCommand="ssh -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new"          clone "$ssh_url" "$dir" >/dev/null 2>&1; then
+    local csp; csp=$(ssh_pin github.com)
+    if git -c core.sshCommand="ssh -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new $csp" clone "$ssh_url" "$dir" >/dev/null 2>&1; then
       ok "clone 成功: $dir（SSH）"; return 0
     fi
     rm -rf "$dir" 2>/dev/null
@@ -664,7 +743,9 @@ push_ssh() {
   info "push(ssh) → $ssh_url ($ref)"
   local t0 t1 rc out
   t0=$(date +%s)
-  out=$(GIT_TERMINAL_PROMPT=0 git -c core.sshCommand="ssh -o ConnectTimeout=25 -o StrictHostKeyChecking=accept-new" push "$ssh_url" "$ref" 2>&1)
+  # sshCommand 里也钉 IP：git 起的每次 ssh 都要重新解析，冷的时候一次就要 3–14 s。
+  local sp; sp=$(ssh_pin github.com)
+  out=$(GIT_TERMINAL_PROMPT=0 git -c core.sshCommand="ssh -o ConnectTimeout=25 -o StrictHostKeyChecking=accept-new $sp" push "$ssh_url" "$ref" 2>&1)
   rc=$?
   t1=$(date +%s)
   (( t1 > t0 )) && info "耗时 $((t1-t0))s"
@@ -708,7 +789,7 @@ cmd_sshcheck() {
   [[ -f "$HOME/.ssh/id_ed25519_gh" ]] || { warn "没有 ~/.ssh/id_ed25519_gh"; return 1; }
   local out
   local port host; read -r port host < <(ssh_target)
-  out=$(timeout 25 ssh -p "$port" -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -T "git@$host" 2>&1)
+  out=$(_ssh_try "$host" "$port" "$(ssh_pin "$host")")
   case "$out" in
     *"successfully authenticated"*) ok "$out"; return 0 ;;
     *) warn "SSH 认证失败: $out"; return 1 ;;
@@ -845,17 +926,41 @@ cmd_status() {
     "raw.githubusercontent.com|https://raw.githubusercontent.com/dongopencv/tools/master/AGENTS.md|raw 域时通时不通（实测 8/8 失败、偶发成功）；要稳就改走 api.github.com/repos/<o>/<r>/contents/<path>"
     "release-assets.githubusercontent.com|https://release-assets.githubusercontent.com/|release 资产域（根路径 404 属正常）"
   )
-  local item name purl hint
+  local item name purl hint idx
+  # 探针必须并行：单条最坏要 8 s 超时（github.com 与 raw 域本来就不通），
+  # 串行七条实测 status 要 35–58 s —— 用户根本不会等，等于没测。
+  # 并行后整节压到「最慢的那一条」，输出顺序仍按 probes 表的顺序。
+  local -a pids=()
+  local tdir; tdir=$(mktemp -d 2>/dev/null || echo "/tmp/pc1-status-$"); mkdir -p "$tdir"
+  idx=0
   for item in "${probes[@]}"; do
     IFS="|" read -r name purl hint <<< "$item"
-    case "$name" in api.github.com) tries=3 ;; *) tries=1 ;; esac
-    code=000
-    for ((i=1; i<=tries; i++)); do
+    ( r=$(node_probe "$purl"); printf "%s" "$r" > "$tdir/p$idx" ) &
+    pids+=($!)
+    idx=$((idx+1))
+  done
+  # SSH 两条也一起跑：跟 HTTPS 探针互不依赖，各自 3–15 s 且谁慢谁快每轮都不一样。
+  # 重定向顺序有讲究：必须 `> file 2>&1`。写成 `2>&1 > file` 的话，stderr 会先复制到"当时的"
+  # stdout（终端），再让 stdout 指向文件 —— 结果 ssh 的整段诊断都进了终端、文件是空的，
+  # 这里就会把能用的 SSH 报成"不通（20 s 内没有输出）"。（本轮踩到并修）
+  # 两条 SSH 探针同样钉 IP（ssh_pin），否则冷解析一次就吃掉 14 s，把整条 status 拖长。
+  ( timeout 20 ssh -p 22  -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new $(ssh_pin github.com)    -T git@github.com    > "$tdir/s0" 2>&1 ) & pids+=($!)
+  ( timeout 20 ssh -p 443 -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new $(ssh_pin ssh.github.com) -T git@ssh.github.com > "$tdir/s1" 2>&1 ) & pids+=($!)
+  for idx in "${!pids[@]}"; do wait "${pids[$idx]}" 2>/dev/null || true; done
+
+  idx=0
+  for item in "${probes[@]}"; do
+    IFS="|" read -r name purl hint <<< "$item"
+    code=000; size=0
+    [[ -s "$tdir/p$idx" ]] && read -r code size < "$tdir/p$idx"
+    [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
+    [[ "$size" =~ ^[0-9]+$ ]] || size=0
+    # api.github.com 偶发抖动，单独重试一次；其余域本来就不通，重试没意义。
+    if [[ "$code" == 000 && "$name" == api.github.com ]]; then
       read -r code size < <(node_probe "$purl")
       [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
-      [[ "$code" != 000 ]] && break
-      (( i < tries )) && sleep 1
-    done
+      [[ "$size" =~ ^[0-9]+$ ]] || size=0
+    fi
     case "$code" in
       200|206) ok "$name → $code（$size B）" ;;
       000)     warn "$name → 不通"
@@ -864,34 +969,50 @@ cmd_status() {
                if [[ "$code" == 403 && "$name" == codeload* ]] || [[ "$code" == 404 && "$name" == release-assets* ]]; then :
                else [[ -n "$hint" ]] && warn "    $hint"; fi ;;
     esac
+    idx=$((idx+1))
   done
 
   echo "── SSH（push 通道） ──" >&2
   # 2026-11-08：别再用 /dev/tcp 探端口。MSYS bash 的 /dev/tcp 连 github.com:22 会 10 s 超时，
-  # 而同一秒 `ssh -T git@github.com` 秒回 authenticated——探测手段本身在骗人（#5 复核）。
+  # 而同一秒 `ssh -T git@github.com` 秒回 authenticated —— 探测手段本身在骗人（#5 复核）。
   # 直接拿真正要用的 ssh 去试，顺手把「端口通」与「密钥注册了」一次说清。
-  local sshok=0 hp out
+  local sshok=0 out hp
+  idx=0
   for hp in "github.com 22" "ssh.github.com 443"; do
-    set -- $hp
-    out=$(timeout 20 ssh -p "$2" -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T "git@$1" 2>&1 || true)
+    out=""; [[ -s "$tdir/s$idx" ]] && out=$(cat "$tdir/s$idx" 2>/dev/null)
     case "$out" in
-      *"successfully authenticated"*) ok "$1:$2 → 通，认证成功"; sshok=1 ;;
-      *"Permission denied"*)         warn "$1:$2 → 端口通，但认证失败（公钥没注册到这个账号？）" ;;
-      *)                             warn "$1:$2 → 不通" ;;
+      *"successfully authenticated"*) ok "$hp → 通，认证成功"; sshok=1 ;;
+      *"Permission denied"*)         warn "$hp → 端口通，但认证失败（公钥没注册到这个账号？）" ;;
+      *)                             warn "$hp → 不通（20 s 内没有输出）" ;;
     esac
+    idx=$((idx+1))
   done
+  rm -rf "$tdir" 2>/dev/null || true
   if [[ $sshok -eq 0 ]]; then
     warn "    两条 SSH 都不通 → push 做不了。先在 https://github.com/settings/keys 确认公钥已注册。"
   fi
 
   echo "── git 传输（本会话能不能 push/fetch） ──" >&2
-  local fork fork_msg; { read -r fork; read -r fork_msg; } < <(git_fork_state)
-  case "$fork" in
-    ok)      ok "git 可以起远端进程：$fork_msg" ;;
-    blocked) warn "$fork_msg"
-             warn "  本会话只能本地提交；push/fetch/clone 要人在普通终端跑。" ;;
-    *)       warn "$fork_msg" ;;
-  esac
+  # 判据可以用已经花掉的 SSH 探针结果：两条 ssh 都认证成功了，就说明本会话能 fork 出
+  # 远端助手进程（push/fetch 靠的就是它），不必再自己跑一遍 ls-remote。
+  # 这一步以前无条件重跑 ls-remote，实测白等 7–11 s。
+  #
+  # 正常路径（SSH 通）根本不用再问 git：能 ssh 认证就说明本会话能 fork 出远端助手，
+  # 那正是 push/fetch 需要的。只有 SSH 也不通时，才值得花 15 s 跑一次 ls-remote 去区分
+  # 「网络挂了」和「沙箱禁了 fork」。
+  local fork="" fork_msg=""
+  if [[ $sshok -eq 1 ]]; then
+    ok "git 可以起远端进程：SSH 探针已认证成功，push/fetch 可用"
+  else
+    { read -r fork; read -r fork_msg; } < <(git_fork_state)
+    case "$fork" in
+      ok)      ok "git 可以起远端进程：$fork_msg" ;;
+      blocked) warn "$fork_msg"
+               warn "  本会话只能本地提交；push/fetch/clone 要人在普通终端跑。" ;;
+      "")      warn "git ls-remote 没有输出（SSH 也不通，push 大概率做不了）" ;;
+      *)       warn "$fork_msg" ;;
+    esac
+  fi
 }
 
 # api：先 gh，再 curl，最后 node。三者的失败理由不一样，不能混为一谈。

@@ -44,7 +44,7 @@ AGENTS.md 里那条「大于 50 MB 不要用 git push」的判据，来源就是
 | 通道 | 状态 | 说明 |
 |---|---|---|
 | `api.github.com:443` | ✅ 通 | `gh` 与 `github.sh api` 走这条。**读的一切都走它** |
-| `release-assets.githubusercontent.com` | ✅ 通 | `api.github.com` 资产端点 302 的落点，**预签名 URL、直连可达**。324 MB 资产实测 **5.09 MiB/s**，是资产下载的最优且唯一路径 |
+| `release-assets.githubusercontent.com` | ✅ 通 | `api.github.com` 资产端点 302 的落点，**预签名 URL、直连可达**。解析出 4 个 IP，好坏不一（实测最坏的一个只有 0.18 MB/s，另有一轮三次全 0 字节），所以下载时要逐个试并砍慢连接，见 `tools/README.md`「release-assets 有四个 IP」 |
 | `codeload.github.com` | ✅ 通 | GitHub 归档下载域 |
 | `github.com:22` | ✅ 通（波动） | 03:53 复测 6/6 通；02:33 同一小时内测到 CLOSED，历史约 4/5 成功率。**push 主通道** |
 | `ssh.github.com:443` | ✅ 通 | 03:53 复测 5/6 通。`github.com:22` 不通时改这条 |
@@ -59,7 +59,7 @@ AGENTS.md 里那条「大于 50 MB 不要用 git push」的判据，来源就是
 
 | 场景 | 走哪条 | 判据 |
 |---|---|---|
-| 代码 / 文档提交 | `bash tools/github.sh push <owner/repo> [ref]` —— 只走 SSH（22 不通自动改 `ssh.github.com:443`） | 单次 < 10 MB。`Permission denied (publickey)` = 账号上没有公钥，去 https://github.com/settings/keys 人工加，别改 `~/.ssh/config` 耗时间 |
+| 代码 / 文档提交 | `bash tools/github.sh push <owner/repo> [ref]` —— 只走 SSH（钉 IP，22 不通自动改 `ssh.github.com:443`） | 单次 < 10 MB。`Permission denied (publickey)` = 账号上没有公钥，去 https://github.com/settings/keys 人工加，别改 `~/.ssh/config` 耗时间 |
 | 仓库单次 push 总量 | 尽量 ≤ 20 MB | 上行 150 KB/s 时约 2.3 分钟；超过就该拆 |
 | **> 50 MB 的产物** | **release 资产，禁止 git push** | 50 MB ÷ 150 KB/s ≈ 5.7 分钟，且失败要重传整包；release 支持断点与校验 |
 | 下载 release 资产 / raw | `bash tools/github.sh asset\|raw ...` | `asset` 走 api 资产端点 + SHA256 校验；`raw` 走 api contents，raw 域只作兜底 |
@@ -68,6 +68,22 @@ AGENTS.md 里那条「大于 50 MB 不要用 git push」的判据，来源就是
 
 20 MB push 的预估耗时（按上行 150 KB/s）：**约 2.3 分钟**。
 **切 release 资产的判据**：单个文件 > 50 MB，或一次 push 预计超过 5 分钟——即总量 > 45 MB。
+
+### SSH 也走 getaddrinfo，也会卡（2026-11-08 实测）
+
+`ssh` 解析 `github.com` 第走的是同一套系统解析器。冷的时候单次解析就能吃掉：
+同一分钟 4 轮实测 **3.2 / 3.4 / 12.5 / 14.4 s**（60% 的轮次落在 12 s 以上）。
+这不是「22 端口时通时不通」，是解析没命中缓存 —— 复测时别把它记成端口不稳。
+
+钉住 IP 就平了：`ssh -o HostName=<ip> -o HostKeyAlias=<host> -p 22 git@github.com`
+同一分钟 4 轮 **3.4 / 3.6 / 4.7 / 4.9 s**。两个细节：
+
+- 用 `-o HostName=` 而不是把 IP 写进 argv：argv 里仍是 `github.com`，`~/.ssh/config` 的
+  `Host github.com` 段（IdentityFile / IdentitiesOnly）照常生效。
+- `HostKeyAlias` 保持 known_hosts 里的名字，换 IP 不会报 host key changed。
+
+`tools/github.sh` 的 `push` / `clone` / `sshcheck` / `status` 都已这么钉（`ssh_pin()`），
+解析不出来会自动退回系统解析，不是硬性依赖。
 
 ## 五、只在 workspace-write 沙箱里成立的做法/失败（不是本机属性）
 

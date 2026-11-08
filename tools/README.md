@@ -44,7 +44,7 @@ bash tools/github.sh <子命令> [参数…]
 2. **`curl`** —— 本机某些会话里 curl 拿不到 TLS 句柄：
    `curl: (35) schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`。
    这是 curl 自身的问题，**不是网络也不是 token 的问题**。
-3. **`node`（`tools/ghfetch.cjs`）** —— 永远兜底。它不是 `fetch`：自己问 DNS（见下文「冷 DNS」），
+3. **`node`（`tools/ghfetch.cjs`）** —— 兜底，也是**下载数据面**的首选。它不是 `fetch`：自己问 DNS（见下文「冷 DNS」），
    并按目标选 `Accept`（资产端点必须 `application/octet-stream`，否则回 1470 字节元数据 JSON）。
 
 `status` 会分别报告「传输器」和「token 认证」两节，就是为了不把传输器故障误读成 token 故障。
@@ -53,26 +53,72 @@ bash tools/github.sh <子命令> [参数…]
 > gh→node），同一台机器上「谁先谁后」读代码都预测不出来。2026-11-07 统一成 gh → curl → node
 > 一条，以后加传输器只改一处。
 
-### 下载选路（2026-11-06 重做）
+### 下载选路（2026-11-08 重做）
 
 老版本是「先逐通道探测再挑最快」，实测这个策略本身比下载还贵：
 
 - 探测比的是 `%{size_download}`，而每个通道都被 `-r 0-1023` 卡在 1024 字节 → 永远只有候选表第一个赢，等于从未测速。
 - 不同通道对 Range 的处理不一致：有的老实回 `206`，有的直接回 `200` 并开始推整个文件 → 探测只能靠 `--max-time` 硬砍，一轮 **60+ 秒**，而真正下载只要 0.8–1.6 秒。
 
-现在改成**按候选表顺序直接下，失败或大小不符就换下一条**，选路成本 ≈ 一次真实传输：
+现在改成**先换 API 端点、数据面交给 node 抢跑、失败或大小不符才换下一条**，选路成本 ≈ 一次真实传输：
 
 1. **一律先换 API 资产端点** `api.github.com/…/releases/assets/<id>`（302 到 `release-assets.githubusercontent.com`，预签名、直连可达）。这不是优化，是**唯一能通的路**：`github.com` 在本机是 TCP 层连不上（`net.connect` 实测 6 s 超时 ×2、`curl` exit 28）。
 2. `download` 收到 `https://github.com/O/R/releases/download/TAG/FILE` 这种直链时，会自动查 `releases/tags/TAG` 拿 asset id 再下 —— 你不用记两条命令。
 3. 每个步骤都先删半截文件：不同通道未必都支持续传，`-C -` 接手别处残片会算出坏哈希。
-4. aria2 只在文件 ≥ 8 MiB 时启用（实测 2.18 MiB 时它与 curl 打平，更小的文件反而慢 6–12 倍）。
+4. **数据面先交给 node：四个 IP 并发抢跑，谁先回响应头谁赢。** `release-assets.githubusercontent.com`
+   解析出 4 个 IP，好坏不一（见下表）。curl 只能逐个试，抽到坏的那个要按 `--speed-time` 白等一轮；
+   `ghfetch.cjs` 把 4 个请求同时发出去，第一个回响应头的赢、其余立刻掐断。
+5. **curl 退成兜底**，并且同样逐个 IP 试 + 慢就砍（`--speed-limit 98304 --speed-time 12`：
+   低于 96 KB/s 持续 12 s 就换下一个 IP）。连上了不代表传得动 —— 出现过单轮 44 s（≈58 KB/s）
+   而 `--connect-timeout` 全程没触发，因为连接早建好了，卡在传输。
+6. aria2 只在文件 ≥ 8 MiB 时启用（实测 2.5 MiB 时它与 curl 打平，更小的文件反而慢 6–12 倍）。
 
-实测（`ipconfig /flushdns` 之后跑，2.5 MB 资产）：`asset` **4.0 s** / `download`（直链自动改写）**4.1–4.9 s** / `raw`（10600 B 正文）**1.4 s**；17.7 MB 资产走 aria2 8 连接 **36.8 s**。
+### release-assets 有四个 IP，好坏不一（2026-11-08）
+
+`release-assets.githubusercontent.com` 解析出 4 个 IP。同一 2.5 MiB 资产用 `curl --resolve`
+逐个钉住各跑 2 次：
+
+| IP | 单次耗时 | 有效速率 |
+|---|---|---|
+| `185.199.108.133` | 2.14 / 3.02 s | 0.84–1.19 MB/s |
+| `185.199.109.133` | 2.42 / 2.58 s | 0.99–1.05 MB/s |
+| `185.199.110.133` | 2.79 / 2.73 s | 0.91–0.93 MB/s |
+| `185.199.111.133` | 6.93 / 14.02 s | **0.18–0.37 MB/s** |
+
+另一轮里 `.110.133` 连续 3 次只拿到 0 字节。**四个里至少有一个会坏，坏的是哪个并不固定** ——
+所以只钉第一个 IP 时好坏全靠运气，这就是同一条命令 4 s 还是 44 s 的来源。
+
+**并发抢跑是在绕开一个真实的坏节点，不是微优化。** 同一 2.5 MiB 资产、每轮 `flushdns` 的 A/B：
+
+| 实现 | 冷缓存 8 轮 | 中位 |
+|---|---|---|
+| `ghfetch.cjs` 四 IP 抢跑 | 2161 / 2427 / 1930 / 2757 / 2271 / 2210 / 2771 ms | **~2.2 s** |
+| curl 逐个 IP 试 | 7431 / 3759 / 3696 / 4574 / 11945 / 10043 / 17836 / 14922 ms | **~8.7 s** |
+
+实测（每轮 `ipconfig /flushdns` + 删 `~/.cache/pc1-pin-*`，2.5 MB 资产，node 打头之后）：
+
+- `asset` 连跑 8 轮：**3.5–4.5 s**（最慢一轮 6.3 s）
+- `download`（直链自动改写）**3.5–3.7 s**；`raw`（10600 B 正文）**1.3 s**
+- 17.7 MB 资产走 aria2 8 连接：**7.7–8.7 s**
+- 资产名写错 **2.2 s 内**失败并说清是 tag/文件名不对（`exit=1`）
+
 改之前同一台机器冷缓存下 `download` 直链是直接失败、`asset` 的 node 兜底会把 1470 字节 JSON 当成品存盘并报「完成」。
 
-资产名写错时现在 **2 s 内**就失败并说清是 tag/文件名不对（`exit=1`），不再白等一轮 curl 超时。
-
 想回到「先测速再选」的旧行为：`GITHUB_PROBE=1 bash tools/github.sh download <url>`。
+
+### `status` 自己也要快（2026-11-08）
+
+`status` 要探 5 条 HTTPS + 2 条 SSH + git 传输，全串行时实测 35–58 s —— 用户根本不会等，
+等于没测。现在全部并行（`& + wait`，结果写临时文件再按表顺序打印），并且：
+
+- SSH 探针与 `push`/`clone` 一样钉 IP（`ssh -o HostName=<ip> -o HostKeyAlias=<name>`）。
+  `ssh` 也走 getaddrinfo，冷的时候解析一次就 3–14 s（实测 4 轮 3.2/3.4/12.5/14.4 s）；
+  钉住后 4 轮 3.4/3.6/4.7/4.9 s。`HostKeyAlias` 保持 known_hosts 里的名字不变。
+- 「git 能不能 fork 传输进程」不再单独跑一遍 `git ls-remote`（那一步自己要 7–15 s）：
+  两条 SSH 都认证成功了就是能 fork（push/fetch 靠的就是它），直接据此下结论。
+  只有 SSH 也不通时，才值得花那 15 s 跑一次 ls-remote —— 因为那时才需要区分「网络挂了」和「沙箱禁了 fork」。
+
+实测：**58.6 s → 6.8 s**（冷缓存，含 flushdns 后重新解析；偶尔撞上解析抖动会到 17.9 s）。
 
 ### 通道探测要说人话
 
