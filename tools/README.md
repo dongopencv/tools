@@ -6,6 +6,7 @@
 |---|---|
 | `github.sh` | GitHub 访问的**唯一入口**：API、release 资产、raw、clone、push、通道体检 |
 | `attention.sh` | 票库注意力视图：等我拍板 / agent 可接 / 被阻塞 / 沉睡 |
+| `handoff-check.mjs` | dsh-auto-handoff 现网核验：代码版本 / 链深 / 日志刷屏 / 文档结构 / 简报送达 / 离线测试 |
 
 ## github.sh
 
@@ -70,12 +71,10 @@ bash tools/github.sh <子命令> [参数…]
 
 想回到「先测速再选」的旧行为：`GITHUB_PROBE=1 bash tools/github.sh download <url>`。
 
-### 凭据只发给 GitHub 自己的域名
+### 镜像分支不带凭据
 
-镜像是第三方（`gh-proxy.com` / `ghfast.top` / `ghproxy.net`），把 PAT 塞进它们的请求头等于把
-repo / workflow / delete_repo 权限交给别人。实测镜像对公开内容**根本不需要** `Authorization`
-（无 token 照样 200 / 206）。所以 `raw` 与 `clone` 的镜像分支都不带凭据，只有
-`api.github.com` / `release-assets` / 直连 / relay 才带。
+`raw` 与 `clone` 的镜像分支都不带 `Authorization`，只有 `api.github.com` / `release-assets` /
+直连 / relay 才带。
 
 ### 通道探测要说人话
 
@@ -85,10 +84,26 @@ repo / workflow / delete_repo 权限交给别人。实测镜像对公开内容**
 
 `release` 在仓库没有 `latest` release 时会自动回退成列出全部 release。
 
-### 写操作只能走 SSH
+### 写操作的通道与前提（2026-11-08 更正）
 
-`git push` 走 `git@github.com:owner/repo.git`。HTTPS 写在本机三条路全死
-（直连被墙 / 8899 上游不支持写 / 镜像不转发写）。
+首选 SSH：`git push` 走 `git@github.com:owner/repo.git`。
+
+**但「HTTPS 写三条路全死」这句是错的，2026-11-08 实测已被推翻。**
+git over HTTPS 经 8899 中转站是活的，缺的只是 token 的 `Contents: Read and write`：
+
+```bash
+git -c http.proxy=http://127.0.0.1:8899 -c http.sslVerify=false \
+    -c http.extraheader="Authorization: Basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)" \
+    ls-remote https://github.com/dongopencv/tools.git HEAD
+# → 返回真实 SHA（通）
+```
+
+同形态 `push` 若返回 `403 The requested URL returned error: 403` 且远端提示
+`Permission to <owner>/<repo>.git denied`，**那是授权问题不是链路问题**：
+细粒度 PAT 缺 `Contents: Read and write`。判据见 `docs/pending-issues/pat-permission-fix.md`。
+
+2026-11-08 同时确认：账号上 `GET /users/dongopencv/keys` 数量为 **0**，
+所以 SSH 通道失效不是配置问题而是**公钥被移除**，只能在网页加回。
 
 **在受限会话（agent 沙箱）里，git 连传输进程都 fork 不出来**：
 
@@ -183,14 +198,36 @@ bash C:/Users/Admin/.skills-vault/download/scripts/github.sh status   # 跑的�
 - 定位顺序：`$GITHUB_GATEWAY` → `$HOME/proj/PC1/tools/github.sh` → `/d/proj/PC1/tools/github.sh`。仓库换位置就 `export GITHUB_GATEWAY=/path/to/tools/github.sh`。
 - 收敛前 vault 那份是 421 行旧副本（缺 `ghdl`/`env`/`relay`，且带着 `sha256sum "$out"` 的 Windows 反斜杠误判），已备份为同目录 `github.sh.bak-2026-11-07-pre-shim`。**不要再改那份备份、也不要照着它改。**
 - vault 根 `~/.skills-vault` 是三个客户端的 junction 目标（`~/.workbuddy/skills`、`~/.trae-cn/skills`、`~/.dsh/skills`），所以 `bash <任意客户端>/download/scripts/github.sh` 走到的都是同一个真身。
-- vault 里仍独立存在的只有两件**凭据相关**的东西：`setup-gh.sh`（五段向导）与 `.github-token`（token 文件，真身也把它当 fallback 读，见脚本第 37–41 行）。它们不属于网关实现，不在收敛范围内。
+- vault 里仍独立存在的只有两件与网关无关的东西：`setup-gh.sh`（五段向导）与 `.github-token`（token 文件，真身也把它当 fallback 读，见脚本第 37–41 行）。它们不属于网关实现，不在收敛范围内。
 - 改网关只改本仓库 `tools/github.sh`，commit + push；vault 侧不需要同步，也不会再分叉。
 
 ### 相关文档
 
 - `docs/network-baseline.md` —— 上下行实测、通道可达性、选路判据（>50 MB 不走 git push）
-- `AGENTS.md` —— 本机网络限制与凭据纪律
+- `AGENTS.md` —— 本机网络限制与 token 位置
 - `docs/agents/issue-tracker.md` —— issue 操作约定（含沙箱内跑 `gh` 的坑）
+- `docs/pending-issues/pat-permission-fix.md` —— PAT 缺哪几项写权限、怎么补
+
+## issue-closeout.sh
+
+票库写权限补齐后，一次性把 #5 的收尾做完（幂等，默认只演练）：
+
+```bash
+bash tools/issue-closeout.sh            # 演练：打印每一步要执行的命令，不写
+bash tools/issue-closeout.sh --apply    # 真写
+```
+
+五步：预检读写权限 → 删坏评论 `6710513283` → 重发干净版 resolution → 回写 #5 正文 → 给 map #2 补 Decisions 第 11 条。
+幂等靠正文里的 HTML 注释标记（`<!-- resolution-2026-11-08-vault-forwarder -->` 等），重复跑会 `[skip]`。
+
+退出码：`0` 完成；`2` 权限不足（会打印实测的 `X-Accepted-Github-Permissions` 与要改哪两项）；`3` 前置文件缺失。
+
+**为什么要有这个脚本**：上一版是四条手敲命令，其中「内联正文」那条被 bash 当成命令替换执行，
+反引号里的内容被跑掉、把 `.github-token` 的明文顶进了公开评论的表格单元格，
+GitHub secret scanning 秒级检出并吊销了那枚 token。脚本把所有正文都走 `-F body=@file`，杜绝这一类。
+
+正文素材在 `docs/pending-issues/i5-comment.md` 与 `map-gist.md`，改内容改那两个文件即可。
+
 ## attention.sh
 
 票越开越多、大部分卡在别人的票后面，于是干脆不看了。这个脚本把整个票库收敛成
@@ -225,3 +262,40 @@ bash tools/attention.sh -R o/r       # 换仓库（默认 dongopencv/tools）
 - 年龄用 `date -d` 算，失败回退 0：一条坏日期不该毁掉整个视图。
 
 2026-11-08 首次实跑（沉睡 3d）：合计 open 35 张，等我 7 · 可接 11 · 被阻塞 12 · 地图 5 · 沉睡 14。
+
+## handoff-check.mjs
+
+`dsh-auto-handoff` 是「检测→落盘→REVIEW→开新会话续作」四段流水线。它出问题的方式很阴——
+**看起来在跑，其实只跑通了前半段**：文档写了、新会话建了，简报没送到；或者代码改好了，
+宿主还在跑旧模块。这个脚本把「它到底有没有真的工作」压成一条命令，不用每次人肉翻日志。
+
+```bash
+node tools/handoff-check.mjs            # 常规核验，扫最近 15 个会话
+node tools/handoff-check.mjs --deep     # 额外扫 40 个会话 + 跑四套离线测试
+```
+
+七个检查项（每项打 ✅ PASS / ◐ WARN / ❌ FAIL）：
+
+| 检查项 | 判据 | 判成 FAIL 说明什么 |
+|---|---|---|
+| 代码版本 | `lib/index.js` 的 mtime 是否晚于 `hub.log` 最后一条 `system.start` | 现网跑的是旧模块——改完没重启，白改 |
+| 链深（genesis 修复） | `claims.json` 里 `chainDepth>=1` 的记录是否出现 `genesis` | 新会话被写成 `done`（终态），链条停在第 2 棒、`chainLimit` 形同废纸 |
+| 交接是否真发生过 | 日志里 `已交接：` 的条数与最后一次 | 一次都没成 = 闸门或投递有硬故障 |
+| 交接前 REVIEW | 日志里 `交接前 REVIEW` 的次数 | 落盘了但没审，等于跳过了流水线的第三段 |
+| 日志刷屏 | `轮中触发被占位拦下` 占日志行数比例（>50% = WARN） | 工具调用计数是累计值、没有「本轮已处理」标记，每个 tool/call 都重走一遍闸门 |
+| 交接文档结构 | 最新一份 md 是否含 `## 交接前 REVIEW` | 文档是旧版渲染，新会话拿到的是残缺简报 |
+| 简报送达 | 最近 N 个会话里，`user/message` 是否以 `[自动交接] 上一会话` 开头 | `sessionController.prompt` 的第二参数（signal）漏传，第一行 `signal.throwIfAborted()` 就抛 |
+| 离线测试（--deep） | `test/{chain,claims,integration,midturn}.test.mjs` 的 PASS 数 | 回归被改坏了 |
+
+设计要点：
+
+- **「简报送达」只认 `user/message` 行**：早先版本在全文里 grep 关键词，命中过 4 个「送达」，
+  结果全是助手读源码时把 `promptText` 拼接代码贴进了对话——假阳性 100%。现在按事件类型收窄。
+- **会话日志必须按 zstd frame 逐帧解**：`session.v4.jsonl.zstd` 是多帧拼接，
+  `zstdDecompressSync(整个文件)` 只解出第一帧（188 字节的 header），会把有内容的会话误判成空会话。
+  脚本按 magic `0x28B52FFD` 切帧。
+- **只读**：不写插件状态、不动台账、不发网络请求。唯一的副作用是 `--deep` 会在临时目录里跑测试
+  （测试自己把 `USERPROFILE` 指到临时目录，不污染真账本）。
+- 环境变量可覆盖路径：`HANDOFF_PLUGIN_DIR`（插件源码目录）、`HANDOFF_OUT_DIR`（交接文档目录）。
+- 退出码 0 = 没有 FAIL，1 = 有 FAIL，可直接进 `&&` 链。
+
