@@ -260,7 +260,7 @@ ISSUES I-2：代码改路径，测试没改，产生假失败。
 ---
 
 ### R-36 只测离线桩，未测真实宿主 【中·ISSUES O-6】
-13 条测试全用假 ctx。真实 Cordis 上下文的行为差异未覆盖。
+38 条断言全用假 ctx。真实 Cordis 上下文的行为差异未覆盖——**v1.1.2 的第四个截断源（maxTokens 1200）就是只有真宿主 e2e 才暴露的**，见 ISSUES.md I-11。
 
 ---
 
@@ -298,11 +298,11 @@ ISSUES I-2：代码改路径，测试没改，产生假失败。
 
 1. `grep -n "enforceMidTurn" lib/index.js` — 三处都在吗？（R-1）
 2. `cordis_inspect_query(Event)` — 两个事件名还在吗？（R-2）
-3. `cordis_inspect_query(Config, include:auto-handoff)` — 12 个字段都在 schema 里吗？
+3. `cordis_inspect_query(Config, include:auto-handoff)` — 17 个字段都在 schema 里吗？（DEFAULTS 17 项，见 §R-1）
 4. `list_plugins` — `fiberPhase` 是 `active` 吗？
 5. `cat ~/.dsh/auto-handoff/state.json` — JSON 合法吗？（R-18）
 6. `/handoff-status` — 读数合理吗？
-7. `node test/*.mjs` — 13 条还过吗？（R-34）
+7. `node test/*.mjs` — 38 条断言还过吗？（R-34）
 
 ---
 

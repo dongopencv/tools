@@ -91,7 +91,7 @@ seq 1922  input=530,354  cache=128   ← 全额重付
 | US-4 | 作为用户，我希望随时能看到离阈值还有多远 | `/handoff-status` 输出 token/工具调用/百分比 |
 | US-5 | 作为用户，我希望想切就立刻切 | `/handoff` 立即交接 |
 | US-6 | 作为用户，我希望插件不会无限自我续作 | `chainLimit` 生效，超限只写文档 |
-| US-7 | 作为维护者，我希望改动后能离线验证 | 13 条测试可 `node` 直接跑 |
+| US-7 | 作为维护者，我希望改动后能离线验证 | 38 条断言（chain 8 / claims 10 / integration 15 / midturn 5）可 `node` 直接跑 |
 | US-8 | 作为用户，我不希望插件自己烧钱 | 可 `modelSummary: false` 完全零模型调用 |
 
 ---
@@ -161,7 +161,7 @@ seq 1922  input=530,354  cache=128   ← 全额重付
 | NFR-3 | 每事件开销 O(1) | 工具计数为 Map 自增 |
 | NFR-4 | token 测量 O(surface) | `tokenMeter.measure` 每轮末各一次，可接受 |
 | NFR-5 | 零外部依赖 | 仅 `@deepseek-ai/schemastery` + Node 内置模块 |
-| NFR-6 | 可离线测试 | 13 条测试，`node test/*.mjs` 直接跑 |
+| NFR-6 | 可离线测试 | 38 条断言（chain 8 / claims 10 / integration 15 / midturn 5），`node test/*.mjs` 直接跑 |
 
 ---
 

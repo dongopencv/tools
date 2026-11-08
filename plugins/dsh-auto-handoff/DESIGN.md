@@ -243,13 +243,18 @@ const created = await controller.create(preset === undefined ? { cwd } : { cwd, 
 
 **这个修复曾经丢失过**，导致 `chainDepth` 用例假失败（写到了工作区却读用户主目录）。恢复记录见 `ISSUES.md` I-2。
 
-### 8.3 13 条用例
+### 8.3 38 条断言 / 4 个文件
 
-`test/integration.test.mjs`（8 条，轮末闸）：
-AC-1 ~ AC-8，见 `REQUIREMENTS.md §6`。
+| 文件 | 断言数 | 覆盖 |
+| --- | --- | --- |
+| `test/integration.test.mjs` | 15 | 轮末闸 AC-1 ~ AC-9，外加「下一步」的三道截断闸与 `cancelParentAfterHandoff` 三态 |
+| `test/midturn.test.mjs` | 5 | 轮中闸 AC-10 ~ AC-13，外加「已交接会话继续跑时只留一条证据行」 |
+| `test/chain.test.mjs` | 8 | 链深推进、`chainLimit` 到顶落 `stopped`、最新一棒不是 `done` |
+| `test/claims.test.mjs` | 10 | 占位四态与 TTL/冷却/次数、落盘读回、坏文件降级 |
 
-`test/midturn.test.mjs`（4 条，轮中闸）：
-AC-10 ~ AC-13。核心是**只灌 `session/event`、完全不发 `turn-stopping`**，模拟"这一轮永远不结束、模型完全不理规则"。
+轮中闸的核心是**只灌 `session/event`、完全不发 `turn-stopping`**，模拟"这一轮永远不结束、模型完全不理规则"。
+
+统计断言数必须用 `grep -cE '^\\s*PASS '`：integration 的输出行带前导空白，`grep -c '^PASS '` 会得 0。
 
 ---
 
